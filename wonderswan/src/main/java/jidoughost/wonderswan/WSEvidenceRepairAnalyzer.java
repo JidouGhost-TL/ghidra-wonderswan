@@ -1,0 +1,175 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+package jidoughost.wonderswan;
+
+import ghidra.app.cmd.function.CreateFunctionCmd;
+import ghidra.app.services.*;
+import ghidra.app.util.importer.MessageLog;
+import ghidra.framework.options.Options;
+import ghidra.program.model.lang.PrototypeModel;
+import ghidra.program.model.symbol.SourceType;
+import ghidra.program.model.address.AddressSetView;
+import ghidra.program.model.listing.BookmarkType;
+import ghidra.program.model.listing.Function;
+import ghidra.util.Msg;
+import java.util.*;
+import ghidra.program.model.listing.Program;
+import ghidra.util.exception.CancelledException;
+import ghidra.util.task.TaskMonitor;
+
+/**
+ * Phase 2 of {@link WSEvidenceAnalyzer}: runs after Ghidra's own analyzers and checks their results
+ * against the same execution evidence (reused from phase 1, no second emulator run):
+ *   N1  clear "does not return" where a call's fall-through executed, restore the cut-off code;
+ *   E1R re-seed executed addresses that later analysis removed;
+ *   J1  CS-relative jump/call tables by rule ({@link WSJumpTables}), checked against observed targets;
+ *   D1  DS context at function entries; A1 classify decode artefacts;
+ *   P1  functions whose entry has no bytes are phantoms: removed and reported with their creating references;
+ *   D0  title DS default from execution evidence ({@link WSCompilerRules}), before D1;
+ *   C1  every function whose signature no user or importer set gets the title's convention: __lsic86 when
+ *       rule K1 identifies LSI C-86 code, else the compiler spec's default (Ghidra's analyzers otherwise
+ *       leave __cdecl16near / unknown, which the decompiler reads as stack arguments).
+ */
+public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
+    public static final String NAME = "WonderSwan Execution Evidence (repair)";
+    private static final String OPT_JT = "Recover jump tables (rule J1)";
+    private static final String OPT_CC = "Apply default calling convention (rule C1)";
+    private boolean jumpTables = true, convention = true;
+
+    public WSEvidenceRepairAnalyzer() {
+        super(NAME, "Checks analysis results against the execution evidence collected by '"
+            + WSEvidenceAnalyzer.NAME + "': non-returning functions, lost executed code, DS at entries, decode artefacts.",
+            AnalyzerType.BYTE_ANALYZER);
+        setPriority(AnalysisPriority.LOW_PRIORITY.after().after());
+        setDefaultEnablement(true);
+        setSupportsOneTimeAnalysis();
+    }
+
+    @Override
+    public boolean canAnalyze(Program program) {
+        return program.getLanguage().getProcessor().toString().equals("V30MZ");
+    }
+
+    @Override
+    public void registerOptions(Options o, Program program) {
+        o.registerOption(OPT_JT, jumpTables, null, "Recover CS-relative jump/call tables by rule, checked against observed targets");
+        o.registerOption(OPT_CC, convention, null, "Set the compiler spec's default convention on functions without a user/imported signature");
+    }
+
+    @Override
+    public void optionsChanged(Options o, Program program) {
+        jumpTables = o.getBoolean(OPT_JT, jumpTables);
+        convention = o.getBoolean(OPT_CC, convention);
+    }
+
+    @Override
+    public boolean added(Program program, AddressSetView set, TaskMonitor monitor, MessageLog log) throws CancelledException {
+        WSEvidence ev = WSEvidenceAnalyzer.EVIDENCE.get(program);
+        if (ev == null) {
+            // No execution evidence (emulation failed or disabled): the evidence rules cannot run, but K1/C1 decide
+            // from the code alone, so the convention is still applied.
+            log.appendMsg(NAME + ": no execution evidence; only K1/C1 run");
+            Msg.warn(this, NAME + ": no execution evidence; only K1/C1 run");
+            if (!convention) return false;
+            try { log.appendMsg(NAME + ": " + applyConvention(program, line -> { })); }
+            catch (Exception e) { Msg.error(this, NAME + ": rule C1 failed: " + e, e); log.appendMsg(NAME + ": rule C1 failed: " + e); }
+            return true;
+        }
+        // Each rule runs on its own: a failing rule is reported (analysis log, Msg error, ERROR line in the
+        // evidence report, error bookmark at the program's first address) and the remaining rules still run.
+        // A swallowed exception here once silently skipped J1, D0, D1, A1 and C1.
+        try (WSEvidenceAnalyzer.Seeder s = new WSEvidenceAnalyzer.Seeder(program, ev, WSEvidenceAnalyzer.REPORT.get(program), true, monitor, log)) {
+            List<String> parts = new ArrayList<>(), failed = new ArrayList<>();
+            rule("N1", s, program, log, failed, () -> s.repairNoReturn());
+            rule("E1R", s, program, log, failed, () -> s.seedExecuted("E1R"));
+            rule("B3", s, program, log, failed, () -> s.resolveWindowFlows());
+            rule("P1", s, program, log, failed, () -> parts.add(removePhantoms(program, s)));
+            if (jumpTables) rule("J1", s, program, log, failed, () -> {
+                WSJumpTables j = new WSJumpTables(program, ev, line -> s.emit("%s", line));
+                j.apply(monitor);
+                parts.add(j.summary());
+            });
+            rule("fixup", s, program, log, failed, () -> {
+                for (Function f : program.getFunctionManager().getFunctions(true)) CreateFunctionCmd.fixupFunctionBody(program, f, monitor);
+            });
+            rule("D0", s, program, log, failed, () -> parts.add(applyDsDefault(program, ev, s)));   // before D1: entry evidence overrides it
+            rule("D1", s, program, log, failed, () -> s.seedDs());
+            rule("A1", s, program, log, failed, () -> s.classifyArtefacts());
+            if (convention) rule("C1", s, program, log, failed, () -> parts.add(applyConvention(program, line -> s.emit("%s", line))));
+            log.appendMsg(NAME + ": " + s.summary() + (parts.isEmpty() ? "" : ", " + String.join(", ", parts))
+                + (failed.isEmpty() ? "" : "; RULES FAILED: " + failed));
+        }
+        catch (CancelledException c) { throw c; }
+        catch (Exception e) {
+            Msg.error(this, NAME + ": could not start phase 2: " + e, e);
+            log.appendException(e);
+        }
+        return true;
+    }
+
+    interface Rule { void run() throws Exception; }
+
+    private void rule(String name, WSEvidenceAnalyzer.Seeder s, Program program, MessageLog log, List<String> failed, Rule r)
+            throws CancelledException {
+        try { r.run(); }
+        catch (CancelledException c) { throw c; }
+        catch (Exception e) {
+            failed.add(name);
+            Msg.error(this, NAME + ": rule " + name + " failed: " + e, e);
+            log.appendMsg(NAME + ": rule " + name + " failed: " + e);
+            s.emit("{\"rule\":\"%s\",\"outcome\":\"ERROR\",\"error\":\"%s\"}", name, String.valueOf(e).replace("\\", "/").replace("\"", "'"));
+            program.getBookmarkManager().setBookmark(program.getMinAddress(), BookmarkType.ERROR, "WSEvidence",
+                "phase-2 rule " + name + " failed: " + e);
+        }
+    }
+
+    /** P1: a function whose entry has no bytes (an uninitialised block such as an empty bank window, or no
+     *  memory at all) cannot be code we know; it was created from a reference into nothing (e.g. an
+     *  unexecuted CALLF decode into an empty bank window). Removed, reported with the creating references, and each
+     *  referencing site bookmarked; the references themselves are kept (they are what the bytes say). */
+    static String removePhantoms(Program program, WSEvidenceAnalyzer.Seeder s) throws Exception {
+        List<Function> phantoms = new ArrayList<>();
+        for (Function f : program.getFunctionManager().getFunctions(true)) {
+            if (f.isExternal() || f.isThunk()) continue;
+            ghidra.program.model.mem.MemoryBlock b = program.getMemory().getBlock(f.getEntryPoint());
+            if (b == null || !b.isInitialized()) phantoms.add(f);
+        }
+        for (Function f : phantoms) {
+            StringBuilder refs = new StringBuilder();
+            for (ghidra.program.model.symbol.Reference r : program.getReferenceManager().getReferencesTo(f.getEntryPoint())) {
+                refs.append(refs.length() > 0 ? "," : "").append('"').append(r.getFromAddress()).append('"');
+                program.getBookmarkManager().setBookmark(r.getFromAddress(), ghidra.program.model.listing.BookmarkType.WARNING, "WSEvidence",
+                    "P1 PHANTOM_TARGET: " + f.getEntryPoint() + " has no bytes; function removed");
+            }
+            s.emit("{\"rule\":\"P1\",\"function\":\"%s\",\"outcome\":\"PHANTOM_REMOVED\",\"refs_from\":[%s]}", f.getEntryPoint(), refs);
+            program.getFunctionManager().removeFunction(f.getEntryPoint());
+        }
+        return "P1 phantom functions removed " + phantoms.size();
+    }
+
+    /** D0 ({@link WSCompilerRules}). */
+    static String applyDsDefault(Program program, WSEvidence ev, WSEvidenceAnalyzer.Seeder s) throws Exception {
+        int v = WSCompilerRules.dominantDs(ev);
+        if (v < 0) { s.emit("{\"rule\":\"D0\",\"ds_default\":\"0000\",\"outcome\":\"KEPT\"}"); return "D0 DS default 0 kept"; }
+        int blocks = WSCompilerRules.applyDsDefault(program, v);
+        s.emit("{\"rule\":\"D0\",\"ds_default\":\"%04x\",\"share\":%.3f,\"blocks\":%d,\"outcome\":\"SET\"}", v, WSCompilerRules.share(ev, v), blocks);
+        return String.format("D0 DS default %04X (%.0f%% of single-DS executed addresses)", v, 100 * WSCompilerRules.share(ev, v));
+    }
+
+    /** C1, convention chosen by rule K1 ({@link WSCompilerRules}): LSI C-86 register convention or the cspec default. */
+    static String applyConvention(Program program, java.util.function.Consumer<String> emit) throws Exception {
+        PrototypeModel def = program.getCompilerSpec().getDefaultCallingConvention();
+        if (def == null) return "C1 no default convention";
+        WSCompilerRules k = WSCompilerRules.measure(program);
+        boolean lsi = k.lsi() && program.getCompilerSpec().getCallingConvention("__lsic86") != null;
+        String cc = lsi ? "__lsic86" : def.getName();
+        emit.accept(String.format("{\"rule\":\"K1\",\"family\":\"%s\",\"evidence\":\"%s\"}", lsi ? "LSI C-86" : "default", k.evidence()));
+        int set = 0, kept = 0;
+        for (Function f : program.getFunctionManager().getFunctions(true)) {
+            SourceType src = f.getSignatureSource();
+            if (src == SourceType.USER_DEFINED || src == SourceType.IMPORTED) { kept++; continue; }
+            if (!cc.equals(f.getCallingConventionName())) { f.setCallingConvention(cc); set++; }
+        }
+        emit.accept(String.format("{\"rule\":\"C1\",\"convention\":\"%s\",\"set\":%d,\"kept_user_or_imported\":%d}", cc, set, kept));
+        return "C1 " + cc + " set on " + set + " functions (kept " + kept + ")";
+    }
+}

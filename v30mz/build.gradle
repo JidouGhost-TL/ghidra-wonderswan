@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Ghidra extension build: GHIDRA_INSTALL_DIR must point at the Ghidra install.
+def ghidraInstallDir = System.env.GHIDRA_INSTALL_DIR ?: (project.hasProperty("GHIDRA_INSTALL_DIR") ? project.GHIDRA_INSTALL_DIR : "/opt/ghidra_12.1.3_PUBLIC")
+apply from: new File(ghidraInstallDir).getCanonicalPath() + "/support/buildExtension.gradle"
+
+// Compile the SLEIGH spec (data/languages/*.slaspec -> *.sla) before packaging, so the
+// extension zip ships a ready .sla (Ghidra does not compile .slaspec files of installed
+// extensions at load time).
+def sleighExe = new File(ghidraInstallDir).getCanonicalPath() + "/support/sleigh"
+task compileSleigh(type: Exec) {
+	inputs.files fileTree(dir: 'data/languages', include: ['*.slaspec', '*.sinc'])
+	outputs.files fileTree(dir: 'data/languages', include: '*.sla')
+	workingDir 'data/languages'
+	commandLine sleighExe, '-a', '.'
+}
+buildExtension.dependsOn compileSleigh

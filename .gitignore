@@ -1,0 +1,19 @@
+# Internal working material: never versioned
+/internal-tools/
+/internal-docs/
+# Build outputs
+/build/
+/.gradle/
+*/build/
+*/dist/
+*.sla
+# Ghidra projects and run outputs
+*.gpr
+*.rep/
+*.lock
+*.lock~
+
+# Transitional symlinks to internal-tools (removed once running jobs finish)
+/tools/assets
+/tools/xlat
+/tools/font

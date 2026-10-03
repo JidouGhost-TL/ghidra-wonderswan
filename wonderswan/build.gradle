@@ -1,0 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Ghidra extension build: GHIDRA_INSTALL_DIR must point at the Ghidra install.
+def ghidraInstallDir = System.env.GHIDRA_INSTALL_DIR ?: (project.hasProperty("GHIDRA_INSTALL_DIR") ? project.GHIDRA_INSTALL_DIR : "/opt/ghidra_12.1.3_PUBLIC")
+apply from: new File(ghidraInstallDir).getCanonicalPath() + "/support/buildExtension.gradle"
