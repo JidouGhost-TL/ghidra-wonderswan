@@ -106,7 +106,8 @@ public class WSEmulate extends GhidraScript {
             w.println("n\tcs\tip\tax\tbx\tcx\tdx\tsi\tdi\tbp\tsp\tds\tes\tss\tflags");
             for (String line : m.firstTrace) w.println(line);
         }
-        println("ACCESS " + m.accessStats + " IRQ " + m.irqStats + " ports B2=" + m.ports[0xB2] + " B0=" + m.ports[0xB0]);
+        println("ACCESS " + m.accessStats + " IRQ " + m.irqStats + " ports B2=" + m.ports[0xB2] + " B0=" + m.ports[0xB0]
+            + String.format(" E0b carried=%d resumed=%d maxDepth=%d", m.computedEdges.carried(), m.computedEdges.resumed(), m.computedEdges.maxDepth()));
         println(String.format("WSEmulate: frames=%d instructions=%d unique_insn=%d dma=%d ms=%d (%.0f insn/s) error=%s",
             frames, m.instructions, m.executed.size(), m.dmaLog.size(), ms, m.instructions * 1000.0 / Math.max(1, ms), error));
     }

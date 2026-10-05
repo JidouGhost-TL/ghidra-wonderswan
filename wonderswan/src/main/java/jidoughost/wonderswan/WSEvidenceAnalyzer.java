@@ -26,6 +26,9 @@ import ghidra.util.task.TaskMonitor;
  * the decode artefacts that disassembly produces when it follows never-taken paths into data.
  *
  * Rules (every decision is evidence-backed and can be written to a JSON-lines report):
+ *   E0b a computed JMP/CALL resolves to the next instruction in its own interrupt context: edges
+ *       pre-empted by an interrupt are carried across the handler flow (WSMachine) and recorded at
+ *       the post-IRET instruction, never inside the handler.
  *   B3  a direct call/jump into a window (no bytes there) whose target executed under exactly one bank gets a
  *       call/jump override reference to that bank's overlay (decompiler follows it); targets that ran under
  *       several banks or never ran are reported, not guessed.
@@ -322,6 +325,8 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
         boolean inProgram(Address a) { return p.getMemory().contains(a) && p.getMemory().getBlock(a).isInitialized(); }
 
         void seed() throws Exception {
+            if (ev.e0bKnown)
+                emit("{\"rule\":\"E0b\",\"carried\":%d,\"resumed\":%d,\"max_depth\":%d}", ev.e0bCarried, ev.e0bResumed, ev.e0bMaxDepth);
             seedExecuted("E1");
             seedEdges();
             resolveWindowFlows();

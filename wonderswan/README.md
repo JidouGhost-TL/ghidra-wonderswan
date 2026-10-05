@@ -92,7 +92,7 @@ Every decision can be written to a JSON-lines report (analysis option *Evidence 
 
 | Rule | Phase | What |
 |---|---|---|
-| E0 | 0 | Evidence hygiene in `WSMachine`: a computed JMP/CALL edge is never recorded to an interrupt entry (an interrupt taken before the target executes leaves the edge pending for the post-IRET instruction) |
+| E0b | 0 | Evidence hygiene in `WSMachine` (`WSComputedEdges`): a computed JMP/CALL resolves to the next instruction in its own interrupt context — an edge pre-empted by an interrupt stays pending across the handler flow (nested interrupts included) and is recorded at the post-IRET instruction, never inside the handler |
 | B2 | 1 | Code executed in the ROM0/ROM1 windows: one overlay block per (window, bank) observed (`ROM0_BANK_xxxx`, from FileBytes), seeded like linear code; a window address that ran under several banks is seeded in each |
 | E1 | 1 | Executed address = instruction start, `csval` = observed CS |
 | E2 | 1 | Call / interrupt edge target = function entry |

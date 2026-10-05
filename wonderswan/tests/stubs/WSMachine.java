@@ -14,5 +14,6 @@ final class WSMachine {
     public final Map<Long, Set<Integer>> executed = new TreeMap<>();
     public final Map<String, Integer> edges = new TreeMap<>();
     public final Map<Long, Set<Integer>> windowBanks = new TreeMap<>();
+    public final WSComputedEdges computedEdges = new WSComputedEdges();
     public long instructions;
 }

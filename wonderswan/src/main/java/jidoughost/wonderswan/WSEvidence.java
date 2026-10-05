@@ -47,6 +47,12 @@ public final class WSEvidence {
     public MesenStats mesenStats;
     /** Free-text provenance (how the evidence was produced). */
     public String provenance = "";
+    /** Rule E0b: computed-branch edges carried across interrupt handler flow, and those later
+     *  resolved at a same-context (post-IRET) instruction. Only known for in-process WSMachine
+     *  runs ({@link #e0bKnown}); loaded or Mesen evidence leaves them unset. */
+    public long e0bCarried, e0bResumed;
+    public int e0bMaxDepth;
+    public boolean e0bKnown;
 
     public static WSEvidence of(WSMachine m) {
         return of(m, Set.of());
@@ -76,6 +82,10 @@ public final class WSEvidence {
             if (!drop.contains(x.getKey())) e.windowBanks.put(x.getKey(), new TreeSet<>(x.getValue()));
         e.provenance = String.format("WSMachine in-process: %d instructions%s", m.instructions,
             drop.isEmpty() ? "" : String.format(" (run ended in an error; %d tail addresses dropped)", drop.size()));
+        e.e0bCarried = m.computedEdges.carried();
+        e.e0bResumed = m.computedEdges.resumed();
+        e.e0bMaxDepth = m.computedEdges.maxDepth();
+        e.e0bKnown = true;
         return e;
     }
 

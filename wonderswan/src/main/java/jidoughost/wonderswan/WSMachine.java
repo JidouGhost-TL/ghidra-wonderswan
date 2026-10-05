@@ -130,14 +130,11 @@ public class WSMachine {
      * Observed control-flow edges whose target is not encoded in the instruction: computed JMP/CALL
      * (kind "jump"/"call"), software interrupts ("int") and injected hardware interrupts ("irq").
      * Key "from,to,targetCS,kind" (linear hex; from = -1 for irq) -> count.
-     * Rule E0: a computed edge never points at an interrupt entry (see interruptEntryPending).
+     * Rule E0b: a computed edge resolves in the same interrupt context (see {@link WSComputedEdges}).
      */
     public final Map<String, Integer> edges = new TreeMap<>();
-    private long pendingFrom = -1;
-    private String pendingKind;
-    /** Set by enterInterrupt: the next executed instruction is an interrupt entry, not the pending
-     *  computed branch's target (rule E0: the pending edge is kept for the post-IRET instruction). */
-    private boolean interruptEntryPending;
+    /** Pending computed-branch edges and interrupt-nesting depth (rule E0b). */
+    public final WSComputedEdges computedEdges = new WSComputedEdges();
     /** Visits per executed address; DS/ES sets are sampled for the first 64 visits (as the Mesen trace does). */
     private final Map<Long, Integer> visits = new HashMap<>();
 
@@ -854,9 +851,7 @@ public class WSMachine {
         }
         sdmaControl(ports[0x52]);
         curInBefore = 0; curSplitWords = 0;
-        pendingFrom = -1;
-        pendingKind = null;
-        interruptEntryPending = false;
+        computedEdges.reset();
         stopped = false;
     }
 
@@ -1145,7 +1140,7 @@ public class WSMachine {
         thread.overrideCounter(addr(((long) seg << 4) + off));
         syncCsval();
         csMayHaveChanged = false;
-        interruptEntryPending = true;   // E0: the next instruction is this entry, not a branch target
+        computedEdges.noteInterruptEntry();   // E0b: handler flow is a deeper context, not a branch target
         edges.merge(String.format("%x,%x,%x,%s", -1L & 0xFFFFF, (((long) seg << 4) + off) & 0xFFFFF, seg, kind), 1, Integer::sum);
     }
 
@@ -1408,16 +1403,12 @@ public class WSMachine {
             ringLin[ri] = lin;
             ringIns[ri] = ins;
             if (lin == stopAt) stopped = true;
-            // E0: a computed branch whose target instruction is pre-empted by an injected interrupt
-            // resolves to the post-IRET instruction (where control actually goes), never to the entry.
-            if (pendingFrom >= 0 && !interruptEntryPending) {
-                edges.merge(String.format("%x,%x,%x,%s", pendingFrom, lin, reg(rCS), pendingKind), 1, Integer::sum);
-                pendingFrom = -1;
-            }
-            interruptEntryPending = false;
+            // E0b: a computed branch resolves to the next instruction in its own interrupt
+            // context; edges pre-empted by an interrupt stay pending across the handler flow.
+            computedEdges.resolveAt(lin, (int) reg(rCS), (from, to, cs, kind) ->
+                edges.merge(String.format("%x,%x,%x,%s", from, to, cs, kind), 1, Integer::sum));
             if (ins.getFlowType().isComputed() && (ins.getFlowType().isJump() || ins.getFlowType().isCall())) {
-                pendingFrom = lin;
-                pendingKind = ins.getFlowType().isCall() ? "call" : "jump";
+                computedEdges.noteComputedBranch(lin, ins.getFlowType().isCall() ? "call" : "jump");
             }
             if (lin >= 0x20000 && lin < 0x40000)    // B1: every ROM bank a window address executes under
                 windowBanks.computeIfAbsent(lin, k -> new TreeSet<>()).add(bank(lin < 0x30000 ? 0xC2 : 0xC3));
@@ -1434,6 +1425,7 @@ public class WSMachine {
         public void afterExecuteInstruction(PcodeThread<byte[]> t, Instruction ins) {
             String mn = ins.getMnemonicString();
             if (CS_WRITERS.contains(mn)) csMayHaveChanged = true;
+            if ("IRET".equals(mn)) computedEdges.noteIret();   // E0b: the interrupted context resumes
             // Interrupt shadow (WSdev NEC V30MZ interrupts, datasheet [DS:2843-2853]; ws-test-suite
             // interrupt_timing): STI/POPF/IRET that set IF delay maskable interrupts by one instruction;
             // POPF/IRET that set TF delay both; a load of SS (MOV SS / POP SS) delays both.
@@ -1571,6 +1563,7 @@ public class WSMachine {
             int off = (v[0] & 0xff) | (v[1] & 0xff) << 8, seg = (v[2] & 0xff) | (v[3] & 0xff) << 8;
             setReg(rCS, seg);
             csMayHaveChanged = true;          // BOUND / divide traps are not in CS_WRITERS
+            computedEdges.noteInterruptEntry();   // E0b: the INT handler is a deeper context
             long target = (((long) seg << 4) + off) & 0xFFFFF;
             edges.merge(String.format("%x,%x,%x,int", ins.getAddress().getOffset(), target, seg), 1, Integer::sum);
             return target;
