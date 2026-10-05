@@ -16,7 +16,7 @@ CID=$(docker run -d --rm \
   -v "$ROM:/work/rom/$NAME:ro" -v "$HERE/trace.lua:/work/trace.lua:ro" -v "$OUT:/work/out" \
   -v "$HERE/settings.json:/home/mesen/.config/Mesen2/settings.json:ro" \
   -e MESEN_FRAMES="${3:-1500}" -e MESEN_TRACE_N="${4:-20000}" -e MESEN_SHOT_EVERY="${5:-100}" -e MESEN_OUT=/work/out \
-  -e MESEN_INPUT_MODE="${MESEN_INPUT_MODE:-standard}" -e MESEN_SEED="${MESEN_SEED:-0}" \
+  -e MESEN_INPUT_MODE="${MESEN_INPUT_MODE:-standard}" -e MESEN_SEED="${MESEN_SEED:-0}" -e MESEN_TRACE_TIMING="${MESEN_TRACE_TIMING:-0}" -e MESEN_TRACE_FROM="${MESEN_TRACE_FROM:-1}" -e MESEN_FRAMESIG="${MESEN_FRAMESIG:-0}" \
   "$IMAGE" --testRunner /work/trace.lua "/work/rom/$NAME" --timeout=3600)
 while [ ! -s "$OUT/summary.txt" ] && docker ps -q --no-trunc | grep -q "$CID"; do sleep 1; done
 docker stop -t 1 "$CID" >/dev/null 2>&1 || true

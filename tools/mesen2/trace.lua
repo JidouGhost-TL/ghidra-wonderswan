@@ -23,13 +23,25 @@ local SHOT_EVERY = tonumber(os.getenv("MESEN_SHOT_EVERY") or "100")
 local OUT = os.getenv("MESEN_OUT") or "/work/out"
 local INPUT_MODE = os.getenv("MESEN_INPUT_MODE") or "standard"
 local SEED = tonumber(os.getenv("MESEN_SEED") or "0") or 0
+-- MESEN_TRACE_TIMING=1 appends cyc (CPU cycle count), line (PPU scanline) and lcyc (cycle within the line) to
+-- trace.tsv, for cycle-level comparison; the default trace format is unchanged.
+local TIMING = os.getenv("MESEN_TRACE_TIMING") == "1"
+-- MESEN_TRACE_FROM (default 1): first instruction of the trace window (rows n = FROM .. FROM+TRACE_N-1), to zoom in on
+-- a late divergence. MESEN_FRAMESIG=1 writes framesig.tsv: per frame the instruction count so far, the CPU cycle count
+-- and the sum of executed linear addresses in that frame, to find the first frame where two runs differ.
+local TRACE_FROM = tonumber(os.getenv("MESEN_TRACE_FROM") or "1") or 1
+local FRAMESIG = os.getenv("MESEN_FRAMESIG") == "1"
+local function inWin(i) return i >= TRACE_FROM and i < TRACE_FROM + TRACE_N end
+local pcsum = 0
+local sig = FRAMESIG and io.open(OUT .. "/framesig.tsv", "w") or nil
+if sig then sig:write("frame\tn\tcyc\tpcsum\n") end
 
 local frame, n = 0, 0
 local done = false
 local ramErr, cdlNote = nil, nil
 local seen = {}          -- linear -> {count, ds = {}, es = {}, c0 = {}, banks = {}}
 local trace = io.open(OUT .. "/trace.tsv", "w")
-trace:write("n\tcs\tip\tax\tbx\tcx\tdx\tsi\tdi\tbp\tsp\tds\tes\tss\tflags\tc0\tc1\tc2\tc3\n")
+trace:write("n\tcs\tip\tax\tbx\tcx\tdx\tsi\tdi\tbp\tsp\tds\tes\tss\tflags\tc0\tc1\tc2\tc3" .. (TIMING and "\tcyc\tline\tlcyc" or "") .. "\n")
 
 local function flags(s)
   local f = 0xF002
@@ -78,30 +90,33 @@ emu.addMemoryCallback(function(addr, value)
   lastAddr = addr
   lastRep, lastOpAddr = repInfo(addr)
   n = n + 1
+  if FRAMESIG then pcsum = (pcsum + addr) & 0xFFFFFFFF end
   -- The callback address is the linear CPU address; the full state is fetched only when needed
   -- (trace window, or the first 64 visits of an address for its DS/ES/C0 sets). During the trace
   -- window the shortcut is checked against CS*16+IP. Bank-window addresses record their bank on
   -- every visit through a cheap port read, so rule B1 sees every bank they ran under.
   local e = seen[addr]
   local wport = windowPort(addr)
-  if e and e.count >= 64 and n > TRACE_N then
+  if e and e.count >= 64 and not inWin(n) then
     e.count = e.count + 1
     if wport then recordWindowBank(e, wport) end
     return
   end
   local s = emu.getState()
   local lin = (s["cpu.cs"] * 16 + s["cpu.ip"]) & 0xFFFFF
-  if n <= TRACE_N and lin ~= addr then addrMismatch = addrMismatch + 1 end
+  if inWin(n) and lin ~= addr then addrMismatch = addrMismatch + 1 end
   if not e then e = { count = 0, ds = {}, es = {}, c0 = {}, banks = {} }; seen[addr] = e end
   e.count = e.count + 1
   e.ds[s["cpu.ds"]] = true; e.es[s["cpu.es"]] = true
   if addr >= 0x40000 then e.c0[s["cart.selectedBanks0"]] = true end
   if wport then recordWindowBank(e, wport) end
-  if n <= TRACE_N then
-    trace:write(string.format("%d\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%02x\t%02x\t%02x\t%02x\n",
+  if inWin(n) then
+    trace:write(string.format("%d\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%02x\t%02x\t%02x\t%02x",
       n, s["cpu.cs"], s["cpu.ip"], s["cpu.ax"], s["cpu.bx"], s["cpu.cx"], s["cpu.dx"], s["cpu.si"], s["cpu.di"],
       s["cpu.bp"], s["cpu.sp"], s["cpu.ds"], s["cpu.es"], s["cpu.ss"], flags(s),
       s["cart.selectedBanks0"], s["cart.selectedBanks1"], s["cart.selectedBanks2"], s["cart.selectedBanks3"]))
+    if TIMING then trace:write(string.format("\t%d\t%d\t%d", s["cpu.cycleCount"], s["ppu.scanline"], s["ppu.cycle"])) end
+    trace:write("\n")
   end
 end, emu.callbackType.exec, 0, 0xFFFFF, emu.cpuType.ws)
 
@@ -231,10 +246,12 @@ emu.addEventCallback(function()
   if SHOT_EVERY > 0 and frame % SHOT_EVERY == 0 then
     local f = io.open(string.format("%s/shot_%05d.png", OUT, frame), "wb"); f:write(emu.takeScreenshot()); f:close()
   end
+  if sig then sig:write(string.format("%d\t%d\t%d\t%d\n", frame, n, emu.getState()["cpu.cycleCount"], pcsum)); pcsum = 0 end
   frame = frame + 1
   if frame >= FRAMES then
     done = true
     trace:close()
+    if sig then sig:close() end
     local c = io.open(OUT .. "/coverage.tsv", "w")
     local lins = {} for l in pairs(seen) do lins[#lins + 1] = l end table.sort(lins)
     for _, l in ipairs(lins) do local e = seen[l]; c:write(string.format("%05x\t%d\t%s\t%s\t%s\n", l, e.count, keys(e.ds), keys(e.es), bankcol(l, e))) end

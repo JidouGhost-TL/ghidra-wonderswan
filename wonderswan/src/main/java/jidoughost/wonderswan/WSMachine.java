@@ -191,9 +191,31 @@ public class WSMachine {
     private int curInBefore = 0;
     /** Split word accesses (odd or 8-bit bus) seen during the current instruction. */
     private int curSplitWords = 0;
+    /** Cycle-timed mode: data/port bus accesses of the current instruction (split accesses counted twice) and
+     *  whether it raised a software interrupt or divide error (entry charged by the timing model). */
+    private int curAccesses = 0;
+    /** Distinct (direction, space, address, size) accesses of the current instruction: p-code may load the same
+     *  operand more than once (read-modify-write forms), the bus reads it once. */
+    private final java.util.Set<Long> curAccessKeys = new java.util.HashSet<>();
+    private boolean curInterrupted = false;
+    /** Cycle-timed mode: V30MZ instruction timing with the prefetch queue (created on the first cycle-timed run). */
+    WSCpuTiming timing;
+    /** Cycle-timed mode: set when the display reaches line 145, where the reference emulator ends a frame. */
+    private boolean vblankStarted = false;
     /** Current instruction bytes/length (captured in callbacks; no disassembly with -noanalysis). */
     private byte[] curBytes = new byte[0];
     private int curLen = 1;
+    /** Linear address of the instruction being executed (set before each instruction). */
+    private long curStart = -1;
+    // Prefetch queue across bank switches (rule P2, NEC V30MZ manual 3.3: 8 queue words, 16 bytes; Mesen 2 models
+    // the queue). Code that switches the bank of the window it runs in keeps executing the bytes already fetched:
+    // when a bank write remaps the region holding the next instruction, up to 16 bytes from there keep their old
+    // contents for straight-line fetch; the first non-sequential fetch (branch, interrupt) or leaving the range
+    // restores the new mapping's bytes.
+    static final int PREFETCH_BYTES = 16;
+    private long pfLo = -1, pfHi, pfExpect;
+    private byte[] pfFresh;
+    public long prefetchHolds;
     /** Per-instruction enable snapshot: HW enables change at the end of OUT, so its own cycles tick
      *  with the before state (otherwise sweep/SDMA overcount the enabling OUT by 7). */
     private boolean tickOverride = false, sweepWas = false, sdmaWas = false;
@@ -354,6 +376,28 @@ public class WSMachine {
         write(window, romSlice(WSHardware.bankToRom(bank(port), rom.length), 0x10000));
     }
 
+    /** Rule P2: remap a window; if it holds the next instruction, keep the prefetched bytes (see PREFETCH_BYTES). */
+    private void prefetchRemap(long lo, long hi, Runnable remap) {
+        prefetchRelease();
+        long next = curStart < 0 ? -1 : curStart + curLen;
+        if (next < lo || next >= hi) { remap.run(); return; }
+        int n = (int) Math.min(PREFETCH_BYTES, hi - next);
+        byte[] old = read(next, n);
+        remap.run();
+        byte[] fresh = read(next, n);
+        if (java.util.Arrays.equals(old, fresh)) return;
+        write(next, old);
+        pfLo = next; pfHi = next + n; pfExpect = next; pfFresh = fresh;
+        prefetchHolds++;
+    }
+
+    /** Rule P2: the prefetched bytes are consumed or flushed; show the current mapping again. */
+    private void prefetchRelease() {
+        if (pfLo < 0) return;
+        write(pfLo, pfFresh);
+        pfLo = -1; pfFresh = null;
+    }
+
     /** Effective-ROM offset of a linear address under the current bank registers, or -1 for RAM/SRAM
      *  (for non-power-of-two images translate to a file offset with {@link WSHardware#fileOffset}). */
     public long romOffset(long linear) {
@@ -434,6 +478,9 @@ public class WSMachine {
         }
         switch (port) {
             case 0x02: return currentLine;
+            case 0x91:   // sound output control; bit 7 is read-only: headphone adapter connected (environment)
+                return (ports[0x91] & 0x7F) | (headphones ? 0x80 : 0)
+                    | (size == 2 ? ports[0x92] << 8 : 0);
             case 0x43: case 0x4D: case 0x51: case 0x53: return 0;   // DMA gaps read 0
             case 0x84: case 0x85: {   // CH3 freq: sweep counts cycles; IN reads a cycle early
                 int f = (ports[0x84] | ports[0x85] << 8) & 0xFFF;
@@ -521,9 +568,9 @@ public class WSMachine {
         boolean touches = false;
         for (int k = 0; k < size; k++) {
             int p = (port + k) & 0xFF;
-            if (p == 0xC0 || p == 0xCF) mapLinear();
-            if (p == 0xC2 || p == 0xD2 || p == 0xD3) mapBank(0xC2, 0x20000);
-            if (p == 0xC3 || p == 0xD4 || p == 0xD5) mapBank(0xC3, 0x30000);
+            if (p == 0xC0 || p == 0xCF) prefetchRemap(0x40000, 0x100000, this::mapLinear);
+            if (p == 0xC2 || p == 0xD2 || p == 0xD3) prefetchRemap(0x20000, 0x30000, () -> mapBank(0xC2, 0x20000));
+            if (p == 0xC3 || p == 0xD4 || p == 0xD5) prefetchRemap(0x30000, 0x40000, () -> mapBank(0xC3, 0x30000));
             if (p == 0x48) touches = true;
             if (p >= 0xBA && p <= 0xBE)
                 internalEeprom.write(p - 0xBA, ports[p], instructions, colorMode(), linearPC());
@@ -537,6 +584,16 @@ public class WSMachine {
             if (p == 0xA6 || p == 0xA7) vTimer = ports[0xA6] | ports[0xA7] << 8;
         }
         if (touches && (ports[0x48] & 0x80) != 0) dma();
+    }
+
+    /** Boot environment: a headphone adapter is connected (port 91 bit 7). The reference emulators (Mesen 2, ares)
+     *  default to connected; games branch on it during sound setup, so evidence runs should match the capture. */
+    public boolean headphones = true;
+
+    /** Boot environment: refill a blank cartridge EEPROM with {@code b} (hardware delivers it erased, 0xFF; Mesen 2
+     *  starts at 0x00). Call before loading saves; no effect without a cartridge EEPROM. */
+    public void setCartEepromFill(int b) {
+        if (cartEeprom != null) java.util.Arrays.fill(cartEeprom.data, (byte) b);
     }
 
     /** Colour mode (port 60 bit 7) on colour hardware. */
@@ -575,6 +632,20 @@ public class WSMachine {
         sdmaFreq = switch (b & 0x03) { case 0 -> 5; case 1 -> 3; case 2 -> 1; default -> 0; };
     }
     /** 16-bit bus with no wait: IRAM always, SRAM never (8-bit), ROM from A0 bits 2-3. */
+    /** Cycle-timed mode: bus accesses of one p-code load/store (words split on odd addresses, byte buses and
+     *  byte ports; 4-byte loads such as LES/LDS are two words). */
+    private void countAccess(boolean store, boolean port, long a, int size) {
+        long key = (store ? 1L << 62 : 0) | (port ? 1L << 61 : 0) | ((long) size << 40) | (a & 0xFFFFFFFFL);
+        if (!curAccessKeys.add(key)) return;
+        if (size <= 1) { curAccesses++; return; }
+        for (int k = 0; k < size; k += 2) {
+            long w = a + k;
+            boolean split = port ? (((w & 1) != 0) || (w & 0xFF) >= 0xC0) : (((w & 1) != 0) || !isWordBus(w & 0xFFFFF));
+            curAccesses += split ? 2 : 1;
+            if (split) curSplitWords++;
+        }
+    }
+
     private boolean isWordBus(long linear) {
         if (linear < 0x10000) return true;
         if (linear < 0x20000) return false;
@@ -686,6 +757,7 @@ public class WSMachine {
     }
 
     public void saveState(java.io.DataOutputStream o) throws java.io.IOException {
+        prefetchRelease();   // rule P2 is not part of the state: a snapshot shows the current mapping
         o.writeInt(STATE_MAGIC);
         o.writeInt(STATE_VERSION);
         o.writeInt(rom.length);
@@ -935,21 +1007,29 @@ public class WSMachine {
         for (int i = 0; i < 7; i++) { cycles++; tickSweep(); tickLine(); }
         if (!sdmaHyper) ports[0x89] = sample & 0xFF;
     }
+    /**
+     * One display cycle (cycle-timed mode). Events belong to the cycle the line counter shows when the cycle
+     * starts: HBlank (and the HBlank timer) on cycle 224, end of line on cycle 255, so an instruction that starts
+     * at cycle 224 still runs before the HBlank-timer interrupt can be taken (matches the reference's order).
+     */
     private void tickLine() {
         apuCycle = (apuCycle + 1) & 0x7F;
         if (apuCycle == 116) sdmaSlot();
-        if (++cycleInLine >= CYCLES_PER_LINE) {
+        int c = cycleInLine;
+        if (c == 224) tickHTimer();
+        if (c >= CYCLES_PER_LINE - 1) {
             cycleInLine = 0;
             if (halted) haltedLines++;
             currentLine++;
             if (currentLine >= LINES) currentLine = 0;
             if (currentLine < VISIBLE) linePorts[currentLine] = ports.clone();
             if (currentLine == VISIBLE) {
-                tickTimers(true);
+                tickVTimer();
                 raiseIrq(6);
             }
+            if (currentLine == VISIBLE + 1) { vblankStarted = true; frameEndCycle = cycles; }   // frame boundary: line 145
             if (currentLine == ports[0x03]) raiseIrq(4);
-        } else if (cycleInLine == 224) tickTimers(false);
+        } else cycleInLine = c + 1;
     }
     private void tickCycles(int n) {
         for (int i = 0; i < n; i++) { cycles++; tickSweep(); tickLine(); }
@@ -1095,6 +1175,11 @@ public class WSMachine {
     public final Map<String, Integer> accessStats = new TreeMap<>();
     /** Full register trace of the first traceLimit instructions, Mesen trace.tsv format. */
     public int traceLimit = 20000;
+    /** First logical step recorded in {@link #firstTrace} (1-based; REP iterations count once, as in the Mesen
+     *  trace) and the running count of logical steps; framePcSum sums their linear addresses (frame signatures). */
+    public long traceFrom = 1, traceSteps = 0, framePcSum = 0;
+    /** Cycle count at the last frame boundary (cycle-timed mode; frame signatures). */
+    public long frameEndCycle = 0;
     public final List<String> firstTrace = new ArrayList<>();
     private long lastTraced = -1;
 
@@ -1104,7 +1189,12 @@ public class WSMachine {
      * boundary where IF=1 (see {@link #run}); it stays requested until acknowledged through B6.
      * Returns true if the request was latched.
      */
+    /** Interrupt requests inside the trace window (step, level, line, cycle in line, latched), for divergence work. */
+    public final List<String> irqLog = new ArrayList<>();
+
     public boolean raiseIrq(int level) {
+        if (traceSteps >= traceFrom && traceSteps < traceFrom + traceLimit && irqLog.size() < 100000)
+            irqLog.add(String.format("%d\t%d\t%d\t%d\t%d", traceSteps, level, currentLine, cycleInLine, (ports[0xB2] >> level) & 1));
         if (((ports[0xB2] >> level) & 1) == 0) { irqStats.merge("masked", 1, Integer::sum); return false; }
         irqStatus |= 1 << level;
         irqStats.merge("requested", 1, Integer::sum);
@@ -1141,6 +1231,7 @@ public class WSMachine {
         syncCsval();
         csMayHaveChanged = false;
         computedEdges.noteInterruptEntry();   // E0b: handler flow is a deeper context, not a branch target
+        if (cycleTiming && timing != null) timing.interrupt(((long) seg << 4) + off, 0);
         edges.merge(String.format("%x,%x,%x,%s", -1L & 0xFFFFF, (((long) seg << 4) + off) & 0xFFFFF, seg, kind), 1, Integer::sum);
     }
 
@@ -1177,14 +1268,52 @@ public class WSMachine {
     }
 
     private void tickTimers(boolean vblank) {
+        tickHTimer();
+        if (vblank) tickVTimer();
+    }
+
+    /** HBlank timer tick (WSdev Timers): the IRQ fires when the counter is 1 at the tick (even if counting is
+     *  disabled); an enabled counter then counts down and, in repeat mode, reloads on reaching 0. */
+    private void tickHTimer() {
         int ctl = ports[0xA2];
-        // WSdev Timers: the IRQ fires when the counter is 1 at the tick (even if counting is disabled);
-        // an enabled counter then counts down and, in repeat mode, reloads on reaching 0.
         if (hTimer == 1) raiseIrq(7);
         if ((ctl & 1) != 0 && hTimer != 0 && --hTimer == 0 && (ctl & 2) != 0) hTimer = ports[0xA4] | ports[0xA5] << 8;
-        if (!vblank) return;
+    }
+
+    /** VBlank timer tick (once per frame, at line 144). */
+    private void tickVTimer() {
+        int ctl = ports[0xA2];
         if (vTimer == 1) raiseIrq(5);
         if ((ctl & 4) != 0 && vTimer != 0 && --vTimer == 0 && (ctl & 8) != 0) vTimer = ports[0xA6] | ports[0xA7] << 8;
+    }
+
+    /**
+     * Rule R2 (REP exit): the language's REP loop tests its exit condition at the start of a step, so after the
+     * final iteration (CX = 0, or the Z condition of REPZ/REPNZ CMPS/SCAS) one more step only falls through. On the
+     * CPU that test is part of the last iteration: no interrupt can be taken in between and it costs nothing. Run
+     * that step now. Returns true if it ran (the caller's per-instruction counters are preserved).
+     */
+    private boolean finishRepExit(long pcBefore) {
+        if (linearPC() != pcBefore || curBytes.length == 0) return false;
+        int i = 0, repKind = 0;
+        while (i < curBytes.length - 1 && WSCpuTiming.isPrefix(curBytes[i] & 0xFF)) {
+            int b = curBytes[i] & 0xFF;
+            if (b == 0xF2 || b == 0xF3) repKind = b;
+            i++;
+        }
+        int op = curBytes[i] & 0xFF;
+        boolean string = (op >= 0xA4 && op <= 0xA7) || (op >= 0xAA && op <= 0xAF) || (op >= 0x6C && op <= 0x6F);
+        if (repKind == 0 || !string) return false;
+        boolean exit = reg(lang.getRegister("CX")) == 0;
+        if (!exit && (op == 0xA6 || op == 0xA7 || op == 0xAE || op == 0xAF)) {
+            boolean zf = flag(lang.getRegister("ZF"));
+            exit = repKind == 0xF3 ? !zf : zf;
+        }
+        if (!exit) return false;
+        int acc = curAccesses, split = curSplitWords; byte[] bytes = curBytes; int len = curLen; boolean intr = curInterrupted;
+        thread.stepInstruction();
+        curAccesses = acc; curSplitWords = split; curBytes = bytes; curLen = len; curInterrupted = intr;
+        return true;
     }
 
     /**
@@ -1223,8 +1352,10 @@ public class WSMachine {
                     if (!boundary()) { haltedLines++; break; }
                     if (csMayHaveChanged) { syncCsval(); csMayHaveChanged = false; }
                     if (beforeStep != null) beforeStep.accept(this);
+                    long pcBefore = linearPC();
                     try {
                         thread.stepInstruction();
+                        finishRepExit(pcBefore);
                     } catch (RuntimeException e) {
                         if (onFault == null || !onFault.test(this, e)) throw e;
                         suppressIrq = suppressTrap = false;
@@ -1239,15 +1370,32 @@ public class WSMachine {
         }
     }
 
-    /** Cycle-timed frames (40704 cycles): lines/timers/sweep/SDMA advance per cycle. */
+    /**
+     * Cycle-timed frames: lines, timers, sweep and SDMA advance per CPU cycle, and instruction costs come from
+     * {@link WSCpuTiming} (prefetch queue, internal cycles, bus accesses). The console starts at the post-boot
+     * display position of its model (mono line 26 cycle 53, colour line 127 cycle 232: where the boot ROM hands
+     * over, as modelled by the reference emulator) and a frame ends at the start of line 145, as on the reference.
+     */
     private void runCycleFrames(int frames, java.util.function.IntConsumer onFrame) {
+        if (timing == null) {
+            timing = new WSCpuTiming(new WSCpuTiming.Bus() {
+                public void cycle() { cycles++; tickSweep(); tickLine(); }
+                public int waitStates(long linear) { return WSMachine.this.waitStates(linear); }
+                public boolean wordBus(long linear) { return isWordBus(linear); }
+            });
+            if (cycles == 0 && instructions == 0) {
+                currentLine = color ? 127 : 26;
+                cycleInLine = color ? 232 : 53;
+            }
+            timing.flush(linearPC());
+        }
         long prevPc = -1;
         for (int f = 0; f < frames; f++) {
             if (onFrame != null) onFrame.accept(f);
             long frameStart = cycles;
-            // Safety: even with all-HLT frames must end; HLT still ticks cycles below.
-            while (cycles - frameStart < CYCLES_PER_FRAME) {
-                if (!boundary()) { tickCycles(1); continue; }   // halted: burn cycles to IRQ
+            vblankStarted = false;
+            while (!vblankStarted) {
+                if (!boundary()) { timing.halted(); continue; }   // halted: cycles burn until an IRQ
                 if (csMayHaveChanged) { syncCsval(); csMayHaveChanged = false; }
                 if (beforeStep != null) beforeStep.accept(this);
                 long pcBefore = linearPC();
@@ -1256,25 +1404,25 @@ public class WSMachine {
                 boolean repFirst = pcBefore != prevPc;
                 try {
                     thread.stepInstruction();
+                    finishRepExit(pcBefore);
                 } catch (RuntimeException e) {
                     if (onFault == null || !onFault.test(this, e)) throw e;
                     suppressIrq = suppressTrap = false;
                     prevPc = -1;
+                    timing.flush(linearPC());
                     continue;
                 }
                 instructions++;
-                afterStep();
                 long pcAfter = linearPC();
                 boolean taken = pcAfter != pcBefore + curLen;
-                int c = cyclesFor(curBytes, taken, repFirst) + curSplitWords;
-                if (taken && (pcAfter & 1) != 0) c++;   // odd branch target costs one more
-                // HLT's own 9 cycles were counted above; the halted wait burns in boundary().
+                boolean repMore = pcAfter == pcBefore;
                 tickOverride = true;
-                try { tickCycles(Math.max(1, c)); } finally { tickOverride = false; }
+                try { timing.instruction(curBytes, taken, pcAfter, curAccesses, repFirst, repMore, curInterrupted); }
+                finally { tickOverride = false; }
+                afterStep();                                     // single-step trap (charged as an interrupt)
                 prevPc = pcBefore;
                 if (stopped) throw new IllegalStateException(String.format("stopAt %05x reached", stopAt));
-                // Guard against pathological zero-cycle loops (should not happen).
-                if (instructions > (long) frames * CYCLES_PER_FRAME * 2) break;
+                if (cycles - frameStart > 4L * CYCLES_PER_FRAME) break;   // display off: end the frame anyway
             }
         }
     }
@@ -1352,14 +1500,20 @@ public class WSMachine {
         @Override
         public void beforeExecuteInstruction(PcodeThread<byte[]> t, Instruction ins, PcodeProgram program) {
             pendingIoWrites.clear();
+            curStart = ins.getAddress().getOffset();
+            if (pfLo >= 0 && (curStart != pfExpect || curStart < pfLo || curStart >= pfHi)) prefetchRelease();
             ifBefore = flag(rIF);
             tfBefore = flag(rTF);
             curSplitWords = 0;
+            curAccesses = 0;
+            curAccessKeys.clear();
+            curInterrupted = false;
             curInBefore = 0;
             try {
                 curBytes = ins.getParsedBytes();
                 curLen = ins.getLength();
             } catch (Exception e) { curBytes = new byte[0]; curLen = 1; }
+            if (pfLo >= 0) pfExpect = curStart + curLen;
             if (cycleTiming) {
                 int q = 0;
                 while (q < curBytes.length - 1 && PREFIXES.contains(curBytes[q] & 0xFF)) q++;
@@ -1372,7 +1526,7 @@ public class WSMachine {
                     Varnode in = op.getInput(i);
                     if (in.getAddress().getAddressSpace() == io) {
                         int port = (int) in.getOffset() & 0xFF;
-                        if (cycleTiming && in.getSize() == 2 && ((port & 1) != 0 || port >= 0xC0)) curSplitWords++;
+                        if (cycleTiming) countAccess(false, true, port, in.getSize());
                         int v = portIn(port, in.getSize());
                         byte[] b = new byte[in.getSize()];
                         for (int k = 0; k < b.length; k++) b[k] = (byte) (v >> (8 * k));
@@ -1382,22 +1536,22 @@ public class WSMachine {
                 }
                 Varnode out = op.getOutput();
                 if (out != null && out.getAddress().getAddressSpace() == io) {
-                    if (cycleTiming && out.getSize() == 2) {
-                        int port = (int) out.getOffset() & 0xFF;
-                        if ((port & 1) != 0 || port >= 0xC0) curSplitWords++;
-                    }
+                    if (cycleTiming) countAccess(true, true, (int) out.getOffset() & 0xFF, out.getSize());
                     pendingIoWrites.add(out);
                 }
             }
             long lin = ins.getAddress().getOffset();
             boolean repIteration = lin == lastTraced && ins.getMnemonicString().contains(".REP");
             lastTraced = lin;
-            if (firstTrace.size() < traceLimit && !repIteration) {
+            if (!repIteration) { traceSteps++; framePcSum = (framePcSum + lin) & 0xFFFFFFFFL; }
+            if (!repIteration && traceSteps >= traceFrom && traceSteps < traceFrom + traceLimit) {
                 firstTrace.add(String.format("%d\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x\t%04x",
-                    firstTrace.size() + 1, reg(rCS), (lin - (reg(rCS) << 4)) & 0xFFFF,
+                    traceSteps, reg(rCS), (lin - (reg(rCS) << 4)) & 0xFFFF,
                     reg(lang.getRegister("AX")), reg(lang.getRegister("BX")), reg(lang.getRegister("CX")), reg(lang.getRegister("DX")),
                     reg(lang.getRegister("SI")), reg(lang.getRegister("DI")), reg(lang.getRegister("BP")), reg(rSP),
-                    reg(rDS), reg(rES), reg(rSS), packFlags()));
+                    reg(rDS), reg(rES), reg(rSS), packFlags())
+                    + String.format("\t%02x\t%02x\t%02x\t%02x", ports[0xC0], ports[0xC1], ports[0xC2], ports[0xC3])
+                    + (cycleTiming ? String.format("\t%d\t%d\t%d", cycles, currentLine, cycleInLine) : ""));
             }
             int ri = (int) (ringCount++ & 63);
             ringLin[ri] = lin;
@@ -1446,11 +1600,7 @@ public class WSMachine {
         @Override
         public void beforeLoad(PcodeThread<byte[]> t, PcodeOp op, AddressSpace space, byte[] offset, int size) {
             accessStats.merge("load:" + space.getName(), 1, Integer::sum);
-            if (cycleTiming && size == 2) {
-                long a = le(offset);
-                if (space == ram) { if ((a & 1) != 0 || !isWordBus(a & 0xFFFFF)) curSplitWords++; }
-                else if (space == io) { int p = (int) a & 0xFF; if ((p & 1) != 0 || p >= 0xC0) curSplitWords++; }
-            }
+            if (cycleTiming && (space == ram || space == io)) countAccess(false, space == io, le(offset), size);
             if (space == ram && memoryWatch != null) {
                 long a = le(offset);
                 byte[] cur = emu.getSharedState().getVar(ram.getAddress(a), size, false, Reason.INSPECT);
@@ -1481,11 +1631,7 @@ public class WSMachine {
         @Override
         public void afterStore(PcodeThread<byte[]> t, PcodeOp op, AddressSpace space, byte[] offset, int size, byte[] value) {
             accessStats.merge("store:" + space.getName(), 1, Integer::sum);
-            if (cycleTiming && size == 2) {
-                long a = le(offset);
-                if (space == ram) { if ((a & 1) != 0 || !isWordBus(a & 0xFFFFF)) curSplitWords++; }
-                else if (space == io) { int p = (int) a & 0xFF; if ((p & 1) != 0 || p >= 0xC0) curSplitWords++; }
-            }
+            if (cycleTiming && (space == ram || space == io)) countAccess(true, space == io, le(offset), size);
             if (space == io) {
                 portOut((int) le(offset) & 0xFF, size, (int) le(value));
                 return;
@@ -1523,11 +1669,13 @@ public class WSMachine {
                     return true;
                 }
                 case "swi": {                                  // INT n / INT3 / INTO / BOUND: returns the handler
+                    curInterrupted = true;
                     long target = instructionInterrupt(t, (int) val(st, op.getInput(1)) & 0xFF);
                     if (op.getOutput() != null) put(st, op.getOutput(), target);   // p-code then does call [target]
                     return true;
                 }
                 case "divtrap": {                              // DIV/IDIV/AAM 0 divide error: INT 0, branch now
+                    curInterrupted = true;
                     long target = instructionInterrupt(t, 0);
                     irqStats.merge("divtrap", 1, Integer::sum);
                     t.overrideCounter(addr(target));

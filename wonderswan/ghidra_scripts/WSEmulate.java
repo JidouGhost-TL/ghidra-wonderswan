@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Run the current WonderSwan program in WSMachine and write emulation evidence.
 // Args: <out dir> [frames=1500] [slice=40000] [stopAt linear hex, or - for none] [shotEvery=100]
-//       [saves dir to load, or -] [input script file, or -]
+//       [saves dir to load, or -] [input script file, or -] [environment, or -: hp=0|1 (headphone adapter
+//       connected, default 1), eep=XX (blank cartridge EEPROM fill, default FF as delivered; Mesen 2 uses 00), cyc=0|1 (cycle-timed
+//       lines, timers and interrupts instead of `slice` instructions per frame)]
 // Writes coverage.json (executed instruction linear addresses with ROM offset, CS and DS/ES sets), edges.tsv,
 // banks.json (bank writes + DMA log), ram.bin, vram_writers.json, saves/ (internal.eeprom, cart.eeprom,
 // cart.sram as present after the run) and eeprom.log (every EEPROM operation and refused request).
@@ -25,6 +27,22 @@ public class WSEmulate extends GhidraScript {
         boolean color = currentProgram.getOptions("WonderSwan").getBoolean("Color", true);
         WSMachine m = new WSMachine(currentProgram, color);
         if (a.length > 3 && !a[3].equals("-")) m.stopAt = Long.parseLong(a[3], 16);
+        boolean[] sigOut = { false };
+        // Arg 8 (optional): boot environment, comma-separated: hp=0|1 (headphones), eep=XX (blank cart EEPROM fill).
+        if (a.length > 7 && !a[7].equals("-")) {
+            for (String kv : a[7].split(",")) {
+                String[] e = kv.split("=", 2);
+                switch (e[0]) {
+                    case "hp" -> m.headphones = !e[1].equals("0");
+                    case "eep" -> m.setCartEepromFill(Integer.parseInt(e[1], 16));
+                    case "cyc" -> m.cycleTiming = !e[1].equals("0");
+                    case "trace" -> { String[] w = e[1].split(":"); m.traceFrom = Long.parseLong(w[0]); if (w.length > 1) m.traceLimit = Integer.parseInt(w[1]); }
+                    case "sig" -> sigOut[0] = !e[1].equals("0");
+                    default -> throw new IllegalArgumentException("unknown environment key: " + e[0]);
+                }
+            }
+            println("WSEmulate: environment " + a[7]);
+        }
         if (a.length > 5 && !a[5].equals("-")) println("WSEmulate: loaded saves " + m.loadSaves(Paths.get(a[5])));
         List<int[]> script = new ArrayList<>();
         if (a.length > 6 && !a[6].equals("-")) {
@@ -36,10 +54,15 @@ public class WSEmulate extends GhidraScript {
                 script.add(new int[] { Integer.parseInt(t[0]), Integer.parseInt(t[1]), Integer.parseInt(t[2], 16) });
             }
         }
+        // Frame signatures (env sig=1): per frame the logical steps so far, the cycle count and the sum of executed
+        // linear addresses (same columns as the Mesen tracer's framesig.tsv).
+        final PrintWriter sig = sigOut[0] ? new PrintWriter(out.resolve("framesig.tsv").toFile()) : null;
+        if (sig != null) sig.println("frame\tn\tcyc\tpcsum");
         long t0 = System.currentTimeMillis();
         String error = null;
         try {
             m.run(frames, slice, f -> {
+                if (sig != null && f > 0) { sig.printf("%d\t%d\t%d\t%d%n", f - 1, m.traceSteps, m.cycleTiming ? m.frameEndCycle : m.cycles, m.framePcSum); m.framePcSum = 0; }
                 if (script.isEmpty()) {
                     int ph = f % 40;
                     m.buttons = (f >= 100 && ph < 3) ? 0x02 : (f >= 100 && ph >= 20 && ph < 23) ? 0x04 : 0;
@@ -66,6 +89,7 @@ public class WSEmulate extends GhidraScript {
             for (String t : m.trace) println("TRACE " + t);
         }
         long ms = System.currentTimeMillis() - t0;
+        if (sig != null) { sig.printf("%d\t%d\t%d\t%d%n", frames - 1, m.traceSteps, m.cycles, m.framePcSum); sig.close(); }
         try (PrintWriter w = new PrintWriter(out.resolve("coverage.json").toFile())) {
             w.print("[");
             boolean first = true;
@@ -102,10 +126,15 @@ public class WSEmulate extends GhidraScript {
             w.println("from\tto\ttarget_cs\tkind\tcount");   // linear hex; from=fffff for injected irq
             for (Map.Entry<String, Integer> e : m.edges.entrySet()) w.println(e.getKey().replace(',', '\t') + "\t" + e.getValue());
         }
+        try (PrintWriter w = new PrintWriter(out.resolve("irqlog.tsv").toFile())) {
+            w.println("step\tlevel\tline\tlcyc\tlatched");
+            for (String l : m.irqLog) w.println(l);
+        }
         try (PrintWriter w = new PrintWriter(out.resolve("trace.tsv").toFile())) {
-            w.println("n\tcs\tip\tax\tbx\tcx\tdx\tsi\tdi\tbp\tsp\tds\tes\tss\tflags");
+            w.println("n\tcs\tip\tax\tbx\tcx\tdx\tsi\tdi\tbp\tsp\tds\tes\tss\tflags\tc0\tc1\tc2\tc3" + (m.cycleTiming ? "\tcyc\tline\tlcyc" : ""));
             for (String line : m.firstTrace) w.println(line);
         }
+        println("P2 prefetch holds " + m.prefetchHolds);
         println("ACCESS " + m.accessStats + " IRQ " + m.irqStats + " ports B2=" + m.ports[0xB2] + " B0=" + m.ports[0xB0]
             + String.format(" E0b carried=%d resumed=%d maxDepth=%d", m.computedEdges.carried(), m.computedEdges.resumed(), m.computedEdges.maxDepth()));
         println(String.format("WSEmulate: frames=%d instructions=%d unique_insn=%d dma=%d ms=%d (%.0f insn/s) error=%s",
