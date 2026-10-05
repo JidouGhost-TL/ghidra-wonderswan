@@ -2,3 +2,39 @@
 // Ghidra extension build: GHIDRA_INSTALL_DIR must point at the Ghidra install.
 def ghidraInstallDir = System.env.GHIDRA_INSTALL_DIR ?: (project.hasProperty("GHIDRA_INSTALL_DIR") ? project.GHIDRA_INSTALL_DIR : "/opt/ghidra_12.1.3_PUBLIC")
 apply from: new File(ghidraInstallDir).getCanonicalPath() + "/support/buildExtension.gradle"
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+}
+
+// JUnit tests (the asset viewer) run under `test`; the plain-Java peripheral tests under `mapperTest`.
+tasks.withType(Test) {
+    useJUnit()
+}
+
+// Plain-Java unit tests (no framework; each test main throws on failure).
+tasks.register('mapperTest', JavaExec) {
+    group = 'verification'
+    description = 'Runs the cartridge peripheral unit tests (flash, RTC, KARNAK, detection).'
+    dependsOn sourceSets.test.output
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'jidoughost.wonderswan.MapperTestAll'
+}
+tasks.named('check') { dependsOn 'mapperTest' }
+
+// Headed GUI smoke test: asset viewer + debugger plugins in a real tool with a
+// synthetic ROM. Needs a display and the v30mz extension installed to the Ghidra
+// user settings in use (see wonderswan/gui-test/run.sh for an isolated Xvfb run).
+// Not part of `check`: it needs a display, so CI runs it via the container.
+tasks.register('guiTest', JavaExec) {
+    group = 'verification'
+    description = 'Runs the headed GUI smoke test (asset viewer + debugger plugins). Needs a display.'
+    dependsOn sourceSets.test.output
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'jidoughost.wonderswan.WSGuiSmoke'
+    systemProperty 'java.awt.headless', 'false'
+}

@@ -37,6 +37,12 @@ import ghidra.util.exception.CancelledException;
  *   3000:0000  ROM1 window  uninitialised, bank-dependent (port C3)
  *   4000:0000 .. F000:0000  fixed linear window, twelve 64 KiB blocks mapped through the reset value
  *                           of the linear bank register (C0 = 0xFF); small ROMs mirror.
+ *   ROM_xx     data overlays, one 64 KiB read-only non-executable overlay block per ROM bank not
+ *              already visible in the fixed linear window, overlaying 0000:0000 (each in its own
+ *              overlay address space named after the block, e.g. ROM_3A:0000:0100). Any ROM offset
+ *              is reachable via Go-To-Address, labels and references. Bank overlays for executed
+ *              window code (rule B2, ROM0_BANK_XXXX / ROM1_BANK_XXXX at 2000:0000 / 3000:0000) are
+ *              executable views at the window address; these are data views (see {@link #isDataOverlay}).
  * The whole ROM is kept as FileBytes so analyzers can add ROM banks as overlays later.
  */
 public class WonderSwanLoader extends AbstractProgramWrapperLoader {
@@ -45,6 +51,66 @@ public class WonderSwanLoader extends AbstractProgramWrapperLoader {
     public static final String LANG_V30MZ = "V30MZ:LE:16:default";
     public static final String LANG_X86_REAL = "x86:LE:16:Real Mode";
     public static final String OPTIONS_CATEGORY = "WonderSwan";
+    /** Loader option: map every non-linear ROM bank as a read-only data overlay (default on). */
+    public static final String OPT_MAP_BANKS = "Map all ROM banks as data overlays";
+
+    /**
+     * True for a loader-created ROM data overlay block (name {@code ROM_XX}, hex bank number,
+     * e.g. {@code ROM_3A}): a read-only non-executable FileBytes-backed overlay of 0000:0000.
+     * Rule-B2 window overlays ({@code ROM0_BANK_XXXX}/{@code ROM1_BANK_XXXX}) are executable
+     * views at the window address and do not match.
+     */
+    public static boolean isDataOverlay(MemoryBlock b) {
+        return b != null && isDataOverlayName(b.getName());
+    }
+
+    /** Name test behind {@link #isDataOverlay}, pure for unit tests (no framework). */
+    public static boolean isDataOverlayName(String n) {
+        if (n == null || !n.startsWith("ROM_") || n.length() <= 4) return false;
+        for (int i = 4; i < n.length(); i++) {
+            char c = n.charAt(i);
+            if ((c < '0' || c > '9') && (c < 'A' || c > 'F')) return false;
+        }
+        return true;
+    }
+
+    /** ROM bank number of a data overlay block, or -1 when {@link #isDataOverlay} is false. */
+    public static int dataOverlayBank(MemoryBlock b) {
+        return b == null ? -1 : dataOverlayBankName(b.getName());
+    }
+
+    /** Bank number behind {@link #dataOverlayBank}, pure for unit tests. */
+    public static int dataOverlayBankName(String n) {
+        if (!isDataOverlayName(n)) return -1;
+        try {
+            return Integer.parseInt(n.substring(4), 16);
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    /** Data overlay block name for a ROM bank (e.g. bank {@code 0x3A} → {@code ROM_3A}). */
+    public static String dataOverlayName(int bank) {
+        return String.format("ROM_%02X", bank);
+    }
+
+    /** Banks visible in the fixed linear window (4000–F000) for an effective ROM size. */
+    public static Set<Integer> linearBanks(long romLen) {
+        Set<Integer> out = new HashSet<>();
+        for (int seg = WSHardware.SEG_LINEAR_FIRST; seg <= 0xF000; seg += 0x1000) {
+            out.add((int) (WSHardware.linearToRom(((long) seg) << 4, WSHardware.RESET_C0, romLen) >> 16));
+        }
+        return out;
+    }
+
+    /** Banks needing data overlays: every 64 KiB bank not in {@link #linearBanks}. */
+    public static List<Integer> dataOverlayBanks(long romLen) {
+        Set<Integer> lin = linearBanks(romLen);
+        List<Integer> out = new ArrayList<>();
+        int total = (int) (romLen / 0x10000);
+        for (int b = 0; b < total; b++) if (!lin.contains(b)) out.add(b);
+        return out;
+    }
 
     @Override
     public String getName() { return NAME; }
@@ -68,13 +134,23 @@ public class WonderSwanLoader extends AbstractProgramWrapperLoader {
         ByteProvider provider = settings.provider();
         byte[] rom = provider.readBytes(0, provider.length());
         WSHeader hdr = WSHeader.parse(rom);
+        WSCartridge cart = WSCartridge.detect(rom, provider.getName());
+        boolean mapBanks = true;
+        for (Option opt : settings.options()) {
+            if (!OPT_MAP_BANKS.equals(opt.getName())) continue;
+            Object v = opt.getValue();
+            if (v instanceof Boolean b) mapBanks = b;
+            else if (v instanceof String s) mapBanks = Boolean.parseBoolean(s);
+        }
         // Hardware model: colour when the footer says so, or when the cartridge was released for the
         // WonderSwan Color (.wsc). Some colour releases leave the footer flag 0 and diverge from Mesen within
         // ~10 instructions when run on the mono model.
         String name = provider.getName() == null ? "" : provider.getName().toLowerCase();
         boolean colorHw = hdr.color || name.endsWith(".wsc");
         String colorSource = hdr.color ? "footer" : colorHw ? "file extension .wsc (footer flag 0)" : "footer (mono)";
-        long romLen = rom.length;
+        long romLen = cart.effectiveSize;
+        settings.log().appendMsg("WonderSwan cartridge: " + cart.summary());
+        for (String w : cart.warnings) settings.log().appendMsg("WonderSwan: " + w);
         Memory mem = program.getMemory();
         SegmentedAddressSpace space = (SegmentedAddressSpace) program.getAddressFactory().getDefaultAddressSpace();
         FileBytes fb = MemoryBlockUtils.createFileBytes(program, provider, settings.monitor());
@@ -98,14 +174,33 @@ public class WonderSwanLoader extends AbstractProgramWrapperLoader {
                 b.setComment(String.format("ROM bank window, contents depend on port %02X; resolved banks are added as overlays", w[1]));
             }
 
+            boolean padded = romLen != rom.length;
             for (int seg = WSHardware.SEG_LINEAR_FIRST; seg <= 0xF000; seg += 0x1000) {
                 long linear = ((long) seg) << 4;
                 long off = WSHardware.linearToRom(linear, WSHardware.RESET_C0, romLen);
-                MemoryBlock b = mem.createInitializedBlock(String.format("LIN_%04X", seg), space.getAddress(seg, 0),
-                    fb, off, 0x10000, false);
+                MemoryBlock b;
+                String comment;
+                if (!padded) {
+                    b = mem.createInitializedBlock(String.format("LIN_%04X", seg), space.getAddress(seg, 0),
+                        fb, off, 0x10000, false);
+                    comment = String.format("Fixed linear window, ROM bank 0x%02X (file offset 0x%06X)", off >> 16, off);
+                } else {
+                    // Non-power-of-two image: materialise the window (file bytes at the end, start padding).
+                    byte[] win = new byte[0x10000];
+                    long pad = romLen - rom.length;
+                    for (int i = 0; i < win.length; i++) {
+                        long f = off + i - pad;
+                        win[i] = f < 0 ? (byte) WSHardware.PAD_BYTE : rom[(int) f];
+                    }
+                    b = mem.createInitializedBlock(String.format("LIN_%04X", seg), space.getAddress(seg, 0),
+                        new java.io.ByteArrayInputStream(win), 0x10000, settings.monitor(), false);
+                    comment = String.format("Fixed linear window, ROM bank 0x%02X (effective offset 0x%06X; image padded at the start)", off >> 16, off);
+                }
                 b.setPermissions(true, false, true);
-                b.setComment(String.format("Fixed linear window, ROM bank 0x%02X (file offset 0x%06X)", off >> 16, off));
+                b.setComment(comment);
             }
+
+            if (mapBanks) mapDataOverlays(mem, space, fb, rom, romLen, padded, settings);
         }
         catch (Exception e) {
             throw new IOException("WonderSwan memory map: " + e.getMessage(), e);
@@ -153,11 +248,55 @@ public class WonderSwanLoader extends AbstractProgramWrapperLoader {
         o.setInt("ROM size code", hdr.romSizeCode);
         o.setInt("Save code", hdr.saveCode);
         o.setInt("Flags", hdr.flags);
-        o.setBoolean("RTC", hdr.rtc);
+        o.setInt("Mapper code", hdr.mapperCode);
+        o.setString("Mapper", cart.mapperName());
+        o.setBoolean("RTC", cart.hasRtc());
+        o.setBoolean("Flash", cart.hasFlash());
         o.setBoolean("Checksum OK", hdr.checksumOk());
         o.setString("Reset", String.format("%04X:%04X", hdr.resetSegment, hdr.resetOffset));
-        if (!hdr.checksumOk())
-            settings.log().appendMsg(String.format("WonderSwan: footer checksum %04X != computed %04X", hdr.checksum, hdr.computedChecksum));
+        o.setBoolean("Map data overlays", mapBanks);
+    }
+
+    /**
+     * Map every 64 KiB ROM bank not already visible in the fixed linear window as a read-only,
+     * non-executable overlay block of 0000:0000, one per bank in its own overlay space
+     * (e.g. {@code ROM_3A} for bank 0x3A, addressable as {@code ROM_3A:0000:0100}).
+     * Non-executable, so Ghidra's code-finding analyzers (entry points, aggressive instruction
+     * finder, function starts) and the WS evidence rules F/G/U/J (all gated on executable) leave
+     * them as pure data; the decompiler only sees functions, of which none are created here.
+     */
+    private void mapDataOverlays(Memory mem, SegmentedAddressSpace space, FileBytes fb, byte[] rom,
+            long romLen, boolean padded, ImporterSettings settings) throws Exception {
+        Address base = space.getAddress(WSHardware.SEG_RAM, 0);
+        int mapped = 0;
+        for (int bank : dataOverlayBanks(romLen)) {
+            String blockName = dataOverlayName(bank);
+            if (mem.getBlock(blockName) != null) continue;
+            long off = ((long) bank) << 16;
+            MemoryBlock b;
+            String comment;
+            if (!padded) {
+                b = mem.createInitializedBlock(blockName, base, fb, off, 0x10000, true);
+                comment = String.format("ROM bank 0x%02X (file offset 0x%06X): read-only data view overlaying 0000:0000; "
+                    + "executable window views (evidence rule B2) are ROM0_BANK_XXXX/ROM1_BANK_XXXX at 2000:0000/3000:0000", bank, off);
+            } else {
+                byte[] win = new byte[0x10000];
+                long pad = romLen - rom.length;
+                for (int i = 0; i < win.length; i++) {
+                    long f = off + i - pad;
+                    win[i] = f < 0 ? (byte) WSHardware.PAD_BYTE : rom[(int) f];
+                }
+                b = mem.createInitializedBlock(blockName, base,
+                    new java.io.ByteArrayInputStream(win), 0x10000, settings.monitor(), true);
+                comment = String.format("ROM bank 0x%02X (effective offset 0x%06X; image padded at the start): "
+                    + "read-only data view overlaying 0000:0000; executable window views (evidence rule B2) are "
+                    + "ROM0_BANK_XXXX/ROM1_BANK_XXXX at 2000:0000/3000:0000", bank, off);
+            }
+            b.setPermissions(true, false, false);
+            b.setComment(comment);
+            mapped++;
+        }
+        settings.log().appendMsg("WonderSwan: mapped " + mapped + " ROM banks as data overlays (ROM_xx at 0000:0000, read-only, non-executable)");
     }
 
     /**
@@ -234,7 +373,7 @@ public class WonderSwanLoader extends AbstractProgramWrapperLoader {
         s.add(ByteDataType.dataType, "rom_size", null);
         s.add(ByteDataType.dataType, "save_type", null);
         s.add(ByteDataType.dataType, "flags", null);
-        s.add(ByteDataType.dataType, "rtc", null);
+        s.add(ByteDataType.dataType, "mapper", "$00 = 2001/KARNAK, $01 = 2003 (older docs: RTC present)");
         s.add(WordDataType.dataType, "checksum", "sum of all ROM bytes except these two");
         return s;
     }
@@ -242,6 +381,8 @@ public class WonderSwanLoader extends AbstractProgramWrapperLoader {
     @Override
     public List<Option> getDefaultOptions(ByteProvider provider, LoadSpec loadSpec, DomainObject domainObject,
             boolean isLoadIntoProgram, boolean mirrorFsLayout) {
-        return super.getDefaultOptions(provider, loadSpec, domainObject, isLoadIntoProgram, mirrorFsLayout);
+        List<Option> list = super.getDefaultOptions(provider, loadSpec, domainObject, isLoadIntoProgram, mirrorFsLayout);
+        list.add(new Option(OPT_MAP_BANKS, Boolean.TRUE, Boolean.class, "MapDataOverlays"));
+        return list;
     }
 }

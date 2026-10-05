@@ -14,7 +14,6 @@ public final class WSHardware {
     /** Bank register values after reset (C0 linear, C2 ROM0, C3 ROM1). */
     public static final int RESET_C0 = 0xFF, RESET_C2 = 0xFF, RESET_C3 = 0xFF;
 
-    /** ROM file offset shown at a linear CPU address (>= 0x40000) under linear bank register c0. */
     /** Cartridge EEPROM size in bytes for a footer save-type byte (WSdev ROM header), 0 if none. */
     public static int cartEepromBytes(int saveCode) {
         return switch (saveCode) { case 0x10 -> 0x80; case 0x20 -> 0x800; case 0x50 -> 0x400; default -> 0; };
@@ -25,30 +24,76 @@ public final class WSHardware {
         return switch (saveCode) { case 0x01, 0x02 -> 0x8000; case 0x03 -> 0x20000; case 0x04 -> 0x40000; case 0x05 -> 0x80000; default -> 0; };
     }
 
+    /**
+     * Effective ROM size for a file image of `fileLength` bytes: the smallest power of two that
+     * holds it. The cartridge bus decodes a power-of-two ROM; a short image is padded at the START
+     * so the footer stays at the top (WSdev ROM_header; Mesen 2 and ares pad the same way), e.g. a
+     * 768 KiB image is read as a 1 MiB ROM whose first 256 KiB is padding. All address masking in
+     * this class uses the effective size.
+     */
+    public static long effectiveSize(long fileLength) {
+        long e = 0x10000;
+        while (e < fileLength) e <<= 1;
+        return e;
+    }
+
+    /** Padding bytes before the file image inside the effective ROM (0 for power-of-two sizes). */
+    public static long padSize(long fileLength) {
+        return effectiveSize(fileLength) - fileLength;
+    }
+
+    /**
+     * File offset of an effective-ROM offset, or -1 when the offset is in the start padding
+     * (reads there return {@link #PAD_BYTE}). Mirroring past the end of the chip is the caller's
+     * masking ({@link #linearToRom}, {@link #bankToRom}); this only places the file at the end.
+     */
+    public static long fileOffset(long effectiveOffset, long fileLength) {
+        long f = effectiveOffset - padSize(fileLength);
+        return f < 0 ? -1 : f;
+    }
+
+    /** Fill byte of the start padding and of erased flash. */
+    public static final int PAD_BYTE = 0xFF;
+
+    /**
+     * Effective-ROM offset shown at a linear CPU address (>= 0x40000) under linear bank register
+     * `c0`. `romLength` is the EFFECTIVE size ({@link #effectiveSize}); translate to a file offset
+     * with {@link #fileOffset} when the image is not a power of two. The C0 mask (6 bits) covers
+     * the 2003 mapper; on a 2001 (4 bits) the extra bits are masked away for every ROM up to
+     * 16 MiB, so one formula serves both.
+     */
     public static long linearToRom(long linear, int c0, long romLength) {
         return ((((long) (c0 & 0x3F)) << 20) | linear) & (romLength - 1);
     }
 
-    /** ROM file offset of 64 KiB bank number `bank` (bank windows C2/C3). */
+    /**
+     * Effective-ROM offset of 64 KiB bank number `bank` (bank windows C1/C2/C3, 16-bit values on
+     * the 2003 mapper). Only the low 10 bits can address the largest (64 MiB) cartridge, but
+     * masking to 10 first is a no-op under the size mask, so the full value is used directly.
+     */
     public static long bankToRom(int bank, long romLength) {
         return (((long) bank) << 16) & (romLength - 1);
     }
 
     /** Port A0 (System Control) at cartridge entry: bit7 bus test OK, bits 3:2 copied from footer flags
      *  bits 3:2 (ROM wait state, ROM width), bit1 colour model, bit0 boot ROM locked out.
-     *  WSdev SoC + ROM_header ("Flag bits 2 and 3 correspond to System Control bits 2 and 3"). */
-    public static int systemControlAtEntry(WSHeader h) {
-        return 0x80 | (h.flags & 0x0C) | (h.color ? 0x02 : 0x00) | 0x01;
+     *  WSdev SoC + ROM_header ("Flag bits 2 and 3 correspond to System Control bits 2 and 3").
+     *  `color` is the console model running the cartridge (the loader's hardware decision: footer flag or
+     *  .wsc), not the footer flag: bit 1 reports the hardware, and colour games whose footer says mono read
+     *  it to choose their colour path. */
+    public static int systemControlAtEntry(WSHeader h, boolean color) {
+        return 0x80 | (h.flags & 0x0C) | (color ? 0x02 : 0x00) | 0x01;
     }
 
     /** CPU registers at cartridge entry (WSdev Boot_ROM, measured on SwanCrystal). DX is undocumented
      *  ("?") and left 0. Order: AX BX CX DX SI DI SP BP DS ES SS CS IP FLAGS. AX low byte = port A0.
      *  SOURCE-CONFLICT: Mesen 2 (b9fa69d, WsConsole::InitPostBootRomState) uses CX=0004, DX=0001,
      *  SI=0435 on colour and DS=FE00 on both models. ws-test-suite's startup_state_custom_crt0 only
-     *  displays the state, so it settles this only when run on real hardware. WSdev kept (measured). */
-    public static int[] registersAtEntry(WSHeader h) {
-        int a0 = systemControlAtEntry(h);
-        return h.color
+     *  displays the state, so it settles this only when run on real hardware. WSdev kept (measured).
+     *  The boot ROM, and so this state, belongs to the console model `color`, not to the cartridge. */
+    public static int[] registersAtEntry(WSHeader h, boolean color) {
+        int a0 = systemControlAtEntry(h, color);
+        return color
             ? new int[] { 0xFF00 | a0, 0x0043, 0, 0, 0x0457, 0x040B, 0x2000, 0, 0xFE00, 0, 0, 0xFFFF, 0x0000, 0xF086 }
             : new int[] { 0xFF00 | a0, 0x0040, 0, 0, 0x023D, 0x040D, 0x2000, 0, 0xFF00, 0, 0, 0xFFFF, 0x0000, 0xF082 };
     }
@@ -93,6 +138,7 @@ public final class WSHardware {
             {"CC", "GPO_EN"}, {"CD", "GPO_DATA"}, {"CE", "FLASH_ENABLE"}, {"CF", "BANK_LINEAR_ALIAS"},
             {"D0", "BANK_SRAM_L"}, {"D1", "BANK_SRAM_H"}, {"D2", "BANK_ROM0_L"}, {"D3", "BANK_ROM0_H"},
             {"D4", "BANK_ROM1_L"}, {"D5", "BANK_ROM1_H"},
+            {"D6", "KARNAK_CTRL"}, {"D8", "KARNAK_ADPCM_IN"}, {"D9", "KARNAK_ADPCM_OUT"},
         };
         for (String[] e : p) PORTS.put(Integer.parseInt(e[0], 16), e[1]);
     }

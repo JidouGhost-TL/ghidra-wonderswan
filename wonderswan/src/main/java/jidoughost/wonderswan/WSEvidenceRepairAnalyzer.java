@@ -27,13 +27,18 @@ import ghidra.util.task.TaskMonitor;
  *   D0  title DS default from execution evidence ({@link WSCompilerRules}), before D1;
  *   C1  every function whose signature no user or importer set gets the title's convention: __lsic86 when
  *       rule K1 identifies LSI C-86 code, else the compiler spec's default (Ghidra's analyzers otherwise
- *       leave __cdecl16near / unknown, which the decompiler reads as stack arguments).
+ *       leave __cdecl16near / unknown, which the decompiler reads as stack arguments);
+ *   R1  register return values from caller/callee evidence ({@link WSReturns});
+ *   V1  RAM flags written by interrupt handlers and polled in spin-wait loops are volatile
+ *       ({@link WSVolatile}).
  */
 public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
     public static final String NAME = "WonderSwan Execution Evidence (repair)";
     private static final String OPT_JT = "Recover jump tables (rule J1)";
     private static final String OPT_CC = "Apply default calling convention (rule C1)";
-    private boolean jumpTables = true, convention = true;
+    private static final String OPT_CP = "Follow code-pointer variables (rules F1-F4)";
+    private static final String OPT_GAP = "Classify unreferenced code after terminators (rules G1/U1)";
+    private boolean jumpTables = true, convention = true, codePointers = true, gapCode = true;
 
     public WSEvidenceRepairAnalyzer() {
         super(NAME, "Checks analysis results against the execution evidence collected by '"
@@ -53,12 +58,16 @@ public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
     public void registerOptions(Options o, Program program) {
         o.registerOption(OPT_JT, jumpTables, null, "Recover CS-relative jump/call tables by rule, checked against observed targets");
         o.registerOption(OPT_CC, convention, null, "Set the compiler spec's default convention on functions without a user/imported signature");
+        o.registerOption(OPT_GAP, gapCode, null, "Disassemble structurally proven code after RET/JMP that nothing references: dead branches (G1, no function) and unreferenced functions (U1)");
+        o.registerOption(OPT_CP, codePointers, null, "Disassemble code reached through far/near code-pointer variables (constant stores, setter functions, IVT) and pushed return addresses");
     }
 
     @Override
     public void optionsChanged(Options o, Program program) {
         jumpTables = o.getBoolean(OPT_JT, jumpTables);
         convention = o.getBoolean(OPT_CC, convention);
+        codePointers = o.getBoolean(OPT_CP, codePointers);
+        gapCode = o.getBoolean(OPT_GAP, gapCode);
     }
 
     @Override
@@ -83,20 +92,58 @@ public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
             rule("E1R", s, program, log, failed, () -> s.seedExecuted("E1R"));
             rule("B3", s, program, log, failed, () -> s.resolveWindowFlows());
             rule("P1", s, program, log, failed, () -> parts.add(removePhantoms(program, s)));
-            if (jumpTables) rule("J1", s, program, log, failed, () -> {
-                WSJumpTables j = new WSJumpTables(program, ev, line -> s.emit("%s", line));
-                j.apply(monitor);
-                parts.add(j.summary());
+            // J1 and F1-F4 feed each other (a recovered table target can store a code pointer, a pointer target can hold
+            // a table): alternate until neither adds code.
+            WSJumpTables j = jumpTables ? new WSJumpTables(program, ev, line -> s.emit("%s", line)) : null;
+            WSCodePointers cp = codePointers ? new WSCodePointers(program, line -> s.emit("%s", line), monitor) : null;
+            WSGapCode gc = gapCode ? new WSGapCode(program, line -> s.emit("%s", line), monitor) : null;
+            for (int round = 0; round < 8; round++) {
+                long before = program.getListing().getNumInstructions();
+                if (j != null) rule("J1", s, program, log, failed, () -> j.apply(monitor));
+                if (cp != null) rule("F1-F4", s, program, log, failed, () -> cp.apply());
+                // G1/U1 only once the reference-driven rules are stable: a gap they explain is not "unreferenced"
+                if (gc != null && program.getListing().getNumInstructions() == before) rule("G1/U1", s, program, log, failed, () -> gc.apply());
+                if (program.getListing().getNumInstructions() == before) break;
+            }
+            if (j != null) rule("J1l-finish", s, program, log, failed, () -> j.finish());
+            if (j != null) parts.add(j.summary());
+            if (cp != null) parts.add(cp.summary());
+            if (gc != null) parts.add(gc.summary());
+            rule("D2", s, program, log, failed, () -> {
+                WSBranchContext d2 = new WSBranchContext(program, ev, line -> s.emit("%s", line), monitor);
+                d2.apply();
+                parts.add(d2.summary());
+            });
+            rule("E5", s, program, log, failed, () -> {
+                WSExecutedFunctions e5 = new WSExecutedFunctions(program, ev, line -> s.emit("%s", line), monitor);
+                e5.apply();
+                parts.add(e5.summary());
             });
             rule("fixup", s, program, log, failed, () -> {
                 for (Function f : program.getFunctionManager().getFunctions(true)) CreateFunctionCmd.fixupFunctionBody(program, f, monitor);
             });
             rule("D0", s, program, log, failed, () -> parts.add(applyDsDefault(program, ev, s)));   // before D1: entry evidence overrides it
             rule("D1", s, program, log, failed, () -> s.seedDs());
-            rule("A1", s, program, log, failed, () -> s.classifyArtefacts());
+            rule("D3", s, program, log, failed, () -> parts.add(applyCsDefault(program, s)));
+            WSJumpTables jj = j;
+            rule("A1", s, program, log, failed, () -> s.classifyArtefacts(jj != null ? jj.keptTargets : java.util.Set.of()));
             if (convention) rule("C1", s, program, log, failed, () -> parts.add(applyConvention(program, line -> s.emit("%s", line))));
-            log.appendMsg(NAME + ": " + s.summary() + (parts.isEmpty() ? "" : ", " + String.join(", ", parts))
-                + (failed.isEmpty() ? "" : "; RULES FAILED: " + failed));
+            java.util.Set<ghidra.program.model.address.Address> ivt =
+                cp == null ? java.util.Set.of() : cp.ivtHandlers;
+            rule("R1", s, program, log, failed, () -> {
+                WSReturns r = new WSReturns(program, line -> s.emit("%s", line), monitor);
+                r.apply();
+                parts.add(r.summary());
+            });
+            rule("V1", s, program, log, failed, () -> {
+                WSVolatile v = new WSVolatile(program, ev, ivt, line -> s.emit("%s", line), monitor);
+                v.apply();
+                parts.add(v.summary());
+            });
+            String sum = NAME + ": " + s.summary() + (parts.isEmpty() ? "" : ", " + String.join(", ", parts))
+                + (failed.isEmpty() ? "" : "; RULES FAILED: " + failed);
+            log.appendMsg(sum);
+            s.emit("{\"rule\":\"phase2\",\"summary\":\"%s\"}", sum.replace("\\", "/").replace("\"", "'"));
         }
         catch (CancelledException c) { throw c; }
         catch (Exception e) {
@@ -153,6 +200,12 @@ public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
         int blocks = WSCompilerRules.applyDsDefault(program, v);
         s.emit("{\"rule\":\"D0\",\"ds_default\":\"%04x\",\"share\":%.3f,\"blocks\":%d,\"outcome\":\"SET\"}", v, WSCompilerRules.share(ev, v), blocks);
         return String.format("D0 DS default %04X (%.0f%% of single-DS executed addresses)", v, 100 * WSCompilerRules.share(ev, v));
+    }
+
+    static String applyCsDefault(Program program, WSEvidenceAnalyzer.Seeder s) throws Exception {
+        int[] n = WSCompilerRules.applyCsDefault(program);
+        s.emit("{\"rule\":\"D3\",\"register\":\"CS\",\"spans\":%d,\"blocks\":%d,\"outcome\":\"SET\"}", n[0], n[1]);
+        return String.format("D3 CS default %d spans over %d blocks", n[0], n[1]);
     }
 
     /** C1, convention chosen by rule K1 ({@link WSCompilerRules}): LSI C-86 register convention or the cspec default. */

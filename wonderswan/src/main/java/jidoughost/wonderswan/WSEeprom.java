@@ -43,7 +43,9 @@ public final class WSEeprom {
     private int command, writeBuffer, readBuffer, pendingRead = -1;
     private boolean writeEnabled, protectedHigh, done = true;
     private long busyUntil = -1;
-    private Runnable pendingWrite;
+    /** Pending completed-write operation: 0 none, 1 WRITE, 2 ERASE, 3 WRAL, 4 ERAL. */
+    private int pendingOp;
+    private int pendingAddr, pendingValue;
     /** Every operation and every refused or invalid request, newest last (capped). */
     public final List<String> log = new ArrayList<>();
     public long operations, refused;
@@ -68,7 +70,17 @@ public final class WSEeprom {
         if (busyUntil < 0 || now < busyUntil) return;
         busyUntil = -1;
         if (pendingRead >= 0) { readBuffer = pendingRead; pendingRead = -1; done = true; }
-        if (pendingWrite != null) { pendingWrite.run(); pendingWrite = null; }
+        if (pendingOp != 0) { applyPendingWrite(); pendingOp = 0; }
+    }
+
+    private void applyPendingWrite() {
+        switch (pendingOp) {
+            case 1 -> store(pendingAddr, pendingValue);
+            case 2 -> store(pendingAddr, 0xFFFF);
+            case 3 -> { for (int i = 0; i < data.length / 2; i++) store(i, pendingValue); }
+            case 4 -> { for (int i = 0; i < data.length / 2; i++) store(i, 0xFFFF); }
+            default -> { }
+        }
     }
 
     public int read(int offset, long now) {
@@ -126,12 +138,13 @@ public final class WSEeprom {
             return;
         }
         done = false;
-        final int w = writeBuffer;
+        pendingAddr = addr;
+        pendingValue = writeBuffer;
         switch (name) {
-            case "WRITE" -> { pendingWrite = () -> store(addr, w); busyUntil = now + BUSY_INSTRUCTIONS; }
-            case "ERASE" -> { pendingWrite = () -> store(addr, 0xFFFF); busyUntil = now + BUSY_INSTRUCTIONS; }
-            case "WRAL" -> { pendingWrite = () -> { for (int i = 0; i < data.length / 2; i++) store(i, w); }; busyUntil = now + BUSY_INSTRUCTIONS; }
-            case "ERAL" -> { pendingWrite = () -> { for (int i = 0; i < data.length / 2; i++) store(i, 0xFFFF); }; busyUntil = now + BUSY_INSTRUCTIONS; }
+            case "WRITE" -> { pendingOp = 1; busyUntil = now + BUSY_INSTRUCTIONS; }
+            case "ERASE" -> { pendingOp = 2; busyUntil = now + BUSY_INSTRUCTIONS; }
+            case "WRAL" -> { pendingOp = 3; busyUntil = now + BUSY_INSTRUCTIONS; }
+            case "ERAL" -> { pendingOp = 4; busyUntil = now + BUSY_INSTRUCTIONS; }
             case "WDS" -> writeEnabled = false;
             case "WEN" -> writeEnabled = true;
             default -> { }
@@ -151,5 +164,40 @@ public final class WSEeprom {
         if (image.length != data.length)
             throw new IllegalArgumentException("EEPROM image is " + image.length + " bytes, this EEPROM has " + data.length);
         System.arraycopy(image, 0, data, 0, data.length);
+    }
+
+    /** Write the full device state (contents plus command/control registers and pending operations). */
+    public void saveState(java.io.DataOutputStream o) throws java.io.IOException {
+        o.writeInt(data.length);
+        o.write(data);
+        o.writeInt(command);
+        o.writeInt(writeBuffer);
+        o.writeInt(readBuffer);
+        o.writeInt(pendingRead);
+        o.writeBoolean(writeEnabled);
+        o.writeBoolean(protectedHigh);
+        o.writeBoolean(done);
+        o.writeLong(busyUntil);
+        o.writeInt(pendingOp);
+        o.writeInt(pendingAddr);
+        o.writeInt(pendingValue);
+    }
+
+    /** Restore state written by {@link #saveState}; the device size must match. */
+    public void restoreState(java.io.DataInputStream o) throws java.io.IOException {
+        int n = o.readInt();
+        if (n != data.length) throw new IllegalArgumentException("EEPROM state has " + n + " bytes, this EEPROM has " + data.length);
+        o.readFully(data);
+        command = o.readInt();
+        writeBuffer = o.readInt();
+        readBuffer = o.readInt();
+        pendingRead = o.readInt();
+        writeEnabled = o.readBoolean();
+        protectedHigh = o.readBoolean();
+        done = o.readBoolean();
+        busyUntil = o.readLong();
+        pendingOp = o.readInt();
+        pendingAddr = o.readInt();
+        pendingValue = o.readInt();
     }
 }

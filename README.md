@@ -54,7 +54,8 @@ Auto-analysis runs the emulator in-process (by default 1500 frames with a script
 seeds code discovery from what executed; see the evidence rules in
 [`wonderswan/README.md`](wonderswan/README.md). This adds a few minutes per cartridge. It can be turned
 off, or pointed at a saved `WSEmulate` run, under Analysis Options → *WonderSwan Execution Evidence*
-(*Run WSMachine*, *Frames*, *Evidence directory*).
+(*Run WSMachine*, *Frames*, *Evidence directory*). A Mesen 2 recording of the cartridge can be
+merged in as well (*Mesen trace directory or CDL file*; see `wonderswan/README.md`).
 
 Run the emulator on an imported program (outputs coverage, traces, RAM, screenshots):
 

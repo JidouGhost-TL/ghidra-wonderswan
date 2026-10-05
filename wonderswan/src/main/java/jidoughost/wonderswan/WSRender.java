@@ -29,17 +29,26 @@ public final class WSRender {
 
     /** Render using each line's port snapshot from the last frame (raster effects), else current ports. */
     public static BufferedImage render(WSMachine m) {
-        byte[] ram = m.read(0, 0x10000);
+        return renderSnapshot(m.read(0, 0x10000), m.ports, m.linePorts, m.color);
+    }
+
+    /**
+     * Render from a RAM dump, port row and per-line port snapshots: the same
+     * implementation {@link #render(WSMachine)} uses, shared with the asset
+     * core ({@link WSAssets#renderScreen(WSSnapshot)}) so both stay
+     * pixel-identical by construction.
+     */
+    public static BufferedImage renderSnapshot(byte[] ram, int[] ports, int[][] linePorts, boolean colorHardware) {
         BufferedImage img = new BufferedImage(224, 144, BufferedImage.TYPE_INT_RGB);
         for (int y = 0; y < 144; y++) {
-            int[] p = m.linePorts[y] != null ? m.linePorts[y] : m.ports;
-            renderLine(img, m, ram, p, y);
+            int[] p = linePorts != null && linePorts[y] != null ? linePorts[y] : ports;
+            renderLine(img, ram, p, y, colorHardware);
         }
         return img;
     }
 
-    static void renderLine(BufferedImage img, WSMachine m, byte[] ram, int[] p, int y) {
-        boolean color = (p[0x60] & 0x80) != 0 && m.color;
+    static void renderLine(BufferedImage img, byte[] ram, int[] p, int y, boolean colorHardware) {
+        boolean color = (p[0x60] & 0x80) != 0 && colorHardware;
         boolean bpp4 = color && (p[0x60] & 0x40) != 0;
         boolean packed = bpp4 && (p[0x60] & 0x20) != 0;
         int ctrl = p[0x00];
@@ -94,39 +103,26 @@ public final class WSRender {
 
         /** Colour index of tile pixel (x,y), 0..3 or 0..15. */
         int tilePixel(int tile, int x, int y) {
-            if (bpp4) {
-                int o = 0x4000 + tile * 32 + y * 4;
-                if (packed) return ((ram[o + x / 2] & 0xff) >> ((x & 1) == 0 ? 4 : 0)) & 15;
-                int v = 0;
-                for (int k = 0; k < 4; k++) v |= (((ram[o + k] & 0xff) >> (7 - x)) & 1) << k;
-                return v;
-            }
-            int o = 0x2000 + (tile & 0x1FF) * 16 + y * 2;
-            return (((ram[o] & 0xff) >> (7 - x)) & 1) | ((((ram[o + 1] & 0xff) >> (7 - x)) & 1) << 1);
+            return bpp4 ? WSAssets.tilePixel4bpp(ram, tile, x, y, packed)
+                : WSAssets.tilePixel2bpp(ram, tile, x, y);
         }
 
         boolean transparent(int pal, int idx) {
-            if (idx != 0) return false;
-            if (bpp4) return true;                            // 16-colour: colour 0 always transparent
-            return (pal & 4) != 0;                            // 4-colour: opaque for palettes 0-3, 8-11
+            return WSAssets.transparent(pal, idx, bpp4);
         }
 
         int colour(int pal, int idx) { return color ? rgb(pal, idx) : shade(pal, idx); }
 
         int rgb(int pal, int idx) {
-            int o = 0xFE00 + pal * 32 + idx * 2;
-            int v = (ram[o] & 0xff) | (ram[o + 1] & 0xff) << 8;
-            return (((v >> 8) & 15) * 17) << 16 | (((v >> 4) & 15) * 17) << 8 | (v & 15) * 17;
+            return WSAssets.rgb444(ram, pal, idx);
         }
 
         int shade(int pal, int idx) {
-            return shadeValue((p[0x20 + pal * 2 + idx / 2] >> (4 * (idx & 1))) & 7);
+            return WSAssets.monoShade(p, pal, idx);
         }
 
         int shadeValue(int v) {
-            int level = (p[0x1C + v / 2] >> (4 * (v & 1))) & 15;
-            int g = 255 - level * 17;
-            return g << 16 | g << 8 | g;
+            return WSAssets.monoLevel(p, v);
         }
 
         /** Screen pixel as RGB, or -1 if transparent. */

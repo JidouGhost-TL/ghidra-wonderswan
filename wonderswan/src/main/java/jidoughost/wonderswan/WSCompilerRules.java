@@ -5,6 +5,7 @@ import java.math.BigInteger;
 import java.util.*;
 
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.SegmentedAddress;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.MemoryBlock;
@@ -44,6 +45,7 @@ final class WSCompilerRules {
         for (Function f : p.getFunctionManager().getFunctions(true)) {
             MemoryBlock b = p.getMemory().getBlock(f.getEntryPoint());
             if (b == null || !b.isInitialized() || b.getName().equals("RAM")) continue;
+            if (WonderSwanLoader.isDataOverlay(b)) continue;
             r.romFns++;
             List<String> seq = new ArrayList<>();
             Instruction c = listing.getInstructionAt(f.getEntryPoint());
@@ -90,17 +92,50 @@ final class WSCompilerRules {
         return single == 0 ? 0 : (double) hit / single;
     }
 
-    /** D0: set DS = v over every initialized ROM block (linear window and bank overlays). */
+    /** D0: set DS = v over every initialized ROM block (linear window and bank overlays). Data overlays stay untouched. */
     static int applyDsDefault(Program p, int v) throws Exception {
         ProgramContext ctx = p.getProgramContext();
         Register ds = ctx.getRegister("DS");
         int blocks = 0;
         for (MemoryBlock b : p.getMemory().getBlocks()) {
             if (!b.isInitialized() || !b.isExecute() || b.getName().equals("RAM")) continue;
+            if (WonderSwanLoader.isDataOverlay(b)) continue;
             Address s = b.getStart(), e = b.getEnd();
             ctx.setValue(ds, s, e, BigInteger.valueOf(v));
             blocks++;
         }
         return blocks;
+    }
+
+    /** D3: set CS to each span's own display segment over every initialized block. Code always runs with
+     *  CS = the segment Ghidra shows, so MOV reg,CS / PUSH CS fold to constants instead of surfacing as
+     *  unaffected CS inputs; bank windows are uninitialized and excluded, RAM included (CS = 0 there).
+     *  Loader data overlays (ROM_xx) are pure data and left untouched.
+     *  Returns {spans, blocks}. */
+    static int[] applyCsDefault(Program p) throws Exception {
+        ProgramContext ctx = p.getProgramContext();
+        Register cs = ctx.getRegister("CS");
+        int spans = 0, blocks = 0;
+        for (MemoryBlock b : p.getMemory().getBlocks()) {
+            if (!b.isInitialized()) continue;
+            if (WonderSwanLoader.isDataOverlay(b)) continue;
+            Address a = b.getStart(), end = b.getEnd();
+            if (!(a instanceof SegmentedAddress) || !(end instanceof SegmentedAddress)) continue;
+            blocks++;
+            while (a != null && a.compareTo(end) <= 0) {
+                int sg = ((SegmentedAddress) a).getSegment();
+                long offPart = a.getOffset() - ((long) sg << 4);
+                long chunk = (offPart >= 0 && offPart <= 0xFFFF) ? 0x10000 - offPart : 1;
+                long remaining = end.getOffset() - a.getOffset() + 1;
+                if (chunk > remaining) chunk = remaining;
+                Address spanEnd = a.add(chunk - 1);
+                if (spanEnd == null || spanEnd.compareTo(end) > 0) spanEnd = end;
+                ctx.setValue(cs, a, spanEnd, BigInteger.valueOf(sg));
+                spans++;
+                if (spanEnd.equals(end)) break;
+                a = spanEnd.next();
+            }
+        }
+        return new int[] { spans, blocks };
     }
 }
