@@ -7,9 +7,12 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.Callable;
 
+import javax.swing.JButton;
 import javax.swing.JComboBox;
 import javax.swing.JComponent;
 import javax.swing.JLabel;
@@ -20,8 +23,11 @@ import docking.ComponentProvider;
 import docking.action.DockingActionIf;
 import ghidra.GhidraApplicationLayout;
 import ghidra.app.plugin.core.debug.service.emulation.DebuggerEmulationServicePlugin;
+import ghidra.app.plugin.core.debug.service.target.DebuggerTargetServicePlugin;
 import ghidra.app.plugin.core.debug.service.tracemgr.DebuggerTraceManagerServicePlugin;
 import ghidra.app.plugin.core.progmgr.ProgramManagerPlugin;
+import ghidra.app.services.DebuggerEmulationService;
+import ghidra.app.services.DebuggerTraceManagerService;
 import ghidra.base.project.GhidraProject;
 import ghidra.debug.api.emulation.EmulatorFactory;
 import ghidra.framework.Application;
@@ -34,6 +40,8 @@ import ghidra.program.model.lang.LanguageID;
 import ghidra.program.model.listing.Program;
 import ghidra.program.util.DefaultLanguageService;
 import ghidra.test.TestTool;
+import ghidra.trace.database.DBTrace;
+import ghidra.trace.model.Trace;
 import ghidra.util.classfinder.ClassSearcher;
 
 /**
@@ -45,7 +53,9 @@ import ghidra.util.classfinder.ClassSearcher;
  * <p>Runs as a plain main (via the {@code guiTest} Gradle task) under a display
  * (Xvfb in CI, see {@code wonderswan/gui-test/}). It creates a tool, imports a
  * small synthetic ROM, adds each plugin, shows each provider, renders the Tiles
- * tab from a ROM offset, removes and re-adds the plugins, and closes cleanly.
+ * tab from a ROM offset, steps two live frames through the debugger's frame-step
+ * API and checks the screen paints the emulated frame, removes and re-adds the
+ * plugins, and closes cleanly.
  * Any exception — including the double-registration {@code AssertException}
  * ("... was already added") — fails the test with a non-zero exit.
  *
@@ -88,6 +98,11 @@ public final class WSGuiSmoke {
         for (int i = 0; i < 8192; i++) {
             rom[i] = (byte) ((i & 1) == 0 ? 0xAA : 0x55);
         }
+        // Reset target (visible at linear F000:0000 through the reset bank mapping):
+        // a tight spin (JMP short -2) so emulated frames execute without running off the
+        // top of the address space. Must precede the checksum below.
+        rom[0x10000] = (byte) 0xEB;
+        rom[0x10000 + 1] = (byte) 0xFE;
         int f = size - WSHeader.SIZE;
         rom[f] = (byte) 0xEA;
         rom[f + 1] = 0x00; rom[f + 2] = 0x00;
@@ -250,6 +265,7 @@ public final class WSGuiSmoke {
         onEdt(() -> {
             tool.addPlugin(DebuggerTraceManagerServicePlugin.class.getName());
             tool.addPlugin(DebuggerEmulationServicePlugin.class.getName());
+            tool.addPlugin(DebuggerTargetServicePlugin.class.getName());
             return null;
         });
         check(true, "debugger service plugins added");
@@ -291,6 +307,9 @@ public final class WSGuiSmoke {
         check(true, "screen/input idle refresh without error");
         check(onEdt(() -> screen.getComponent()) != null, "screen component present");
         check(onEdt(() -> input.getComponent()) != null, "input component present");
+
+        // ---- Live frame stepping ----
+        liveFrameStepping(tool, program, dbgPlugin, screen, input);
 
         // ---- Re-registration: remove and add again ----
         onEdt(() -> {
@@ -336,6 +355,129 @@ public final class WSGuiSmoke {
         check(true, "tool closed");
         gp.close();
         check(true, "project closed");
+    }
+
+    /**
+     * Live emulation through the debugger path: start debugger-emulator sessions on the
+     * synthetic ROM, step two frames through the debugger's frame-step API (the call the Step
+     * Frame action runs via the frame scheduler) on the live session and an identical reference
+     * session, and verify the screen provider paints the emulated frame after each.
+     */
+    private static void liveFrameStepping(PluginTool tool, Program program,
+            WSDebuggerPlugin dbgPlugin, WSScreenProvider screen, WSInputProvider input)
+            throws Exception {
+        boolean color = program.getOptions("WonderSwan").getBoolean("Color", true);
+        WSDebuggerEmulator emu = WSDebuggerEmulator.forProgram(program, color, "smoke-live");
+        WSDebuggerEmulator ref = WSDebuggerEmulator.forProgram(program, color, "smoke-ref");
+        check(emu.ws != null && ref.ws != null, "live emulation sessions started");
+        check(emu.ws.instructions == 0 && ref.ws.instructions == 0,
+            "fresh sessions at zero instructions");
+        showTestPattern(emu.ws);
+        showTestPattern(ref.ws);
+
+        Trace trace = onEdt(() -> {
+            Trace t = new DBTrace("smoke-live", program.getCompilerSpec(), WSGuiSmoke.class);
+            DebuggerTraceManagerService tm = tool.getService(DebuggerTraceManagerService.class);
+            tm.openTrace(t);
+            tm.activateTrace(t);
+            return t;
+        });
+        check(trace != null, "live trace opened and active");
+
+        // Frame 1 through the debugger's frame-step API.
+        int steps1 = emu.stepFrame(emu.ws.thread);
+        int refSteps1 = ref.stepFrame(ref.ws.thread);
+        check(steps1 > 0, "Step Frame advanced " + steps1 + " instructions");
+        check(emu.ws.instructions == steps1 && ref.ws.instructions == refSteps1
+            && steps1 == refSteps1, "frame 1 instruction counts agree");
+        check(emu.ws.getCurrentLine() == WSMachine.VISIBLE, "frame 1 landed on VBlank entry");
+        check(emu.framesAdvanced == 0 && ref.framesAdvanced == 0,
+            "frame 1 ends before the line wrap");
+        liveScreen(dbgPlugin, screen, input, trace, emu, ref, "frame 1");
+        long after1 = emu.ws.instructions;
+
+        // Frame 2: determinism across a second frame (line wrap included).
+        int steps2 = emu.stepFrame(emu.ws.thread);
+        int refSteps2 = ref.stepFrame(ref.ws.thread);
+        check(steps2 > 0, "second Step Frame advanced " + steps2 + " instructions");
+        check(emu.ws.instructions == after1 + steps2 && steps2 == refSteps2
+            && emu.ws.instructions == ref.ws.instructions, "second frame deterministic");
+        check(emu.ws.getCurrentLine() == WSMachine.VISIBLE, "frame 2 landed on VBlank entry");
+        check(emu.framesAdvanced == 1 && ref.framesAdvanced == 1,
+            "frame 2 wrapped the line counter");
+        liveScreen(dbgPlugin, screen, input, trace, emu, ref, "frame 2");
+
+        onEdt(() -> {
+            tool.getService(DebuggerTraceManagerService.class).closeTraceNoConfirm(trace);
+            return null;
+        });
+        check(true, "live trace closed");
+    }
+
+    /** Report the live session the way the emulation service does when a run stops, then verify
+     *  the screen painted the emulated frame and the input pad went live. */
+    private static void liveScreen(WSDebuggerPlugin dbgPlugin, WSScreenProvider screen,
+            WSInputProvider input, Trace trace, WSDebuggerEmulator emu, WSDebuggerEmulator ref,
+            String what) throws Exception {
+        onEdt(() -> {
+            dbgPlugin.stopped(new DebuggerEmulationService.CachedEmulator(trace, emu, null));
+            return null;
+        });
+        check(dbgPlugin.getCurrentEmulator() == emu, what + ": plugin follows live session");
+        onEdt(() -> null); // let the posted refresh run
+        Field fImage = WSScreenProvider.class.getDeclaredField("image");
+        fImage.setAccessible(true);
+        BufferedImage img = onEdt(() -> (BufferedImage) fImage.get(screen));
+        check(img != null && img.getWidth() == 224 && img.getHeight() == 144,
+            what + ": screen painted 224x144");
+        BufferedImage expected = WSRender.render(ref.ws);
+        check(checksum(img) == checksum(expected), what + ": screen matches synthetic ROM output"
+            + " (checksum " + Long.toHexString(checksum(img)) + ")");
+        check(img.getRGB(0, 0) != img.getRGB(100, 100) && distinctColors(img) >= 3,
+            what + ": screen non-blank (" + distinctColors(img) + " colours)");
+        Field fButtons = WSInputProvider.class.getDeclaredField("buttons");
+        fButtons.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        List<JButton> buttons = onEdt(() -> (List<JButton>) fButtons.get(input));
+        check(onEdt(() -> buttons.stream().allMatch(JButton::isEnabled)),
+            what + ": input pad enabled while live");
+    }
+
+    /** Minimal visible scene on a fresh machine: screen 1 on, map entry (0,0) on tile 1, tile 1
+     *  striped through a distinct mono palette. The synthetic ROM's code touches neither, so the
+     *  stepped frames render it deterministically. */
+    private static void showTestPattern(WSMachine ws) {
+        ws.ports[0x00] = 0x01; // screen 1 on
+        ws.ports[0x01] = 0x00; // background shade 0
+        ws.ports[0x07] = 0x00; // screen map base 0
+        ws.ports[0x60] = 0x00; // mono: 2bpp tiles at 0x2000
+        ws.ports[0x1C] = 0x00; // shades 0-1 -> level 0 (white)
+        ws.ports[0x1D] = 0x44; // shades 2-3 -> level 4
+        ws.ports[0x1E] = 0x88; // shades 4-5 -> level 8
+        ws.ports[0x1F] = 0xF0; // shades 6-7 -> level 15 (black)
+        ws.ports[0x20] = 0x70; // palette 0: idx0 -> shade 0, idx1 -> shade 7
+        ws.ports[0x21] = 0x34; // palette 0: idx2 -> shade 4, idx3 -> shade 3
+        ws.write(0, new byte[] { 1, 0 }); // map entry (0,0): tile 1, palette 0
+        byte[] tile = new byte[16];
+        for (int y = 0; y < 8; y++) {
+            tile[y * 2] = (byte) ((y & 1) == 0 ? 0xFF : 0x00);
+            tile[y * 2 + 1] = (byte) ((y & 1) == 0 ? 0x00 : 0xFF);
+        }
+        ws.write(0x2000 + 16, tile);
+    }
+
+    private static long checksum(BufferedImage img) {
+        long sum = 0;
+        for (int y = 0; y < img.getHeight(); y++)
+            for (int x = 0; x < img.getWidth(); x++) sum += img.getRGB(x, y);
+        return sum;
+    }
+
+    private static int distinctColors(BufferedImage img) {
+        Set<Integer> seen = new HashSet<>();
+        for (int y = 0; y < img.getHeight(); y++)
+            for (int x = 0; x < img.getWidth(); x++) seen.add(img.getRGB(x, y));
+        return seen.size();
     }
 
     private static boolean hasAction(java.util.Set<DockingActionIf> actions, String name) {
