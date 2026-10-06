@@ -42,6 +42,7 @@ public final class WSStaticCode {
     private final Set<Long> codeBytes = new HashSet<>();
     private final Map<String, Integer> rejects = new TreeMap<>();
     private final Set<Address> known = new HashSet<>();
+    private final Set<String> saveProfiles = new HashSet<>();
     private final IntPropertyMap provenance;
     private int passes, accepted, instructions, bytes, candidates;
 
@@ -67,6 +68,18 @@ public final class WSStaticCode {
             if (ro >= 0) for (int k = 0; k < d.getLength(); k++) definedData.add(ro + k);
         }
         for (Instruction i : listing.getInstructions(true)) index(i);
+        for (Function f : p.getFunctionManager().getFunctions(true)) {
+            if (provenance.hasProperty(f.getEntryPoint())) continue;
+            Instruction i = listing.getInstructionAt(f.getEntryPoint());
+            StringBuilder prefix = new StringBuilder(); int saves = 0;
+            while (i != null && i.getLength() == 1 && isSave(i.getBytes()[0] & 255) && prefix.length() < 24) {
+                int op = i.getBytes()[0] & 255;
+                prefix.append(String.format("%02x", op)); saves += op == 0x60 ? 2 : 1;
+                i = i.getFallThrough() == null ? null : listing.getInstructionAt(i.getFallThrough());
+            }
+            if (saves >= 3 && i != null && !(i.getLength() == 1 && isSave(i.getBytes()[0] & 255)))
+                saveProfiles.add(prefix.toString());
+        }
     }
 
     public static String apply(Program p, Consumer<String> output, TaskMonitor monitor) throws Exception {
@@ -157,6 +170,7 @@ public final class WSStaticCode {
 
     private List<Start> starts(MemoryBlock block, byte[] raw, int at, int segment) throws Exception {
         List<Start> frames = new ArrayList<>(), savesFound = new ArrayList<>(), boundaries = new ArrayList<>();
+        Map<Address, Integer> saveWidths = new HashMap<>();
         for (int k = at; k >= Math.max(0, at-BACKWARD_BYTES); k--) {
             Address a = block.getStart().add(k);
             if (!unknown(a)) break;
@@ -164,19 +178,22 @@ public final class WSStaticCode {
                 ((raw[k+1] == (byte)0x89 && raw[k+2] == (byte)0xe5) ||
                  (raw[k+1] == (byte)0x8b && raw[k+2] == (byte)0xec)))
                 frames.add(new Start(a, "frame-prologue"));
-            // At least three register saves, or a segment save plus PUSHA,
-            // establishes a save prologue without needing a BP frame.
+            // Match a complete save sequence observed at an existing entry.
+            // A generic run can absorb an opcode-shaped table byte before code.
             int saves = 0, width = 0;
             boolean all = false;
-            while (k+width < raw.length && width < 6) {
+            StringBuilder profile = new StringBuilder();
+            while (k+width < raw.length && width < 12) {
                 int op = raw[k+width] & 255;
                 if (op == 0x60) { saves += 2; all = true; }
                 else if (op >= 0x50 && op <= 0x57 && op != 0x54 || op == 0x06 || op == 0x0e || op == 0x16 || op == 0x1e) saves++;
                 else break;
+                profile.append(String.format("%02x", op));
                 width++;
             }
-            boolean previousSave = k > 0 && isSave(raw[k-1] & 255);
-            if (!previousSave && saves >= 3 && (width >= 3 || all)) savesFound.add(new Start(a, "save-prologue"));
+            if (saves >= 3 && (width >= 3 || all) && saveProfiles.contains(profile.toString())) {
+                savesFound.add(new Start(a, "known-save-prologue")); saveWidths.put(a, width);
+            }
             for (Reference ref : program.getReferenceManager().getReferencesTo(a)) {
                 if (ref.getReferenceType().isFlow() && listing.getInstructionAt(ref.getFromAddress()) != null) {
                     boundaries.add(new Start(a, "code-reference")); break;
@@ -205,6 +222,7 @@ public final class WSStaticCode {
                 } catch (Exception ex) { /* not a boundary */ }
             }
         }
+        savesFound.sort(Comparator.comparingInt((Start s) -> saveWidths.get(s.address())).reversed());
         frames.addAll(savesFound); frames.addAll(boundaries);
         return frames;
     }
