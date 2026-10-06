@@ -170,12 +170,43 @@ public final class WSStaticCode {
         }
     }
 
+    // Erased flash reads back as FF. A run of two or more FF bytes can never
+    // start a valid instruction (FF FF decodes no GRP5 subcode), so inter-
+    // routine fill is stepping-stone, never code. Returns the first index
+    // past the run, or k when raw[k] does not open a fill run.
+    private static int fillEnd(byte[] raw, int k) {
+        if (k + 1 >= raw.length || raw[k] != (byte)0xff || raw[k+1] != (byte)0xff) return k;
+        int j = k + 2;
+        while (j < raw.length && raw[j] == (byte)0xff) j++;
+        return j;
+    }
+
     private List<Start> starts(MemoryBlock block, byte[] raw, int at, int segment) throws Exception {
         List<Start> frames = new ArrayList<>(), savesFound = new ArrayList<>(), boundaries = new ArrayList<>();
         Map<Address, Integer> saveWidths = new HashMap<>();
         for (int k = at; k >= Math.max(0, at-BACKWARD_BYTES); k--) {
             Address a = block.getStart().add(k);
             if (!unknown(a)) break;
+            int runEnd = fillEnd(raw, k);
+            if (runEnd != k) {
+                // Fill bytes hold no routine entry, but a terminator ending
+                // exactly at the run start supports the code after the fill.
+                if ((k == 0 || raw[k-1] != (byte)0xff) && runEnd < raw.length) {
+                    Address after = block.getStart().add(runEnd);
+                    Instruction before = listing.getInstructionContaining(a.subtract(1));
+                    if (before != null && before.getMaxAddress().next().equals(a) && !before.hasFallthrough())
+                        boundaries.add(new Start(after, "terminator-after-fill"));
+                    for (int len : new int[] {1, 2, 3, 5}) {
+                        int q = k-len;
+                        if (q < 0) continue;
+                        try {
+                            String evidence = terminalEvidence(block, raw, q, len, segment);
+                            if (evidence != null) boundaries.add(new Start(after, evidence + "-after-fill"));
+                        } catch (Exception ex) { /* not a boundary */ }
+                    }
+                }
+                continue;
+            }
             if (k+2 < raw.length && raw[k] == 0x55 &&
                 ((raw[k+1] == (byte)0x89 && raw[k+2] == (byte)0xe5) ||
                  (raw[k+1] == (byte)0x8b && raw[k+2] == (byte)0xec)))
@@ -209,18 +240,9 @@ public final class WSStaticCode {
             for (int len : new int[] {1, 2, 3, 5}) {
                 int q = k-len;
                 if (q < 0) continue;
-                int op = raw[q] & 255;
-                if (!((len == 1 && (op == 0xc3 || op == 0xcb)) ||
-                      (len == 2 && op == 0xeb) ||
-                      (len == 3 && (op == 0xc2 || op == 0xca || op == 0xe9)) ||
-                      (len == 5 && op == 0xea))) continue;
                 try {
-                    PseudoInstruction term = decode(block.getStart().add(q), segment);
-                    if (term.getLength() == len && (term.getFlowType().isTerminal() ||
-                        term.getFlowType().isJump() && term.getFlowType().isUnConditional()) &&
-                        !term.hasFallthrough() && !term.getFlowType().isComputed() &&
-                        boundaryAligned(block, raw, q, segment))
-                        boundaries.add(new Start(a, term.getFlowType().isJump() ? "aligned-jump-boundary" : "aligned-return-boundary"));
+                    String evidence = terminalEvidence(block, raw, q, len, segment);
+                    if (evidence != null) boundaries.add(new Start(a, evidence));
                 } catch (Exception ex) { /* not a boundary */ }
             }
         }
@@ -232,6 +254,21 @@ public final class WSStaticCode {
     private static boolean isSave(int op) {
         return op == 0x60 || op >= 0x50 && op <= 0x57 && op != 0x54 ||
             op == 0x06 || op == 0x0e || op == 0x16 || op == 0x1e;
+    }
+
+    private String terminalEvidence(MemoryBlock block, byte[] raw, int q, int len, int segment) throws Exception {
+        int op = raw[q] & 255;
+        if (!((len == 1 && (op == 0xc3 || op == 0xcb)) ||
+              (len == 2 && op == 0xeb) ||
+              (len == 3 && (op == 0xc2 || op == 0xca || op == 0xe9)) ||
+              (len == 5 && op == 0xea))) return null;
+        PseudoInstruction term = decode(block.getStart().add(q), segment);
+        if (term.getLength() == len && (term.getFlowType().isTerminal() ||
+            term.getFlowType().isJump() && term.getFlowType().isUnConditional()) &&
+            !term.hasFallthrough() && !term.getFlowType().isComputed() &&
+            boundaryAligned(block, raw, q, segment))
+            return term.getFlowType().isJump() ? "aligned-jump-boundary" : "aligned-return-boundary";
+        return null;
     }
 
     private boolean boundaryAligned(MemoryBlock block, byte[] raw, int at, int segment) {
@@ -252,6 +289,16 @@ public final class WSStaticCode {
             Address a = origin;
             try {
                 while (a.compareTo(boundary) < 0) {
+                    int idx = (int)a.subtract(block.getStart());
+                    int runEnd = idx >= 0 ? fillEnd(raw, idx) : idx;
+                    if (runEnd != idx) {
+                        for (int t = idx; t < runEnd; t++) {
+                            long ro = romOffset(block.getStart().add(t));
+                            if (definedData.contains(ro)) throw new Reject("data-before-boundary");
+                        }
+                        a = block.getStart().add(runEnd);
+                        continue;
+                    }
                     PseudoInstruction i = decode(a, segment);
                     for (int k = 0; k < i.getLength(); k++) {
                         long ro = romOffset(a.add(k));
