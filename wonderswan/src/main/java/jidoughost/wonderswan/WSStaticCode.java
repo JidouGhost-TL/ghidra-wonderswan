@@ -353,7 +353,11 @@ public final class WSStaticCode {
         }
         Function f = program.getFunctionManager().getFunctionAt(start.address());
         boolean routine = !start.evidence().equals("aligned-jump-boundary") && !start.evidence().equals("code-reference");
-        if (f == null && routine && program.getFunctionManager().getFunctionContaining(start.address()) == null)
+        // A validated code fragment can intersect an existing function's body
+        // even when its first instruction lies outside that body. Preserve the
+        // code and its provenance without inventing an overlapping function.
+        boolean overlaps = program.getFunctionManager().getFunctionsOverlapping(walk.body()).hasNext();
+        if (f == null && routine && !overlaps)
             f = program.getFunctionManager().createFunction(null, start.address(), walk.body(), SourceType.ANALYSIS);
         if (f != null) { f.addTag(PROPERTY); known.add(f.getEntryPoint()); }
         program.getBookmarkManager().setBookmark(start.address(), BookmarkType.ANALYSIS, PROPERTY,
