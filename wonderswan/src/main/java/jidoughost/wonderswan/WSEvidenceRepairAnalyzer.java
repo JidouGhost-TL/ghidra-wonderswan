@@ -105,6 +105,7 @@ public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
                 if (gc != null && program.getListing().getNumInstructions() == before) rule("G1/U1", s, program, log, failed, () -> gc.apply());
                 if (program.getListing().getNumInstructions() == before) break;
             }
+            if (j != null) rule("J1r", s, program, log, failed, () -> j.restoreClearedSites(monitor));
             if (j != null) rule("J1l-finish", s, program, log, failed, () -> j.finish());
             if (j != null) parts.add(j.summary());
             if (cp != null) parts.add(cp.summary());

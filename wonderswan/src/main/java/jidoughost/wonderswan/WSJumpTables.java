@@ -74,6 +74,23 @@ import ghidra.util.task.TaskMonitor;
  *   the recovery override, after which the decompiler's own unbounded table read follows garbage cross-space.
  * J1q: every jump-table override is filtered to the site's address space: a foreign-bank override target sends
  *   the decompiler where nothing was decoded. References keep every bank (they are evidence and harmless).
+ * J1r: a quarantined site whose own instruction is gone (a guessed offcut polluted the backward slice, then the
+ *   quarantine's orphan clear removed the dispatch setup with it) gets one restoration attempt before the final
+ *   verdict: the cleared run is re-decoded from the fall-through of the nearest preceding kept instruction in the
+ *   same function (trial decode, undefined bytes only, bounded; it must reach the site with the same computed
+ *   JMP/CALL mnemonic and contain no other computed branch), committed, and the site re-attempted. A recovered
+ *   site applies normally; a still-unresolved one keeps its restored decode and stays quarantined (opaque).
+ *   Anything else (no kept fall-through anchor, no clean rejoin, wrong shape) stays cleared, as today.
+ * J1s: a table target skipped as an offcut (TARGET_OFFCUT) is retried on later passes: once the conflicting
+ *   decode is gone and the target disassembles, it is committed like a kept target (disassembled, referenced,
+ *   functioned for CALL sites). The table, bound and stops already proved it; only the conflict blocked it.
+ * J1t (post-analysis script WSJumpTableFinish, after the J1m lock): a function at a recovered JMP site's kept
+ *   target whose body contains another kept target of the same site is an over-glued case block (stock analysis
+ *   joined sibling cases into one body, which then decompiles with the parent switch's mis-recovered cases):
+ *   when the body partitions exactly into one terminal span per contained target (every span ends in a jump or
+ *   return, every body range starts at a target), RET-terminated spans are kept as functions and JMP-terminated
+ *   spans are demoted to case-blocks of the switch parent (stock switch-namespace labels stripped, the site
+ *   re-locked to its proven targets). Anything else stays as it is.
  * Index scaling by ADD r,r counts as SHL r,1.
  * J1d: a 0000 slot is empty (not a target, not a stop) inside a table whose end is proven.
  * Stop rules: EXECUTED_CODE (entry slot executed), TABLE_BOUNDARY (next recovered table), OWN_TARGET (J1j), OUT_OF_ROM,
@@ -128,14 +145,21 @@ public final class WSJumpTables {
     final Set<Address> reported = new HashSet<>();
     /** Quarantined site -> guessed references deleted there (J1l). */
     final Map<Address, List<QuarRef>> quarantined = new LinkedHashMap<>();
+    /** J1r: quarantined site -> its mnemonic while decoded (matched on restoration). */
+    final Map<Address, String> quarMn = new LinkedHashMap<>();
 
     record QuarRef(Address to, RefType type) { }
+    /** J1s: offcut-skipped targets awaiting retry (site -> targets whose conflict may clear). */
+    record Offcut(Address target, int cs, boolean isCall) { }
+    final Map<Address, List<Offcut>> offcutPending = new LinkedHashMap<>();
 
     void apply(TaskMonitor monitor) throws Exception {
         for (int pass = 0; pass < 16; pass++) {
             int before = done.size() + quarantined.size();
             applyPass(monitor);
             passes++;
+            int retried = retryOffcuts(monitor);
+            if (retried > 0) continue;   // retried code can hold new table sites: collect them next pass
             if (done.size() + quarantined.size() == before) break;
         }
         dropOverlayEndRefs();
@@ -179,7 +203,160 @@ public final class WSJumpTables {
         quarantined.clear();
     }
 
-    int passes, supersededRefs, quarantines, droppedRefs, deshadowed;
+    int passes, supersededRefs, quarantines, droppedRefs, deshadowed, restoredDispatches, restoredRecovered;
+
+    /**
+     * J1r: one restoration attempt per quarantined site whose own instruction is gone. Runs after the
+     * J1/F1-F4/G1-U1 rounds, before J1l-finish finalizes the still-quarantined sites: a restored site
+     * that recovers applies normally (and leaves quarantine); one that does not keeps its restored
+     * decode and stays quarantined. Anything failing a check below stays cleared, as today.
+     */
+    void restoreClearedSites(TaskMonitor monitor) throws Exception {
+        ghidra.program.model.lang.Register csval = p.getProgramContext().getRegister("csval");
+        for (Address site : new ArrayList<>(quarantined.keySet())) {
+            monitor.checkCancelled();
+            if (listing.getInstructionAt(site) != null) continue;   // site alive: nothing to restore
+            try {
+                restoreOneSite(site, csval, monitor);
+            } catch (Exception x) {
+                errors++;
+                emit.accept(String.format("{\"rule\":\"J1r\",\"site\":\"%s\",\"outcome\":\"ERROR\",\"error\":\"%s\"}",
+                    site, String.valueOf(x).replace('"', '\'')));
+            }
+        }
+    }
+
+    /** J1r body for one quarantined site (a failure here must not skip the remaining sites). */
+    void restoreOneSite(Address site, ghidra.program.model.lang.Register csval, TaskMonitor monitor) throws Exception {
+        String wantMn = quarMn.getOrDefault(site, "");
+        if (!wantMn.equals("JMP") && !wantMn.equals("CALL")) {
+            emit.accept(String.format("{\"rule\":\"J1r\",\"site\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"NOT_JMP_CALL\"}", site));
+            return;
+        }
+        CodeUnit scu = listing.getCodeUnitAt(site);
+        if (!(scu instanceof Data sd) || sd.isDefined()) {
+            emit.accept(String.format("{\"rule\":\"J1r\",\"site\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"SITE_DEFINED\"}", site));
+            return;
+        }
+        // anchor: walk back over undefined bytes of the same block to a kept instruction whose
+        // fall-through starts the gap; the anchor must sit in a function (live fall-through code)
+        MemoryBlock sblk = mem.getBlock(site);
+        Address g = site;
+        Instruction anchor = null;
+        for (int k = 0; k < 2048; k++) {
+            Address b = g.previous();
+            if (b == null) break;
+            MemoryBlock bb = mem.getBlock(b);
+            if (bb == null || !bb.equals(sblk)) break;
+            CodeUnit u = listing.getCodeUnitContaining(b);
+            if (u instanceof Data d && !d.isDefined()) { g = b; continue; }
+            if (u instanceof Instruction pi && pi.getMaxAddress().equals(b)
+                    && pi.getFallThrough() != null && pi.getFallThrough().equals(g)
+                    && p.getFunctionManager().getFunctionContaining(pi.getAddress()) != null)
+                anchor = pi;
+            break;
+        }
+        if (anchor == null) {
+            emit.accept(String.format("{\"rule\":\"J1r\",\"site\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"NO_ANCHOR\"}", site));
+            return;
+        }
+        // trial decode from the anchor fall-through: fall-through only (any call, direct jump,
+        // terminal or second computed branch bails), undefined bytes only, bounded; it must reach
+        // the site with the same computed mnemonic
+        int cs = csOf(anchor.getAddress());
+        List<Address> span = new ArrayList<>();
+        Address a = g;
+        String fail = null;
+        ghidra.app.util.PseudoDisassembler pd = new ghidra.app.util.PseudoDisassembler(p);
+        for (int k = 0; k < 64; k++) {
+            if (listing.getInstructionAt(a) != null) { fail = "REJOIN@" + a; break; }
+            CodeUnit cu = listing.getCodeUnitAt(a);
+            if (!(cu instanceof Data d) || d.isDefined()) { fail = "DEFINED@" + a; break; }
+            ghidra.app.util.PseudoInstruction pi;
+            try {
+                ghidra.app.util.PseudoDisassemblerContext pc =
+                    new ghidra.app.util.PseudoDisassemblerContext(p.getProgramContext());
+                if (csval != null) pc.setFutureRegisterValue(a,
+                    new ghidra.program.model.lang.RegisterValue(csval, java.math.BigInteger.valueOf(cs)));
+                pi = pd.disassemble(a, pc, false);
+            } catch (Exception x) { pi = null; }
+            if (pi == null) { fail = "UNDECODABLE@" + a; break; }
+            for (Address q = a.next(); q != null && q.compareTo(pi.getMaxAddress()) <= 0; q = q.next()) {
+                CodeUnit c2 = listing.getCodeUnitAt(q);
+                if (!(c2 instanceof Data d2) || d2.isDefined()) { fail = "OVERLAP@" + q; break; }
+            }
+            if (fail != null) break;
+            span.add(a);
+            if (pi.getFlowType().isComputed()) {
+                if (!a.equals(site) || !pi.getMnemonicString().equalsIgnoreCase(wantMn)) fail = "SHAPE@" + a;
+                a = null;
+                break;
+            }
+            if (pi.getFlowType().isCall() || pi.getFlowType().isJump()
+                    || pi.getFallThrough() == null || pi.getFlowType().isTerminal()) {
+                fail = "BRANCH@" + a;
+                break;
+            }
+            a = pi.getFallThrough();
+        }
+        if (fail != null || a != null) {
+            emit.accept(String.format("{\"rule\":\"J1r\",\"site\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"%s\"}",
+                site, fail == null ? "TOO_LONG" : fail));
+            return;
+        }
+        // commit (must reproduce the trial: same bytes, same csval) and re-attempt once
+        copyContext(anchor.getAddress(), g, cs);
+        new DisassembleCommand(g, null, true).applyTo(p, monitor);
+        Instruction now = listing.getInstructionAt(site);
+        if (now == null || !now.getFlowType().isComputed() || !now.getMnemonicString().equalsIgnoreCase(wantMn)) {
+            for (Address t : span) listing.clearCodeUnits(t, t, false);
+            emit.accept(String.format("{\"rule\":\"J1r\",\"site\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"MISMATCH\"}", site));
+            return;
+        }
+        restoredDispatches++;
+        newCode += span.size();
+        // pull the dispatch into the anchor's function first: applySite writes the override and
+        // pulls the targets only when the site sits in a function (it starts in the gap)
+        Function af = p.getFunctionManager().getFunctionContaining(anchor.getAddress());
+        if (af != null) CreateFunctionCmd.fixupFunctionBody(p, af, monitor);
+        Rec r = recover(now);
+        trimToBases(r);
+        if (r == null || r.targets.isEmpty()) {
+            emit.accept(String.format("{\"rule\":\"J1r\",\"site\":\"%s\",\"outcome\":\"DISPATCH_RESTORED\",\"instructions\":%d}",
+                site, span.size()));
+            return;
+        }
+        try {
+            applySite(now, r, monitor);
+            done.add(site);
+            quarantined.remove(site);
+            reported.remove(site);
+            restoredRecovered++;
+            emit.accept(String.format("{\"rule\":\"J1r\",\"site\":\"%s\",\"outcome\":\"RECOVERED\",\"instructions\":%d}",
+                site, span.size()));
+        } catch (Exception x) {
+            errors++;
+            emit.accept(String.format("{\"rule\":\"J1r\",\"site\":\"%s\",\"outcome\":\"ERROR\",\"error\":\"%s\"}",
+                site, String.valueOf(x).replace('"', '\'')));
+        }
+    }
+
+    /** TABLE_BOUNDARY trim for a lone re-attempted site (the pass loop's cross-site trim needs all Recs). */
+    void trimToBases(Rec r) throws Exception {
+        if (r == null || r.targets.isEmpty()) return;
+        collectTableBases(TaskMonitor.DUMMY);
+        for (Address tb : tableBases) {
+            if (tb.equals(tableStart)) continue;
+            long off;
+            try { off = tb.subtract(tableStart); } catch (Exception e) { continue; }
+            if (off <= 0 || off >= 2L * r.slots || (off & 1) != 0) continue;
+            int lim = (int) (off / 2);
+            r.slots = lim;
+            r.targets = trimToSlots(r, lim);
+            r.empty = (int) r.emptySlots.stream().filter(k -> k < lim).count();
+            r.stop = "TABLE_BOUNDARY";
+        }
+    }
     /** Every kept table target (proven code): rule A1 stops its artefact walk-back at these. */
     final Set<Address> keptTargets = new HashSet<>();
     /** Distinct computed-jump/call sites ever collected (retries do not inflate the count). */
@@ -287,6 +464,7 @@ public final class WSJumpTables {
             p.getReferenceManager().delete(ref);
         }
         quarantined.put(site, gone);
+        quarMn.put(site, ins.getMnemonicString().toUpperCase());
         AddressSet cleared = new AddressSet();
         for (Address t : targets) cleared.add(clearOrphan(t));
         if (!cleared.isEmpty()) removeStaleConflicts(cleared);
@@ -317,6 +495,8 @@ public final class WSJumpTables {
                     offcut++;
                     emit.accept(String.format("{\"rule\":\"J1\",\"site\":\"%s\",\"target\":\"%s\",\"outcome\":\"TARGET_OFFCUT\",\"inside\":\"%s\"}",
                         ins.getAddress(), t, listing.getInstructionContaining(t).getAddress()));
+                    // J1s: retried on later passes (the conflict often clears when quarantine deletes guesses)
+                    offcutPending.computeIfAbsent(ins.getAddress(), k -> new ArrayList<>()).add(new Offcut(t, cs, isCall));
                     continue;
                 }
                 // single-byte data shadowing a proven target (a data pointer read the slot first):
@@ -377,6 +557,65 @@ public final class WSJumpTables {
             r.baseVia.replace("\"", "'"),
             missing.isEmpty() ? "[]" : "[\"" + String.join("\",\"", missing) + "\"]"));
     }
+
+    /** J1s: retry offcut-skipped targets whose conflicting decode cleared. Returns the number
+     *  committed (each can expose new table sites, so the caller runs another pass). A target that is
+     *  now decoded by another rule only gains its code reference; one still conflicted or undecodable
+     *  stays pending. Jump-table overrides are not rewritten (CALL sites never had one). */
+    int retryOffcuts(TaskMonitor monitor) throws Exception {
+        int n = 0;
+        for (Iterator<Map.Entry<Address, List<Offcut>>> it = offcutPending.entrySet().iterator(); it.hasNext();) {
+            Map.Entry<Address, List<Offcut>> e = it.next();
+            monitor.checkCancelled();
+            Instruction site = listing.getInstructionAt(e.getKey());
+            // site itself cleared after recovery (pathological: recovered sites are never quarantined,
+            // so J1r will not see this one): nothing to attach the retries to, drop them
+            if (site == null) { it.remove(); continue; }
+            for (Iterator<Offcut> jt = e.getValue().iterator(); jt.hasNext();) {
+                Offcut o = jt.next();
+                if (listing.getInstructionAt(o.target()) != null) {
+                    site.addMnemonicReference(o.target(),
+                        o.isCall() ? RefType.COMPUTED_CALL : RefType.COMPUTED_JUMP, SourceType.ANALYSIS);
+                    keptTargets.add(o.target());
+                    jt.remove(); n++;
+                    emit.accept(String.format("{\"rule\":\"J1s\",\"site\":\"%s\",\"target\":\"%s\",\"outcome\":\"DECODED_ELSEWHERE\"}",
+                        e.getKey(), o.target()));
+                    continue;
+                }
+                if (listing.getInstructionContaining(o.target()) != null) continue;   // conflict persists
+                boolean decodes;
+                try { decodes = new ghidra.app.util.PseudoDisassembler(p).disassemble(o.target()) != null; }
+                catch (Exception x) { decodes = false; }
+                if (!decodes) {
+                    jt.remove();
+                    emit.accept(String.format("{\"rule\":\"J1s\",\"site\":\"%s\",\"target\":\"%s\",\"outcome\":\"GONE\"}",
+                        e.getKey(), o.target()));
+                    continue;
+                }
+                if (listing.getDataAt(o.target()) != null) deshadow(e.getKey(), o.target());
+                copyContext(e.getKey(), o.target(), o.cs());
+                new DisassembleCommand(o.target(), null, true).applyTo(p, monitor);
+                newCode++;
+                site.addMnemonicReference(o.target(),
+                    o.isCall() ? RefType.COMPUTED_CALL : RefType.COMPUTED_JUMP, SourceType.ANALYSIS);
+                if (o.isCall() && p.getFunctionManager().getFunctionAt(o.target()) == null
+                        && listing.getInstructionAt(o.target()) != null)
+                    new CreateFunctionCmd(o.target()).applyTo(p, monitor);
+                if (!o.isCall()) {
+                    Function sf = p.getFunctionManager().getFunctionContaining(e.getKey());
+                    if (sf != null) CreateFunctionCmd.fixupFunctionBody(p, sf, monitor);
+                }
+                keptTargets.add(o.target());
+                jt.remove(); n++; offcutRetried++;
+                emit.accept(String.format("{\"rule\":\"J1s\",\"site\":\"%s\",\"target\":\"%s\",\"outcome\":\"RECOVERED\"}",
+                    e.getKey(), o.target()));
+            }
+            if (e.getValue().isEmpty()) it.remove();
+        }
+        return n;
+    }
+
+    int offcutRetried;
 
     void copyContext(Address site, Address target, int cs) throws Exception {
         ProgramContext ctx = p.getProgramContext();
@@ -444,8 +683,8 @@ public final class WSJumpTables {
     static final Pattern CONFLICT = Pattern.compile("conflicting instruction at (\\S+)");
 
     String summary() {
-        return String.format("J1 jump/call table sites %d (passes %d): recovered %d (J1i register base %d), unresolved %d, quarantined %d (refs dropped %d), new code %d, observed targets added %d, offcut targets %d, deshadowed %d, superseded refs %d, orphan bytes cleared %d, site errors %d",
-            seen.size(), passes, recovered, computedBases, reported.size(), quarantines, droppedRefs, newCode, observedMissing, offcut, deshadowed, supersededRefs, clearedOrphans, errors);
+        return String.format("J1 jump/call table sites %d (passes %d): recovered %d (J1i register base %d), unresolved %d, quarantined %d (refs dropped %d), new code %d, observed targets added %d, offcut targets %d (retried %d), deshadowed %d, superseded refs %d, orphan bytes cleared %d, dispatches restored %d (recovered %d), site errors %d",
+            seen.size(), passes, recovered, computedBases, reported.size(), quarantines, droppedRefs, newCode, observedMissing, offcut, offcutRetried, deshadowed, supersededRefs, clearedOrphans, restoredDispatches, restoredRecovered, errors);
     }
 
     /** J1n: clear single-byte data shadowing a proven table target so it disassembles. The shadowing byte
@@ -681,6 +920,218 @@ public final class WSJumpTables {
             } catch (Exception ex) { /* not an address: not a deletion we can use */ }
         }
         return out;
+    }
+
+    /**
+     * J1t: demote over-glued case pseudo-functions. Stock switch analysis commits one function per
+     * recovered case, but when its case recovery over-approximates (reads past the table end) the
+     * committed "function" glues several true cases together. A case-block that jumps back to the
+     * switch parent is not a function at all (decompiling it as one inlines the parent's switch
+     * tail); only a RET-terminated span is function-shaped. So per span: RET/RETF-terminated spans
+     * are kept as functions, JMP-terminated spans are demoted (no function; the switch parent
+     * absorbs them through the locked switch flows). The site is re-locked to its current
+     * computed-targets-to-code (J1m pattern; best-effort, audited): without the lock the decompiler
+     * re-derives stock's over-approximation and every span truncates.
+     */
+    public static String demoteGluedCases(Program p, List<String> evidence, Consumer<String> emit, TaskMonitor monitor) throws Exception {
+        AddressFactory af = p.getAddressFactory();
+        Set<Address> sites = new LinkedHashSet<>();
+        for (String line : evidence) {
+            if (!line.contains("\"rule\":\"J1\"") || !line.contains("\"outcome\":\"RECOVERED\"")) continue;
+            int ii = line.indexOf("\"insn\":\"");
+            if (ii < 0 || !line.startsWith("JMP", ii + 8)) continue;
+            Address a = addrField(line, "\"site\":\"", af);
+            if (a != null) sites.add(a);
+        }
+        Listing listing = p.getListing();
+        FunctionManager fm = p.getFunctionManager();
+        int split = 0, kept = 0, dropped = 0;
+        for (Address s : sites) {
+            monitor.checkCancelled();
+            Instruction ins = listing.getInstructionAt(s);
+            if (ins == null || !ins.getFlowType().isComputed() || !"JMP".equalsIgnoreCase(ins.getMnemonicString()))
+                continue;
+            List<Address> targets = new ArrayList<>();
+            for (Reference r : p.getReferenceManager().getReferencesFrom(s)) {
+                if (!r.getReferenceType().isComputed()) continue;
+                if (r.getSource() == SourceType.USER_DEFINED || r.getSource() == SourceType.IMPORTED) continue;
+                if (!targets.contains(r.getToAddress())) targets.add(r.getToAddress());
+            }
+            for (Address t : targets) {
+                Function f = fm.getFunctionAt(t);
+                if (f == null) continue;
+                List<Address> in = new ArrayList<>();
+                for (Address u : targets) {
+                    if (!u.equals(t) && f.getBody().contains(u)) in.add(u);
+                }
+                if (in.isEmpty()) continue;
+                List<Address> pts = new ArrayList<>(in);
+                pts.add(t);
+                Collections.sort(pts);
+                if (!pts.get(0).equals(t)) {
+                    emit.accept(String.format("{\"rule\":\"J1t\",\"site\":\"%s\",\"entry\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"BACKWARD\"}",
+                        s, t));
+                    continue;
+                }
+                Set<Address> ptset = new HashSet<>(pts);
+                String why = null;
+                for (AddressRange r : f.getBody()) {
+                    if (!ptset.contains(r.getMinAddress())) { why = "EXTRA_RANGE@" + r.getMinAddress(); break; }
+                }
+                for (int i = 0; why == null && i < pts.size(); i++) {
+                    Address lo = pts.get(i);
+                    Address hi = (i + 1 < pts.size()) ? pts.get(i + 1) : null;
+                    Instruction last = null;
+                    InstructionIterator it = listing.getInstructions(f.getBody(), true);
+                    while (it.hasNext()) {
+                        Instruction c = it.next();
+                        if (c.getAddress().compareTo(lo) < 0) continue;
+                        if (hi != null && c.getAddress().compareTo(hi) >= 0) break;
+                        last = c;
+                    }
+                    if (last == null || last.getFallThrough() != null) why = "NOT_TERMINAL@" + lo;
+                }
+                if (why != null) {
+                    emit.accept(String.format("{\"rule\":\"J1t\",\"site\":\"%s\",\"entry\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"%s\"}",
+                        s, t, why));
+                    continue;
+                }
+                // Per-span verdict from the terminal instruction (the partition check proved every
+                // span non-empty and terminal): RET/RETF-terminated spans are real functions and kept;
+                // JMP-terminated spans are case-blocks of the switch parent and demoted (no function;
+                // the parent absorbs them through the locked switch flows at decompile).
+                List<Address> keep = new ArrayList<>(), drop = new ArrayList<>();
+                for (int i = 0; i < pts.size(); i++) {
+                    Address lo = pts.get(i);
+                    Address hi = (i + 1 < pts.size()) ? pts.get(i + 1) : null;
+                    Instruction last = null;
+                    InstructionIterator it = listing.getInstructions(f.getBody(), true);
+                    while (it.hasNext()) {
+                        Instruction c = it.next();
+                        if (c.getAddress().compareTo(lo) < 0) continue;
+                        if (hi != null && c.getAddress().compareTo(hi) >= 0) break;
+                        last = c;
+                    }
+                    String mn = last.getMnemonicString().toUpperCase();
+                    if (mn.equals("RET") || mn.equals("RETF")) keep.add(lo);
+                    else drop.add(lo);
+                }
+                // Re-lock set (J1m pattern): current computed targets to code. The partition check
+                // already proved this target set guess-free (a guessed target mid-block breaks the
+                // terminal-span condition). Best-effort: the demote stands even unlocked (the listing
+                // code is unchanged, so the decompiler re-derives exactly what it derived before).
+                Function sf = fm.getFunctionContaining(s);
+                List<Address> lockCases = new ArrayList<>();
+                for (Reference r : p.getReferenceManager().getReferencesFrom(s)) {
+                    if (!r.getReferenceType().isComputed()) continue;
+                    if (r.getSource() == SourceType.USER_DEFINED || r.getSource() == SourceType.IMPORTED) continue;
+                    if (listing.getInstructionAt(r.getToAddress()) == null) continue;
+                    if (!lockCases.contains(r.getToAddress())) lockCases.add(r.getToAddress());
+                }
+                lockCases = ownSpace(s, lockCases);   // J1q: every lock stays in the site's space
+                String oldName = f.getName();
+                AddressSetView oldBody = new AddressSet(f.getBody());
+                if (!fm.removeFunction(t)) {
+                    emit.accept(String.format("{\"rule\":\"J1t\",\"site\":\"%s\",\"entry\":\"%s\",\"outcome\":\"ERROR\",\"error\":\"REMOVE_FAILED\"}",
+                        s, t));
+                    continue;
+                }
+                // strip stale stock case labels throughout the glued ranges (the decompiler
+                // renders leftover case labels as goto-labels inside whatever absorbs the spans)
+                int stripped = 0;
+                for (AddressRange r : oldBody) {
+                    Address a = r.getMinAddress();
+                    while (a != null && a.compareTo(r.getMaxAddress()) <= 0) {
+                        stripped += stripCaseNames(p, a);
+                        a = a.next();
+                    }
+                }
+                Namespace global = p.getGlobalNamespace();
+                List<Address> made = new ArrayList<>();
+                try {
+                    for (Address lo : keep) {
+                        int i = pts.indexOf(lo);
+                        Address end = (i + 1 < pts.size()) ? pts.get(i + 1).previous() : oldBody.getMaxAddress();
+                        if (end == null || end.compareTo(lo) < 0) continue;
+                        // exact sub-body (no fixup: the partition check proved each span terminal and
+                        // every range starting at a target); explicit global namespace, because stock
+                        // case labels under switch-override namespaces break entry-based creation
+                        AddressSet sub = new AddressSet(oldBody.intersect(new AddressSet(lo, end)));
+                        if (sub.isEmpty()) continue;
+                        String name = "FUN_" + lo.toString().replaceAll("[^A-Za-z0-9_]", "_");
+                        fm.createFunction(name, global, lo, sub, SourceType.ANALYSIS);
+                        made.add(lo);
+                    }
+                } catch (Exception x) {
+                    emit.accept(String.format("{\"rule\":\"J1t\",\"site\":\"%s\",\"entry\":\"%s\",\"outcome\":\"ERROR\",\"error\":\"%s\"}",
+                        s, t, String.valueOf(x).replace('"', '\'')));
+                    continue;
+                }
+                if (made.size() != keep.size()) {
+                    emit.accept(String.format("{\"rule\":\"J1t\",\"site\":\"%s\",\"entry\":\"%s\",\"outcome\":\"PARTIAL\",\"kept\":%d,\"demoted\":%d}",
+                        s, t, made.size(), drop.size()));
+                    continue;
+                }
+                int locked = 0;
+                if (sf != null && !lockCases.isEmpty()) {
+                    try {
+                        new JumpTable(s, new ArrayList<>(lockCases), true, 0).writeOverride(sf);
+                        locked = lockCases.size();
+                    } catch (Exception x) {
+                        emit.accept(String.format("{\"rule\":\"J1t\",\"site\":\"%s\",\"entry\":\"%s\",\"outcome\":\"LOCK_FAILED\",\"error\":\"%s\"}",
+                            s, t, String.valueOf(x).replace('"', '\'')));
+                    }
+                }
+                // all-demoted: absorb the blocks into the switch parent (keeps executed code
+                // in-function; skipped when spans were kept as functions, which fixup would eat)
+                if (made.isEmpty() && sf != null) {
+                    try {
+                        ghidra.app.cmd.function.CreateFunctionCmd.fixupFunctionBody(p, sf, monitor);
+                    } catch (Exception x) {
+                        emit.accept(String.format("{\"rule\":\"J1t\",\"site\":\"%s\",\"entry\":\"%s\",\"outcome\":\"FIXUP_FAILED\",\"error\":\"%s\"}",
+                            s, t, String.valueOf(x).replace('"', '\'')));
+                    }
+                }
+                for (Address q : made) {
+                    try {
+                        p.getBookmarkManager().setBookmark(q, BookmarkType.ANALYSIS, "J1t",
+                            "kept function-shaped span of demoted " + oldName + "@" + t + " (site " + s + ")");
+                    } catch (Exception x) { }
+                }
+                split++;
+                kept += made.size();
+                dropped += drop.size();
+                emit.accept(String.format(
+                    "{\"rule\":\"J1t\",\"site\":\"%s\",\"entry\":\"%s\",\"outcome\":\"DEMOTED\",\"was\":\"%s\",\"demoted\":%d,\"kept\":%d,\"stripped\":%d,\"cases\":%d}",
+                    s, t, oldName.replace('"', '\''), drop.size(), made.size(), stripped, locked));
+            }
+        }
+        return String.format("demote %d over-glued case functions (%d spans demoted, %d kept)", split, dropped, kept);
+    }
+
+    /**
+     * J1t: delete stock switch-case labels at one address. Besides caseD_ names, this removes labels
+     * in stock switch-override namespaces (namespace path containing "switchD", any source): the
+     * stock switch analysis commits its case_N labels there; a function symbol cannot live under
+     * such a namespace, so entry-based creation fails while they stand, and leftover case labels
+     * render as goto-labels inside whatever absorbs the spans. Human labels live in global/function
+     * namespaces, never under switchD_, so the path condition keeps them safe. Returns the number
+     * deleted (audited on the J1t line).
+     */
+    static int stripCaseNames(Program p, Address a) {
+        int n = 0;
+        for (Symbol y : p.getSymbolTable().getSymbols(a)) {
+            boolean caseD = y.getName().contains("caseD")
+                && y.getSource() != SourceType.USER_DEFINED && y.getSource() != SourceType.IMPORTED;
+            boolean switchNs = false;
+            for (ghidra.program.model.symbol.Namespace ns = y.getParentNamespace(); ns != null;
+                    ns = ns.getParentNamespace()) {
+                if (ns.getName() != null && ns.getName().contains("switchD")) { switchNs = true; break; }
+            }
+            if (!caseD && !switchNs) continue;
+            try { if (y.delete()) n++; } catch (Exception x) { }
+        }
+        return n;
     }
 
     /** cs:off in the space of the site being recovered: a site in a bank overlay (rule B2) reads its table
