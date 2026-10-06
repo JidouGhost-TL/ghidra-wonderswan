@@ -65,3 +65,9 @@ To record a long-play code/data log instead of a scripted trace, play in Mesen
 with the debugger enabled (*Debug → Debugger*): Mesen saves a `.cdl` next to its
 debugger files on exit, which imports the same way (see the extension README for
 how CDL bytes map to addresses).
+
+## Licence
+
+Mesen 2 is GPL-3.0. This folder holds only our own files (MIT OR Apache-2.0): the trace script, which uses Mesen's
+Lua scripting API, and the Docker recipe, which clones and builds Mesen from its upstream repository at a pinned commit.
+No Mesen source is copied here. The extension uses Mesen only as a behavioural reference and as a source of traces.

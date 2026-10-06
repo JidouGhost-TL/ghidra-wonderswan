@@ -225,6 +225,9 @@ public class WSMachine {
     private long[] curAccessKeys = new long[8];
     private int curAccessCount;
     private boolean curInterrupted = false;
+    /** Cycle-timed mode: bus accesses of the current instruction's interrupt entry, if it raised one
+     *  (3 pushes, 2 vector reads; split words counted twice, like curAccesses). */
+    private int curEntryAccesses = 0;
     /** Cycle-timed mode: V30MZ instruction timing with the prefetch queue (created on the first cycle-timed run). */
     WSCpuTiming timing;
     /** Cycle-timed mode: set when the display reaches line 145, where the reference emulator ends a frame. */
@@ -309,9 +312,9 @@ public class WSMachine {
         if (rCsval == null || io == null)
             throw new IllegalStateException("WSMachine requires the V30MZ language (csval context + io space); program uses " + lang.getLanguageID());
         WSHeader hdr = cartridge.header;
-        internalEeprom = new WSEeprom(true, color ? 0x800 : 0x80);
+        internalEeprom = new WSEeprom(true, color ? 0x800 : 0x80, color);
         int eep = WSHardware.cartEepromBytes(hdr.saveCode), sr = WSHardware.sramBytes(hdr.saveCode);
-        cartEeprom = eep > 0 ? new WSEeprom(false, eep) : null;
+        cartEeprom = eep > 0 ? new WSEeprom(false, eep, false) : null;
         sram = sr > 0 ? new byte[sr] : null;
         ports[0xC0] = WSHardware.RESET_C0; ports[0xC2] = WSHardware.RESET_C2; ports[0xC3] = WSHardware.RESET_C3;
         ports[0xC1] = 0xFF; ports[0xCF] = ports[0xD0] = ports[0xD2] = ports[0xD4] = 0xFF;
@@ -605,6 +608,12 @@ public class WSMachine {
                 b &= 0xDF;                                       // bit 5 reserved
             } else if (p == 0x85) b &= 0x07;                     // CH3 freq high is 3 bits
             else if (p == 0x8D) b &= 0x1F;                       // sweep period is 5 bits
+            else if (p == 0xA0) {
+                // REG_HW_FLAGS (WSMan): bits 2-3 (bus width, cart ROM speed) are writable; bit 1 (colour system) is
+                // read-only; bits 0 (BIOS out) and 7 (BIST passed) lock once set. A boot write such as OUT 0A0h,05
+                // must not clear the colour bit.
+                b = (ports[0xA0] & ~0x0C) | (b & 0x0C) | (b & 0x81);
+            }
             ports[p] = b;
             if (p >= 0x4A && p <= 0x4C) sdmaSrcReload = sdmaSrc();   // shadows follow every write
             if (p >= 0x4E && p <= 0x50) sdmaLenReload = sdmaLen();
@@ -643,6 +652,9 @@ public class WSMachine {
 
     /** Boot environment: refill a blank cartridge EEPROM with {@code b} (hardware delivers it erased, 0xFF; Mesen 2
      *  starts at 0x00). Call before loading saves; no effect without a cartridge EEPROM. */
+    /** Console owner data in the internal EEPROM (name, default volume; see WSEeprom.setOwner). Default: blank. */
+    public void setOwner(String name, int volume) { internalEeprom.setOwner(name, volume); }
+
     public void setCartEepromFill(int b) {
         if (cartEeprom != null) java.util.Arrays.fill(cartEeprom.data, (byte) b);
     }
@@ -703,6 +715,12 @@ public class WSMachine {
         if (linear < 0x10000) return true;
         if (linear < 0x20000) return false;
         return (ports[0xA0] & 0x04) != 0;
+    }
+    /** Bus cycles of one interrupt-entry word access (entry pushes, vector reads): words split on odd
+     *  addresses and byte buses, like p-code accesses (see countAccess). */
+    private int entryWordCost(long linear) {
+        long a = linear & 0xFFFFF;
+        return ((a & 1) != 0 || !isWordBus(a)) ? 2 : 1;
     }
     private int waitStates(long linear) {
         if (linear < 0x10000) return 1;
@@ -1271,21 +1289,25 @@ public class WSMachine {
         int cs = (int) reg(rCS);
         int ip = (int) ((ipLinear - ((long) cs << 4)) & 0xFFFF);
         int sp = (int) reg(rSP), ss = (int) reg(rSS);
+        int entryAccesses = 0;
         for (int w : new int[] { packFlags(), cs, ip }) {
             sp = (sp - 2) & 0xFFFF;
-            write(((long) ss << 4) + sp, new byte[] { (byte) w, (byte) (w >> 8) });
+            long a = ((long) ss << 4) + sp;
+            entryAccesses += entryWordCost(a);
+            write(a, new byte[] { (byte) w, (byte) (w >> 8) });
         }
         setReg(rSP, sp);
         setReg(rIF, 0);
         setReg(rTF, 0);
         byte[] v = read(vec * 4L, 4);
+        entryAccesses += entryWordCost(vec * 4L) + entryWordCost(vec * 4L + 2);
         int off = (v[0] & 0xff) | (v[1] & 0xff) << 8, seg = (v[2] & 0xff) | (v[3] & 0xff) << 8;
         setReg(rCS, seg);
         thread.overrideCounter(addr(((long) seg << 4) + off));
         syncCsval();
         csMayHaveChanged = false;
         computedEdges.noteInterruptEntry();   // E0b: handler flow is a deeper context, not a branch target
-        if (cycleTiming && timing != null) timing.interrupt(((long) seg << 4) + off, 0);
+        if (cycleTiming && timing != null) timing.interrupt(((long) seg << 4) + off, 0, entryAccesses);
         edges.merge(String.format("%x,%x,%x,%s", -1L & 0xFFFFF, (((long) seg << 4) + off) & 0xFFFFF, seg, kind), 1, Integer::sum);
     }
 
@@ -1348,6 +1370,17 @@ public class WSMachine {
      * that step now. Returns true if it ran (the caller's per-instruction counters are preserved).
      */
     private boolean finishRepExit(long pcBefore) {
+        if (!repExitDue(pcBefore)) return false;
+        int acc = curAccesses, split = curSplitWords; byte[] bytes = curBytes; int len = curLen; boolean intr = curInterrupted;
+        int entry = curEntryAccesses;
+        thread.stepInstruction();
+        curAccesses = acc; curSplitWords = split; curBytes = bytes; curLen = len; curInterrupted = intr;
+        curEntryAccesses = entry;
+        return true;
+    }
+
+    /** R2's test alone: the REP string step that just ran left the PC unchanged and its exit condition holds. */
+    private boolean repExitDue(long pcBefore) {
         if (linearPC() != pcBefore || curBytes.length == 0) return false;
         int i = 0, repKind = 0;
         while (i < curBytes.length - 1 && WSCpuTiming.isPrefix(curBytes[i] & 0xFF)) {
@@ -1363,11 +1396,7 @@ public class WSMachine {
             boolean zf = flag(lang.getRegister("ZF"));
             exit = repKind == 0xF3 ? !zf : zf;
         }
-        if (!exit) return false;
-        int acc = curAccesses, split = curSplitWords; byte[] bytes = curBytes; int len = curLen; boolean intr = curInterrupted;
-        thread.stepInstruction();
-        curAccesses = acc; curSplitWords = split; curBytes = bytes; curLen = len; curInterrupted = intr;
-        return true;
+        return exit;
     }
 
     /**
@@ -1471,7 +1500,7 @@ public class WSMachine {
                 boolean taken = pcAfter != pcBefore + curLen;
                 boolean repMore = pcAfter == pcBefore;
                 tickOverride = true;
-                try { timing.instruction(curBytes, taken, pcAfter, curAccesses, repFirst, repMore, curInterrupted); }
+                try { timing.instruction(curBytes, taken, pcAfter, curAccesses, repFirst, repMore, curInterrupted, curEntryAccesses); }
                 finally { tickOverride = false; }
                 afterStep();                                     // single-step trap (charged as an interrupt)
                 prevPc = pcBefore;
@@ -1489,6 +1518,12 @@ public class WSMachine {
      */
     void debuggerPreStep() {
         if (csMayHaveChanged) { syncCsval(); csMayHaveChanged = false; }
+    }
+
+    /** Mirror of runFrames' R2 (REP exit in the same step) for WSDebuggerEmulator: true when the step that just ran
+     *  needs its final iteration now; the debugger then performs that step itself (its own step path). */
+    boolean debuggerRepExitDue(long pcBefore) {
+        return repExitDue(pcBefore);
     }
 
     /**
@@ -1565,6 +1600,7 @@ public class WSMachine {
             curAccesses = 0;
             curAccessCount = 0;
             curInterrupted = false;
+            curEntryAccesses = 0;
             curInBefore = 0;
             WSInstructionDecoder.MemoInstruction memo = ins instanceof WSInstructionDecoder.MemoInstruction m ? m : null;
             if (memo != null) {
@@ -1785,12 +1821,15 @@ public class WSMachine {
             int sp = (int) reg(rSP), ss = (int) reg(rSS);
             for (int w : new int[] { packFlags(), cs, ip }) {
                 sp = (sp - 2) & 0xFFFF;
-                write(((long) ss << 4) + sp, new byte[] { (byte) w, (byte) (w >> 8) });
+                long a = ((long) ss << 4) + sp;
+                curEntryAccesses += entryWordCost(a);
+                write(a, new byte[] { (byte) w, (byte) (w >> 8) });
             }
             setReg(rSP, sp);
             setReg(rIF, 0);
             setReg(rTF, 0);
             byte[] v = read(vec * 4L, 4);
+            curEntryAccesses += entryWordCost(vec * 4L) + entryWordCost(vec * 4L + 2);
             int off = (v[0] & 0xff) | (v[1] & 0xff) << 8, seg = (v[2] & 0xff) | (v[3] & 0xff) << 8;
             setReg(rCS, seg);
             csMayHaveChanged = true;          // BOUND / divide traps are not in CS_WRITERS

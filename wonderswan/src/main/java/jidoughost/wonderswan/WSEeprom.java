@@ -50,15 +50,29 @@ public final class WSEeprom {
     public final List<String> log = new ArrayList<>();
     public long operations, refused;
 
-    public WSEeprom(boolean internal, int sizeBytes) {
+    public WSEeprom(boolean internal, int sizeBytes, boolean colorModel) {
         this.internal = internal;
         this.data = new byte[sizeBytes];
-        // Initial contents: a cartridge EEPROM is delivered erased (all ones, M93LCx6 datasheet). No source
-        // documents a console's internal EEPROM contents; it starts zero-filled, which matches the reference
-        // emulator for the area games read (load a dump of a real console for its owner data).
+        // Initial contents: a cartridge EEPROM is delivered erased (all ones, M93LCx6 datasheet). The console's
+        // internal EEPROM holds its owner's data, which differs per console; it starts blank here and is set with
+        // setOwner (a boot-environment choice, like the cartridge fill).
         if (!internal) java.util.Arrays.fill(data, (byte) 0xFF);
         this.bigAddressBits = Integer.numberOfTrailingZeros(sizeBytes / 2);
         this.writeEnabled = internal;
+    }
+
+    /** Owner name and default volume in the internal EEPROM's owner block (WSMan, "Owner information"): the name is
+     *  16 bytes at 0x060 in the console's name encoding (space 0x00, digits 0x01-0x0A, A-Z 0x0B-0x24; any other
+     *  character is stored as a space); colour models also keep flags at 0x083 whose bits 0-1 are the default
+     *  volume. Lower-case letters are upper-cased. */
+    public void setOwner(String name, int volume) {
+        if (!internal) throw new IllegalStateException("owner data lives in the internal EEPROM");
+        for (int i = 0; i < 16 && 0x60 + i < data.length; i++) {
+            char c = i < name.length() ? Character.toUpperCase(name.charAt(i)) : ' ';
+            int v = c >= '0' && c <= '9' ? 0x01 + (c - '0') : c >= 'A' && c <= 'Z' ? 0x0B + (c - 'A') : 0x00;
+            data[0x60 + i] = (byte) v;
+        }
+        if (data.length > 0x83) data[0x83] = (byte) ((data[0x83] & ~0x03) | (volume & 0x03));
     }
 
     /** Word-address bits in effect: the full size, or 1 Kbit form for the internal EEPROM in mono mode. */

@@ -82,10 +82,11 @@ public final class WSCpuTiming {
      * @param repFirst for REP string instructions: true on the first iteration
      * @param repMore  for REP string instructions: another iteration follows
      * @param interrupted the instruction raised a software interrupt or a divide error (entry charged here)
+     * @param entryAccesses bus accesses of the interrupt entry (3 pushes, 2 vector reads; split words count 2)
      * @return cycles charged
      */
     public long instruction(byte[] b, boolean taken, long target, int accesses, boolean repFirst, boolean repMore,
-            boolean interrupted) {
+            boolean interrupted, int entryAccesses) {
         instrCycles = 0;
         int i = 0;
         boolean rep = false;
@@ -226,17 +227,18 @@ public final class WSCpuTiming {
             default -> idle();                                       // undefined opcodes: 1 cycle
         }
         access(accesses);
-        if (interrupted) { idle(30); access(5); flush(target); return instrCycles; }   // interrupt entry
+        if (interrupted) { idle(30); access(entryAccesses); flush(target); return instrCycles; }   // interrupt entry
         if (rep && string && repMore) repeatOpcode();
         if (branchFlush || (taken && !(rep && string))) flush(target);
         return instrCycles;
     }
 
-    /** Hardware interrupt or exception entry: 30 internal cycles, 3 pushes, 2 vector reads, flush to the handler. */
-    public long interrupt(long handler, int extraIdle) {
+    /** Hardware interrupt or exception entry: 30 internal cycles, then the entry bus accesses (3 pushes,
+     *  2 vector reads; split words count 2), flush to the handler. */
+    public long interrupt(long handler, int extraIdle, int entryAccesses) {
         instrCycles = 0;
         idle(extraIdle + 30);
-        access(5);
+        access(entryAccesses);
         flush(handler);
         return instrCycles;
     }

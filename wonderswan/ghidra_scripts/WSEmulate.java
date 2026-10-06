@@ -2,7 +2,8 @@
 // Run the current WonderSwan program in WSMachine and write emulation evidence.
 // Args: <out dir> [frames=1500] [slice=40000] [stopAt linear hex, or - for none] [shotEvery=100]
 //       [saves dir to load, or -] [input script file, or -] [environment, or -: hp=0|1 (headphone adapter
-//       connected, default 1), eep=XX (blank cartridge EEPROM fill, default FF as delivered; Mesen 2 uses 00), cyc=0|1 (cycle-timed
+//       connected, default 1), eep=XX (blank cartridge EEPROM fill, default FF as delivered; Mesen 2 uses 00), owner=NAME[:volume] (console
+//       owner data in the internal EEPROM, default blank; Mesen 2 uses WONDERSWAN / WONDERSWANCOLOR:3), cyc=0|1 (cycle-timed
 //       lines, timers and interrupts instead of `slice` instructions per frame)]
 // Writes coverage.json (executed instruction linear addresses with ROM offset, CS and DS/ES sets), edges.tsv,
 // banks.json (bank writes + DMA log), ram.bin, vram_writers.json, saves/ (internal.eeprom, cart.eeprom,
@@ -35,6 +36,10 @@ public class WSEmulate extends GhidraScript {
                 switch (e[0]) {
                     case "hp" -> m.headphones = !e[1].equals("0");
                     case "eep" -> m.setCartEepromFill(Integer.parseInt(e[1], 16));
+                    case "owner" -> {   // owner=NAME[:volume]: console owner data in the internal EEPROM
+                        String[] o = e[1].split(":");
+                        m.setOwner(o[0], o.length > 1 ? Integer.parseInt(o[1]) : 0);
+                    }
                     case "cyc" -> m.cycleTiming = !e[1].equals("0");
                     case "trace" -> { String[] w = e[1].split(":"); m.traceFrom = Long.parseLong(w[0]); if (w.length > 1) m.traceLimit = Integer.parseInt(w[1]); }
                     case "sig" -> sigOut[0] = !e[1].equals("0");

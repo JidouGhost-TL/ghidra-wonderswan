@@ -274,7 +274,9 @@ public class WSDebuggerEmulator extends PcodeEmulator {
         }
         ws.debuggerPreStep();
         if (ws.beforeStep != null) ws.beforeStep.accept(this.ws);
+        long pcBefore = ws.linearPC();
         t.plainStep();
+        if (ws.debuggerRepExitDue(pcBefore)) t.plainStep();   // R2, as in runFrames
         completeDebuggerStep();
     }
 
