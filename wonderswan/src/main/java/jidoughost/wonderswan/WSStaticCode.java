@@ -24,7 +24,9 @@ import ghidra.util.task.TaskMonitor;
  * reach a return or an existing instruction, and transfers may not enter the
  * middle of an instruction. Defined data and inconsistent file-backed aliases
  * veto a candidate. Computed transfers and unresolved bank contexts are kept
- * as unknown, with a rejection reason. No execution evidence is synthesized.
+ * as unknown, with a rejection reason, except an immediate software interrupt,
+ * which behaves like a call returning to its fallthrough. No execution
+ * evidence is synthesized.
  */
 public final class WSStaticCode {
     public static final String PROPERTY = "WS_STATIC_UNEXECUTED";
@@ -293,15 +295,22 @@ public final class WSStaticCode {
                 throw new Reject("zero-fill-instruction");
             if (text.matches("(MOV|POP)CS.*")) throw new Reject("code-segment-write");
             var flow = i.getFlowType();
-            if (flow.isComputed()) throw new Reject("computed-transfer");
+            // An immediate software interrupt transfers through a fixed
+            // vector table and returns to its fallthrough like a call. The
+            // language models it as an indirect call, but the destination
+            // carries no data dependence, so it is opaque to the trial walk
+            // rather than an unresolvable computed transfer.
+            byte[] encoded = i.getBytes();
+            boolean softInterrupt = flow.isComputed() && flow.isCall() && !flow.isJump()
+                && i.getMnemonicString().equals("INT") && encoded.length == 2 && encoded[0] == (byte)0xcd;
+            if (flow.isComputed() && !softInterrupt) throw new Reject("computed-transfer");
             code.put(a, i); body.add(a, i.getMaxAddress());
             Set<Address> next = new HashSet<>(); edges.put(a, next);
             Address[] targets = i.getFlows();
-            if (flow.isCall() || flow.isJump()) {
+            if ((flow.isCall() || flow.isJump()) && !softInterrupt) {
                 if (targets.length == 0) throw new Reject("unresolved-transfer");
                 for (Address target : targets) {
                     transfers.add(target);
-                    byte[] encoded = i.getBytes();
                     if (flow.isJump() && encoded[0] == (byte)0xea && listing.getInstructionAt(target) == null)
                         throw new Reject("unresolved-far-jump-context");
                     if (flow.isJump()) { next.add(target); queue.add(target); }
