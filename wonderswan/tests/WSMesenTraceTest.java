@@ -61,7 +61,7 @@ public class WSMesenTraceTest {
         check(d.byLinear.get(0xb0000L).count() == 10, "cov count");
         check(d.byLinear.get(0xb0000L).ds().equals(Set.of(0)), "cov ds");
         check(d.byLinear.get(0xb0000L).c0().equals(Set.of(0xff)), "cov c0 single");
-        check(d.byLinear.get(0xb0003L).c0().equals(Set.of(0x0f, 0xff)), "cov c0 multi");
+        check(d.byLinear.get(0xb0003L).c0().equals(Set.of(0x0e, 0xff)), "cov c0 multi");
         check(d.byLinear.get(0x20010L).c2().equals(Set.of(0xf2, 0xff)), "cov c2 multi");
         check(d.byLinear.get(0x20020L).c2().isEmpty(), "cov empty banks col");
         check(d.skipped == 0, "cov v2 no skipped");
@@ -129,10 +129,14 @@ public class WSMesenTraceTest {
         WSMesenTrace.TraceData trace = WSMesenTrace.parseTrace(fx.resolve("trace-v2.tsv"));
         WSMesenTrace.CovData cov = WSMesenTrace.parseCoverage(fx.resolve("coverage-v2.tsv"));
         Map<Long, Integer> wsm = Map.of(0x20020L, 0x2000, 0xb0006L, 0xb000);
-        WSEvidence e = WSEvidence.fromMesen(trace, cov, null, "test", 0x100000, wsm, -1);
+        // 2 MiB: C0 = 0x0E shows other bytes than the loader's C0 = 0xFF (bit 20 differs), so its
+        // rows are skipped; on a 1 MiB cartridge the size mask makes every C0 alias (kept, below).
+        WSEvidence e = WSEvidence.fromMesen(trace, cov, null, "test", 0x200000, wsm, -1);
         check(e.cs.get(0xb0000L) == 0xb000, "mesen cs from trace");
         check(e.cs.get(0x500L) == 0x0000, "mesen cs guessed for RAM");
-        check(!e.cs.containsKey(0xb0006L), "mesen c0!=FF skipped");
+        check(!e.cs.containsKey(0xb0006L), "mesen c0 other image skipped");
+        check(WSEvidence.fromMesen(trace, cov, null, "test", 0x100000, wsm, -1).cs.containsKey(0xb0006L),
+            "mesen c0 aliased by size mask kept");
         check(!e.cs.containsKey(0x20020L), "mesen window without banks skipped");
         check(!e.cs.containsKey(0x15000L), "mesen sram skipped");
         check(e.cs.containsKey(0xb0003L), "mesen multi-c0 with FF kept");
@@ -173,14 +177,16 @@ public class WSMesenTraceTest {
             && e2.cdlEntries.get(0).kind().equals("call"), "mesen cdl sub-entry edge");
         check(e2.mesenStats.cdlSeededNew() == 2, "mesen cdl seeded-new");
         // With a trace/coverage alongside, CDL seeds need corroboration under the loader mapping.
-        byte[] flagsC = new byte[(int) romLen];
-        flagsC[0xb0000] = (byte) (WSMesenTrace.CDL_CODE | WSMesenTrace.CDL_SUB_ENTRY); // covered, C0=FF
-        flagsC[0xb0006] = (byte) (WSMesenTrace.CDL_CODE | WSMesenTrace.CDL_SUB_ENTRY); // C0-skipped
-        flagsC[0x70000] = (byte) (WSMesenTrace.CDL_CODE | WSMesenTrace.CDL_JUMP_TARGET); // unobserved
+        // 2 MiB (C0 = 0x0E is another image there): CDL offsets are the loader's (C0 = 0xFF) images.
+        long romLenC = 0x200000;
+        byte[] flagsC = new byte[(int) romLenC];
+        flagsC[0x1b0000] = (byte) (WSMesenTrace.CDL_CODE | WSMesenTrace.CDL_SUB_ENTRY); // covered, C0=FF
+        flagsC[0x1b0006] = (byte) (WSMesenTrace.CDL_CODE | WSMesenTrace.CDL_SUB_ENTRY); // C0-skipped
+        flagsC[0x170000] = (byte) (WSMesenTrace.CDL_CODE | WSMesenTrace.CDL_JUMP_TARGET); // unobserved
         Path fc = dir.resolve("c.cdl");
         Files.write(fc, flagsC);
-        WSMesenTrace.CdlData cdlC = WSMesenTrace.parseCdl(fc, romLen);
-        WSEvidence e4 = WSEvidence.fromMesen(trace, cov, cdlC, "cdl", romLen, Map.of(), -1);
+        WSMesenTrace.CdlData cdlC = WSMesenTrace.parseCdl(fc, romLenC);
+        WSEvidence e4 = WSEvidence.fromMesen(trace, cov, cdlC, "cdl", romLenC, Map.of(), -1);
         check(e4.cdlEntries.size() == 1 && e4.cdlEntries.get(0).to() == 0xb0000, "mesen cdl corroborated entry kept");
         check(e4.mesenStats.cdlNotSeeded() == 2, "mesen cdl uncorroborated/c0 declined");
         byte[] flagsM = new byte[0x80000];

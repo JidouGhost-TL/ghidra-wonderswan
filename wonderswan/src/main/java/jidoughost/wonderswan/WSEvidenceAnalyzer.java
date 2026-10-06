@@ -29,11 +29,15 @@ import ghidra.util.task.TaskMonitor;
  *   E0b a computed JMP/CALL resolves to the next instruction in its own interrupt context: edges
  *       pre-empted by an interrupt are carried across the handler flow (WSMachine) and recorded at
  *       the post-IRET instruction, never inside the handler.
- *   B3  a direct call/jump into a window (no bytes there) whose target executed under exactly one bank gets a
- *       call/jump override reference to that bank's overlay (decompiler follows it); targets that ran under
- *       several banks or never ran are reported, not guessed.
+ *   B3  a direct call/jump into a window (no bytes there) whose target executed under exactly one bank is
+ *       resolved to that bank's overlay (and disassembled there): calls get a call-override reference the
+ *       decompiler follows; jumps get a data reference (a cross-space jump override is un-followable and
+ *       fails every decompile it reaches). Targets that ran under several banks or never ran are reported.
  *   E1  an executed linear address is an instruction start: csval = the CS observed there; disassemble.
- *   E2  a call / int / irq edge target is a function entry.
+ *       Executed RAM is H1 instead (no image).
+ *   H1  executed work RAM is never decoded (load-time bytes are loader zero-fill, not the ran code):
+ *       each run is bookmarked ("RAM code, no image yet") and reported, nothing is disassembled there.
+ *   E2  a call / int / irq edge target is a function entry (RAM and last-overlay-byte targets excluded).
  *   E3  a computed JMP site gets COMPUTED_JUMP references to every observed target, and a JumpTable
  *       override listing them (observed targets only; a static table rule may add more later).
  *   D1  a function entry where only one non-zero DS value was observed gets that DS as context.
@@ -229,7 +233,7 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
         final Register csval, rDS, colorsoc;
         final boolean colorHw;
         final PrintWriter out;
-        int e1, e1skip, e2, e2conflict, e3, e3t, d1, a1runs, a1insns, n1, n1sites, b2, b2ambiguous, b3, b3multi, b3unobserved, b3conflict;
+        int e1, e1skip, e2, e2conflict, e3, e3t, d1, a1runs, a1insns, n1, n1sites, b2, b2ambiguous, b3, b3multi, b3unobserved, b3conflict, b3jump, h1runs;
         /** Mesen-sourced edges (resolved trace transfers, CDL sub-entries), by identity. */
         final Set<WSEvidence.Edge> mesenEdges = Collections.newSetFromMap(new IdentityHashMap<>());
         int e1already, e1alreadyM, e1m, e2m, e3m, e3tm, xferFall, xferIrq, xferCall, xferJump, xferInt, xferDrop, xferNoSrc;
@@ -324,6 +328,19 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
 
         boolean inProgram(Address a) { return p.getMemory().contains(a) && p.getMemory().getBlock(a).isInitialized(); }
 
+        /** H1: an address in work RAM, whose load-time bytes (loader zero-fill) are never code. */
+        boolean isRamNoImage(Address a) {
+            MemoryBlock b = p.getMemory().getBlock(a);
+            return b != null && !b.isOverlay() && b.getName().equals("RAM");
+        }
+
+        /** J1o: the last byte of a bank overlay: no case entry can live there (any instruction either
+         *  overruns the block or falls out of its address space, which the decompiler cannot follow). */
+        boolean isOverlayEnd(Address a) {
+            MemoryBlock b = p.getMemory().getBlock(a);
+            return b != null && b.isOverlay() && a.getOffset() == b.getEnd().getOffset();
+        }
+
         void seed() throws Exception {
             if (ev.e0bKnown)
                 emit("{\"rule\":\"E0b\",\"carried\":%d,\"resumed\":%d,\"max_depth\":%d}", ev.e0bCarried, ev.e0bResumed, ev.e0bMaxDepth);
@@ -388,6 +405,7 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
                 String outcome;
                 if (!fn && !code) outcome = "SKIPPED_CLASS";
                 else if (!(a instanceof SegmentedAddress sa) || !inProgram(a)) outcome = "NOT_IN_PROGRAM";
+                else if (isRamNoImage(a)) outcome = "RAM_NO_IMAGE";   // H1: seed files cannot image RAM either
                 else if (listing.getInstructionAt(a) == null && listing.getInstructionContaining(a) != null) outcome = "CONFLICT_EXISTING_DECODE";
                 else {
                     if (listing.getInstructionAt(a) == null) {
@@ -404,6 +422,8 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
                 }
                 if (outcome.equals("FUNCTION") || outcome.equals("CODE"))
                     p.getBookmarkManager().setBookmark(a, BookmarkType.ANALYSIS, "WSEvidence", "S1 SEED " + cls + " from " + file.getFileName() + ": " + outcome);
+                if (outcome.equals("RAM_NO_IMAGE"))
+                    p.getBookmarkManager().setBookmark(a, BookmarkType.ANALYSIS, "WSEvidence", "RAM code, no image yet");
                 if (outcome.equals("FUNCTION")) s1fn++;
                 else if (outcome.equals("CODE")) s1code++;
                 else s1skip++;
@@ -429,14 +449,21 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
                     MemoryBlock b = mem.getBlock(f);
                     if (b == null || b.isInitialized() || b.isOverlay()) continue;
                     long lin = f.getOffset();
+                    // Terminal outcomes never change (the evidence is fixed), so a site resolved by an
+                    // earlier pass is done; without this the repair pass re-emits every line (phase 1 ran first).
+                    // CONTEXT_CONFLICT is not terminal: later passes may clear the bad decode and resolve it.
+                    String doneKey = i.getAddress() + "|" + lin;
+                    if (ev.b3resolved.contains(doneKey)) continue;
                     Set<Integer> banks = ev.windowBanks.get(lin);
                     if (banks == null || banks.isEmpty()) {
                         b3unobserved++;
+                        ev.b3resolved.add(doneKey);
                         emit("{\"rule\":\"B3\",\"site\":\"%s\",\"target\":\"%05x\",\"outcome\":\"UNOBSERVED\"}", i.getAddress(), lin);
                         continue;
                     }
                     if (banks.size() > 1) {
                         b3multi++;
+                        ev.b3resolved.add(doneKey);
                         emit("{\"rule\":\"B3\",\"site\":\"%s\",\"target\":\"%05x\",\"outcome\":\"MULTI_BANK\",\"banks\":\"%s\"}", i.getAddress(), lin, banks);
                         continue;
                     }
@@ -457,13 +484,25 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
                         }
                         new DisassembleCommand(o, null, true).applyTo(p, monitor);
                     }
-                    Reference r = p.getReferenceManager().addMemoryReference(i.getAddress(), o,
-                        call ? RefType.CALL_OVERRIDE_UNCONDITIONAL : RefType.JUMP_OVERRIDE_UNCONDITIONAL, SourceType.ANALYSIS, Reference.MNEMONIC);
-                    p.getReferenceManager().setPrimary(r, true);
-                    if (call && p.getFunctionManager().getFunctionAt(o) == null && listing.getInstructionAt(o) != null)
-                        new CreateFunctionCmd(o).applyTo(p, monitor);
-                    b3++;
-                    emit("{\"rule\":\"B3\",\"site\":\"%s\",\"target\":\"%s\",\"outcome\":\"OVERRIDE\",\"kind\":\"%s\"}", i.getAddress(), o, call ? "call" : "jump");
+                    ev.b3resolved.add(doneKey);
+                    if (call) {
+                        Reference r = p.getReferenceManager().addMemoryReference(i.getAddress(), o,
+                            RefType.CALL_OVERRIDE_UNCONDITIONAL, SourceType.ANALYSIS, Reference.MNEMONIC);
+                        p.getReferenceManager().setPrimary(r, true);
+                        if (p.getFunctionManager().getFunctionAt(o) == null && listing.getInstructionAt(o) != null)
+                            new CreateFunctionCmd(o).applyTo(p, monitor);
+                        b3++;
+                        emit("{\"rule\":\"B3\",\"site\":\"%s\",\"target\":\"%s\",\"outcome\":\"OVERRIDE\",\"kind\":\"call\"}", i.getAddress(), o);
+                        continue;
+                    }
+                    // A jump override into another address space is un-followable: every function whose flow
+                    // reaches it fails to decompile ("could not find op at target address") even with the
+                    // target disassembled. The target stays disassembled (coverage needs it) and is recorded
+                    // here plus a data reference (navigation without flow); calls above are unaffected.
+                    p.getReferenceManager().addMemoryReference(i.getAddress(), o,
+                        RefType.DATA, SourceType.ANALYSIS, Reference.MNEMONIC);
+                    b3jump++;
+                    emit("{\"rule\":\"B3\",\"site\":\"%s\",\"target\":\"%s\",\"outcome\":\"JUMP_DATAREF\",\"kind\":\"jump\"}", i.getAddress(), o);
                 }
             }
         }
@@ -472,9 +511,11 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
         void seedExecuted(String rule) throws Exception {
             Listing listing = p.getListing();
             AddressSet seeds = new AddressSet();
+            Set<Long> ram = new TreeSet<>();
             int seeded = 0, skipped = 0;
             for (Map.Entry<Long, Integer> e : ev.cs.entrySet()) for (Address a : addrs(e.getKey(), e.getValue())) {
                 if (!inProgram(a)) { skipped++; continue; }
+                if (isRamNoImage(a)) { ram.add(e.getKey()); skipped++; continue; }   // H1: no image yet
                 if (listing.getInstructionAt(a) != null) {
                     e1already++;
                     if (isMesen(e.getKey())) e1alreadyM++;
@@ -491,8 +532,41 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
                 if (rule.equals("E1") && isMesen(e.getKey())) e1m++;
             }
             if (!seeds.isEmpty()) new DisassembleCommand(seeds, null, true).applyTo(p, monitor);
+            h1runs += bookmarkRamRuns(ram);
             emit("{\"rule\":\"%s\",\"seeded\":%d,\"skipped\":%d}", rule, seeded, skipped);
             e1 += seeded; e1skip += skipped;
+        }
+
+        /** H1: work RAM holds loader zero-fill at analysis time, never the bytes the game ran there
+         *  (copied in later), so executed RAM is bookmarked per run instead of decoded. E1R re-runs this
+         *  with the same evidence: runs already bookmarked are left alone (returns only new runs). */
+        int bookmarkRamRuns(Set<Long> ram) throws Exception {
+            int runs = 0;
+            Long start = null, prev = null;
+            List<long[]> spans = new ArrayList<>();
+            for (long lin : ram) {
+                if (start == null || lin != prev + 1) {
+                    if (start != null) spans.add(new long[] { start, prev });
+                    start = lin;
+                }
+                prev = lin;
+            }
+            if (start != null) spans.add(new long[] { start, prev });
+            for (long[] s : spans) {
+                Address a = at(s[0], ev.cs.getOrDefault(s[0], 0));
+                boolean marked = false;
+                for (Bookmark b : p.getBookmarkManager().getBookmarks(a))
+                    if (b.getComment() != null && b.getComment().startsWith("RAM code, no image yet")) { marked = true; break; }
+                if (marked) continue;
+                int n = (int) (s[1] - s[0] + 1);
+                p.getBookmarkManager().setBookmark(a, BookmarkType.ANALYSIS, "WSEvidence",
+                    n == 1 ? "RAM code, no image yet"
+                        : String.format("RAM code, no image yet (%s..%s, %d executed addresses)",
+                            a, at(s[1], ev.cs.getOrDefault(s[1], 0)), n));
+                emit("{\"rule\":\"H1\",\"run\":\"%s..%s\",\"addresses\":%d}", a, at(s[1], ev.cs.getOrDefault(s[1], 0)), n);
+                runs++;
+            }
+            return runs;
         }
 
         /**
@@ -558,6 +632,14 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
                 if (tas.size() > 1) b2ambiguous++;   // target ran under several banks; the edge does not say which
                 for (Address ta : tas) {
                     if (!inProgram(ta)) continue;
+                    if (isRamNoImage(ta)) {   // H1: executed RAM has no image; the H1 run bookmark covers it
+                        emit("{\"rule\":\"E2\",\"target\":\"%s\",\"kind\":\"%s\",\"outcome\":\"RAM_NO_IMAGE\"}", ta, ed.kind());
+                        continue;
+                    }
+                    if (isOverlayEnd(ta)) {   // J1o: no case entry can live on the last overlay byte
+                        emit("{\"rule\":\"J1o\",\"from\":\"%x\",\"target\":\"%s\",\"kind\":\"%s\",\"outcome\":\"EXCLUDED\"}", ed.from(), ta, ed.kind());
+                        continue;
+                    }
                     if (ed.kind().equals("jump")) {
                         for (Instruction site : srcs) {
                             jumps.computeIfAbsent(site.getAddress(), k -> new LinkedHashSet<>()).add(ta);
@@ -595,13 +677,20 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
                 for (Address t : j.getValue()) site.addMnemonicReference(t, RefType.COMPUTED_JUMP, SourceType.ANALYSIS);
                 Function f = p.getFunctionManager().getFunctionContaining(site.getAddress());
                 if (f != null) {
-                    new JumpTable(site.getAddress(), new ArrayList<>(j.getValue()), true, 0).writeOverride(f);
-                    CreateFunctionCmd.fixupFunctionBody(p, f, monitor);
+                    // J1q: the override stays in the site's space (references above keep every bank);
+                    // without an own-space target there is nothing to lock yet (rule J1m retries post-merge).
+                    List<Address> own = WSJumpTables.ownSpace(site.getAddress(), j.getValue());
+                    if (!own.isEmpty()) {
+                        new JumpTable(site.getAddress(), new ArrayList<>(own), true, 0).writeOverride(f);
+                        CreateFunctionCmd.fixupFunctionBody(p, f, monitor);
+                    }
                 }
                 e3++; e3t += j.getValue().size();
                 int nm = jumpsMesen.getOrDefault(j.getKey(), new LinkedHashSet<>()).size();
                 if (nm > 0) { e3m++; e3tm += nm; }
-                emit("{\"rule\":\"E3\",\"site\":\"%s\",\"observed_targets\":%d%s}", site.getAddress(), j.getValue().size(),
+                StringBuilder tb = new StringBuilder();
+                for (Address t : j.getValue()) { if (tb.length() > 0) tb.append(','); tb.append('"').append(t).append('"'); }
+                emit("{\"rule\":\"E3\",\"site\":\"%s\",\"observed_targets\":%d,\"targets\":[%s]%s}", site.getAddress(), j.getValue().size(), tb,
                     nm == 0 ? "" : nm == j.getValue().size() ? ",\"src\":\"mesen\"" : ",\"src\":\"mixed\"");
             }
 
@@ -693,8 +782,8 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
         }
 
         String summary() {
-            return String.format("B2 bank overlays %d (edges into multi-bank code %d), B3 window flows overridden %d (multi-bank %d, unobserved %d, context conflicts %d), E1 seeded %d (skipped %d), E2 functions %d (offcut targets skipped %d), E3 jump sites %d (targets %d), N1 no-return cleared %d (%d call sites), D1 DS entries %d, A1 artefact runs %d (%d instructions cleared)",
-                b2, b2ambiguous, b3, b3multi, b3unobserved, b3conflict, e1, e1skip, e2, e2conflict, e3, e3t, n1, n1sites, d1, a1runs, a1insns);
+            return String.format("B2 bank overlays %d (edges into multi-bank code %d), B3 window flows overridden %d (jumps fenced %d, multi-bank %d, unobserved %d, context conflicts %d), E1 seeded %d (skipped %d), H1 RAM runs %d, E2 functions %d (offcut targets skipped %d), E3 jump sites %d (targets %d), N1 no-return cleared %d (%d call sites), D1 DS entries %d, A1 artefact runs %d (%d instructions cleared)",
+                b2, b2ambiguous, b3, b3jump, b3multi, b3unobserved, b3conflict, e1, e1skip, h1runs, e2, e2conflict, e3, e3t, n1, n1sites, d1, a1runs, a1insns);
         }
 
         @Override public void close() { if (out != null) out.close(); }

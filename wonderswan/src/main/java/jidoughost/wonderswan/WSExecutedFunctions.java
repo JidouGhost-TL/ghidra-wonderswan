@@ -19,14 +19,14 @@ import ghidra.util.task.TaskMonitor;
  * connected pieces by flow (fall-through and branches between executed, function-less instructions); every piece
  * entry, an instruction that something calls or that no other instruction of the piece flows to, becomes a function.
  * Executed code is proven, so this never creates a function in data. Only the default address space is considered:
- * bank-window overlays need per-bank evidence.
+ * bank-window overlays need per-bank evidence. Work RAM is skipped (rule H1: no image at analysis time).
  */
 public class WSExecutedFunctions {
     private final Program p;
     private final WSEvidence ev;
     private final Consumer<String> emit;
     private final TaskMonitor monitor;
-    int pieces, created, failed, outside;
+    int pieces, created, failed, outside, ramSkipped;
 
     public WSExecutedFunctions(Program p, WSEvidence ev, Consumer<String> emit, TaskMonitor monitor) {
         this.p = p; this.ev = ev; this.emit = emit; this.monitor = monitor;
@@ -40,6 +40,9 @@ public class WSExecutedFunctions {
             monitor.checkCancelled();
             Address a = i.getAddress();
             if (a.getAddressSpace().isOverlaySpace()) continue;
+            // H1: executed RAM has no image (loader zero-fill); the H1 run bookmark covers it, never a function.
+            ghidra.program.model.mem.MemoryBlock b = p.getMemory().getBlock(a);
+            if (b != null && !b.isOverlay() && b.getName().equals("RAM")) { ramSkipped++; continue; }
             if (!ev.executed(a.getOffset())) continue;
             if (fm.getFunctionContaining(a) == null) out.add(a);
         }
@@ -73,7 +76,7 @@ public class WSExecutedFunctions {
     }
 
     public String summary() {
-        return String.format("E5 executed code outside functions: %d instructions, %d entries, %d functions created, %d failed",
-            outside, pieces, created, failed);
+        return String.format("E5 executed code outside functions: %d instructions, %d entries, %d functions created, %d failed, %d RAM skipped (no image)",
+            outside, pieces, created, failed, ramSkipped);
     }
 }

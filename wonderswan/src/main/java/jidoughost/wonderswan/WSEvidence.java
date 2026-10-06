@@ -47,6 +47,8 @@ public final class WSEvidence {
     public MesenStats mesenStats;
     /** Free-text provenance (how the evidence was produced). */
     public String provenance = "";
+    /** B3 site|linear keys already resolved (terminal outcomes never change; the repair pass skips them). */
+    public final java.util.Set<String> b3resolved = new java.util.HashSet<>();
     /** Rule E0b: computed-branch edges carried across interrupt handler flow, and those later
      *  resolved at a same-context (post-IRET) instruction. Only known for in-process WSMachine
      *  runs ({@link #e0bKnown}); loaded or Mesen evidence leaves them unset. */
@@ -134,9 +136,11 @@ public final class WSEvidence {
      * {@code (linear & 0xF0000) >> 4}. {@code romCrc} is the program ROM's CRC32 (-1 to skip the
      * CDL header check); a mismatch is reported in the stats, not fatal.
      *
-     * <p>Mapping rules: linear-window code is seeded only when it ran with the loader's C0 = 0xFF
-     * (or the log predates bank columns, in which case that mapping is assumed); bank-window code
-     * only with observed banks (rule B1); SRAM has no program bytes and is reported, not seeded.
+     * <p>Mapping rules: linear-window code is seeded when an observed C0 shows the same bytes the
+     * loader maps (effective-ROM offset under C0 = 0xFF; several C0 values alias to one image under the
+     * size mask), or the log predates bank columns (that mapping is assumed); otherwise the address is
+     * skipped (no image for what it executed). Bank-window code only with observed banks (rule B1);
+     * SRAM has no program bytes and is reported, not seeded.
      * CDL code bytes seed only their unambiguous linear image, and only when they are known
      * instruction starts (jump targets and sub-entries; plain code bytes are mostly instruction
      * operands, which must never seed). With a trace or coverage alongside, CDL seeds additionally
@@ -169,7 +173,14 @@ public final class WSEvidence {
                 Set<Integer> c0 = new TreeSet<>();
                 if (coverage != null && coverage.byLinear.containsKey(lin)) c0.addAll(coverage.byLinear.get(lin).c0());
                 if (trace != null && trace.c0.containsKey(lin)) c0.addAll(trace.c0.get(lin));
-                if (!c0.isEmpty() && !c0.contains(WSHardware.RESET_C0)) { c0Skipped++; c0skip.add(lin); continue; }
+                // Keep an address its observed C0 maps to the same bytes the loader shows (effective-ROM
+                // offset under RESET_C0): several C0 values alias to one image once the size mask applies.
+                // Only a C0 showing genuinely other bytes is skipped (no image for what it executed).
+                long effLen = WSHardware.effectiveSize(romLen);
+                long loaderOff = WSHardware.linearToRom(lin, WSHardware.RESET_C0, effLen);
+                boolean imaged = c0.isEmpty();
+                for (int v : c0) if (WSHardware.linearToRom(lin, v, effLen) == loaderOff) { imaged = true; break; }
+                if (!imaged) { c0Skipped++; c0skip.add(lin); continue; }
                 if (c0.size() > 1) multiC0++;
                 e.cs.put(lin, cs);
             } else if (lin >= 0x20000) {

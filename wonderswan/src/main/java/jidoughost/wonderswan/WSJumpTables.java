@@ -60,9 +60,20 @@ import ghidra.util.task.TaskMonitor;
  * J1m (post-analysis script WSJumpTableFinish, after the merges): at a quarantined site, re-delete any guessed
  *   reference a later analysis re-derived (by the QUARANTINED address list) and lock the switch to its observed
  *   targets (a stored jump-table override); with no observed target the site stays an opaque indirect branch.
+ *   Unresolved sites with E3 observed targets get the same lock; recovered jump sites are re-locked (J1p: merges
+ *   strip the recovery override, after which the decompiler's own unbounded table read follows garbage
+ *   cross-space). Every lock is filtered to the site's address space (J1q).
  * J1n: a kept target shadowed by single-byte data (a data pointer read the slot first) is deshadowed (analysis
  *   references to the byte deleted with it; the slot's code reference is added anyway): a proven code target
  *   beats one data byte. User/imported and multi-byte data stay, keeping the target undecoded.
+ * J1o: a slot targeting the last byte of a bank overlay is skipped like an empty slot, and unproven
+ *   computed references there are deleted: no case entry can live on that byte (any instruction either
+ *   overruns the block or falls out of its address space, which neither the listing nor the decompiler
+ *   can follow). User/imported references stay.
+ * J1p: recovered jump sites are re-locked post-merge (rule J1m): a merge recreates the function and strips
+ *   the recovery override, after which the decompiler's own unbounded table read follows garbage cross-space.
+ * J1q: every jump-table override is filtered to the site's address space: a foreign-bank override target sends
+ *   the decompiler where nothing was decoded. References keep every bank (they are evidence and harmless).
  * Index scaling by ADD r,r counts as SHL r,1.
  * J1d: a 0000 slot is empty (not a target, not a stop) inside a table whose end is proven.
  * Stop rules: EXECUTED_CODE (entry slot executed), TABLE_BOUNDARY (next recovered table), OWN_TARGET (J1j), OUT_OF_ROM,
@@ -74,6 +85,7 @@ public final class WSJumpTables {
 
     static final class Rec {
         String shape = "?", idx, scaledBy = null, bound = "none", stop = "BOUND";
+        Address site;
         boolean baseFound, byteBound;
         int slots, empty;                       // slots scanned (incl. empty 0000 slots), empty slots
         List<Integer> slotOf = new ArrayList<>(); // slot index of each target
@@ -126,6 +138,31 @@ public final class WSJumpTables {
             passes++;
             if (done.size() + quarantined.size() == before) break;
         }
+        dropOverlayEndRefs();
+    }
+
+    /** J1o: delete computed references to the last byte of a bank overlay (no case entry can live
+     *  there: the reference builds a cross-space body range that neither the listing nor the
+     *  decompiler can follow). User and imported references stay; recovered tables never hold such
+     *  targets (the reader skips them), so anything deleted here is an unproven guess. Idempotent. */
+    void dropOverlayEndRefs() {
+        for (Instruction ins : listing.getInstructions(true)) {
+            if (!ins.getFlowType().isComputed()) continue;
+            for (Reference ref : p.getReferenceManager().getReferencesFrom(ins.getAddress())) {
+                if (!ref.getReferenceType().isComputed()) continue;
+                if (ref.getSource() == SourceType.USER_DEFINED || ref.getSource() == SourceType.IMPORTED) continue;
+                if (!isOverlayEnd(ref.getToAddress())) continue;
+                p.getReferenceManager().delete(ref);
+                emit.accept(String.format("{\"rule\":\"J1o\",\"site\":\"%s\",\"target\":\"%s\",\"outcome\":\"REF_DELETED\"}",
+                    ins.getAddress(), ref.getToAddress()));
+            }
+        }
+    }
+
+    /** J1o: the last byte of a bank overlay block. */
+    boolean isOverlayEnd(Address a) {
+        ghidra.program.model.mem.MemoryBlock b = mem.getBlock(a);
+        return b != null && b.isOverlay() && a.getOffset() == b.getEnd().getOffset();
     }
 
     /** End of phase 2: quarantined sites that never recovered keep their guessed references deleted
@@ -324,8 +361,14 @@ public final class WSJumpTables {
         }
         Function f = p.getFunctionManager().getFunctionContaining(ins.getAddress());
         if (!isCall && f != null) {
-            new JumpTable(ins.getAddress(), new ArrayList<>(r.targets), true, 0).writeOverride(f);
-            CreateFunctionCmd.fixupFunctionBody(p, f, monitor);
+            // J1q: a jump-table override must stay in the site's address space: a foreign-bank target
+            // sends the decompiler looking for code where none was decoded ("could not find op").
+            // References keep every bank (they are evidence and harmless); only the override is filtered.
+            List<Address> own = ownSpace(ins.getAddress(), r.targets);
+            if (!own.isEmpty()) {
+                new JumpTable(ins.getAddress(), new ArrayList<>(own), true, 0).writeOverride(f);
+                CreateFunctionCmd.fixupFunctionBody(p, f, monitor);
+            }
         }
         recovered++;
         if (!r.baseAdds.isEmpty()) computedBases++;
@@ -410,6 +453,9 @@ public final class WSJumpTables {
      *  User/imported data and multi-byte data stay (returns false, keeping the target undecoded). Analysis
      *  references to the byte are deleted with it (the slot's code reference is added by the caller). */
     boolean deshadow(Address site, Address t) throws Exception {
+        // H1: RAM targets have no image (loader zero-fill); leave the byte undecoded.
+        ghidra.program.model.mem.MemoryBlock rb = mem.getBlock(t);
+        if (rb != null && !rb.isOverlay() && rb.getName().equals("RAM")) return false;
         var d = listing.getDataAt(t);
         if (d == null || d.getLength() != 1) return false;
         List<Reference> refs = new ArrayList<>();
@@ -426,20 +472,39 @@ public final class WSJumpTables {
     /** Rule J1m (post-analysis, after the merges): at a site quarantined by J1l that never recovered, re-delete
      *  any guessed reference a later analysis re-derived (by the QUARANTINED address list; observed and user
      *  references stay) and lock the switch to its observed targets with a stored jump-table override. With no
-     *  observed target the site stays an opaque indirect branch. Sites recovered after quarantine are skipped
-     *  (their references are proven). Idempotent. Returns a summary; evidence lines go to emit. */
+     *  observed target the site stays an opaque indirect branch. Unresolved sites with rule-E3 observed targets
+     *  get the same lock (their phase-1 override may never have been written: E3 runs before any function
+     *  contains the site): other analysis computed references are deleted, observed targets stay. Recovered
+     *  jump sites are re-locked as well (rule J1p: a merge recreates the function and strips the recovery
+     *  override, after which the decompiler's own unbounded table read follows garbage cross-space): the lock
+     *  is the union of observed and recovered targets in the site's space with code, no reference is deleted.
+     *  Every lock is filtered to the site's address space (rule J1q: a foreign-bank override target sends the
+     *  decompiler where nothing was decoded). Idempotent. Returns a summary. */
     public static String lockSwitches(Program p, List<String> evidence, Consumer<String> emit, TaskMonitor monitor) throws Exception {
         AddressFactory af = p.getAddressFactory();
         Set<Address> recovered = new HashSet<>();
+        Set<Address> recoveredJump = new LinkedHashSet<>();
+        Set<Address> unresolved = new LinkedHashSet<>();
         Map<Address, Set<Address>> quar = new LinkedHashMap<>();
+        Map<Address, Set<Address>> e3obs = new LinkedHashMap<>();
         for (String l : evidence) {
             if (l.contains("\"rule\":\"J1\"") && l.contains("\"outcome\":\"RECOVERED\"")) {
                 Address s = addrField(l, "\"site\":\"", af);
-                if (s != null) recovered.add(s);
+                if (s != null) {
+                    recovered.add(s);
+                    if (l.contains("\"insn\":\"JMP")) recoveredJump.add(s);
+                }
+            } else if (l.contains("\"rule\":\"J1\"") && l.contains("\"outcome\":\"UNRESOLVED\"")) {
+                Address s = addrField(l, "\"site\":\"", af);
+                if (s != null) unresolved.add(s);
             } else if (l.contains("\"rule\":\"J1l\"") && l.contains("\"outcome\":\"QUARANTINED\"")) {
                 Address s = addrField(l, "\"site\":\"", af);
                 Set<Address> del = addrList(l, "\"deleted\":[", af);
                 if (s != null && del != null) quar.put(s, del);
+            } else if (l.contains("\"rule\":\"E3\"") && l.contains("\"targets\":[")) {
+                Address s = addrField(l, "\"site\":\"", af);
+                Set<Address> obs = addrList(l, "\"targets\":[", af);
+                if (s != null && obs != null) e3obs.put(s, obs);
             }
         }
         ReferenceManager rm = p.getReferenceManager();
@@ -470,6 +535,7 @@ public final class WSJumpTables {
                 if (listing.getInstructionAt(r.getToAddress()) == null) continue;
                 obs.add(r.getToAddress());
             }
+            obs = ownSpace(site, obs);
             if (obs.isEmpty()) {
                 opaque++;
                 emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"OPAQUE\",\"refs_deleted\":%d}", site, n));
@@ -484,14 +550,108 @@ public final class WSJumpTables {
             try {
                 new JumpTable(site, new ArrayList<>(obs), true, 0).writeOverride(f);
                 locked++;
-                emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"LOCKED\",\"refs_deleted\":%d,\"cases\":%d}", site, n, obs.size()));
+                emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"LOCKED\",\"refs_deleted\":%d,\"cases\":%d,\"src\":\"quarantined\"}", site, n, obs.size()));
             } catch (InvalidInputException x) {
                 skipped++;
                 emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"%s\"}", site, x.getMessage().replace("\"", "'")));
             }
         }
-        return String.format("J1m jump-table lock: quarantined sites %d, re-derived refs deleted %d, switches locked %d, opaque %d, skipped %d",
-            quar.size(), cleaned, locked, opaque, skipped);
+        int elocked = 0, eopaque = 0, eskipped = 0;
+        for (Address site : unresolved) {
+            monitor.checkCancelled();
+            if (recovered.contains(site) || quar.containsKey(site)) continue;
+            Set<Address> obs = e3obs.get(site);
+            if (obs == null || obs.isEmpty()) continue;
+            Instruction ins = listing.getInstructionAt(site);
+            if (ins == null || !ins.getFlowType().isComputed()) {
+                eskipped++;
+                emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"NO_SITE\"}", site));
+                continue;
+            }
+            int n = 0;
+            for (Reference r : rm.getReferencesFrom(site)) {
+                if (!r.getReferenceType().isComputed() || obs.contains(r.getToAddress())) continue;
+                if (r.getSource() == SourceType.USER_DEFINED || r.getSource() == SourceType.IMPORTED) continue;
+                rm.delete(r);
+                n++;
+            }
+            cleaned += n;
+            List<Address> withCode = new ArrayList<>();
+            for (Address t : ownSpace(site, obs)) if (listing.getInstructionAt(t) != null) withCode.add(t);
+            if (withCode.isEmpty()) {
+                eopaque++;
+                emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"OPAQUE\",\"refs_deleted\":%d}", site, n));
+                continue;
+            }
+            Function f = fm.getFunctionContaining(site);
+            if (f == null) {
+                eskipped++;
+                emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"NO_FUNCTION\"}", site));
+                continue;
+            }
+            try {
+                new JumpTable(site, new ArrayList<>(withCode), true, 0).writeOverride(f);
+                elocked++;
+                emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"LOCKED\",\"refs_deleted\":%d,\"cases\":%d,\"src\":\"unresolved\"}", site, n, withCode.size()));
+            } catch (InvalidInputException x) {
+                eskipped++;
+                emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"%s\"}", site, x.getMessage().replace("\"", "'")));
+            }
+        }
+        // J1p: re-lock J1-recovered jump sites. Recovery wrote its override before the merges; a merge
+        // that recreates the function strips it, and the decompiler's own unbounded table read then
+        // follows garbage cross-space. The lock is the union of observed (E3) and recovered (reference)
+        // targets in the site's space with code; references are proven here, so none are deleted.
+        int rlocked = 0, rskipped = 0;
+        // (quarantined-then-recovered sites are locked here too: the quarantine pass skips them
+        // because their references are proven, but the merge may still have stripped the override.)
+        for (Address site : recoveredJump) {
+            monitor.checkCancelled();
+            Instruction ins = listing.getInstructionAt(site);
+            if (ins == null || !ins.getFlowType().isComputed()) {
+                rskipped++;
+                emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"NO_SITE\"}", site));
+                continue;
+            }
+            Set<Address> cand = new LinkedHashSet<>();
+            Set<Address> e3 = e3obs.get(site);
+            if (e3 != null) cand.addAll(e3);
+            for (Reference r : rm.getReferencesFrom(site)) {
+                if (r.getReferenceType().isComputed()) cand.add(r.getToAddress());
+            }
+            List<Address> cases = new ArrayList<>();
+            for (Address t : ownSpace(site, cand)) if (listing.getInstructionAt(t) != null) cases.add(t);
+            if (cases.isEmpty()) {
+                rskipped++;
+                emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"NO_CASES\"}", site));
+                continue;
+            }
+            Function f = fm.getFunctionContaining(site);
+            if (f == null) {
+                rskipped++;
+                emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"NO_FUNCTION\"}", site));
+                continue;
+            }
+            try {
+                new JumpTable(site, new ArrayList<>(cases), true, 0).writeOverride(f);
+                rlocked++;
+                emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"LOCKED\",\"refs_deleted\":0,\"cases\":%d,\"src\":\"recovered\"}", site, cases.size()));
+            } catch (InvalidInputException x) {
+                rskipped++;
+                emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"%s\"}", site, x.getMessage().replace("\"", "'")));
+            }
+        }
+        return String.format("J1m jump-table lock: quarantined sites %d, re-derived refs deleted %d, switches locked %d, opaque %d, skipped %d (unresolved+E3 locked %d, opaque %d, skipped %d, recovered locked %d, skipped %d)",
+            quar.size(), cleaned, locked + elocked + rlocked, opaque + eopaque, skipped + eskipped + rskipped, elocked, eopaque, eskipped, rlocked, rskipped);
+    }
+
+    /** J1q: the targets that may go into a jump-table override at a site: only the site's own
+     *  address space. Foreign-bank or cross-space targets make the decompiler follow flows into
+     *  spaces where nothing was decoded ("could not find op", cross-space block errors). */
+    static List<Address> ownSpace(Address site, Collection<Address> targets) {
+        List<Address> own = new ArrayList<>();
+        for (Address t : targets) if (t.getAddressSpace().equals(site.getAddressSpace())) own.add(t);
+        return own;
     }
 
     static Address addrField(String line, String key, AddressFactory af) {
@@ -548,6 +708,7 @@ public final class WSJumpTables {
     Rec recover(Instruction site) {
         siteSpace = site.getAddress().getAddressSpace();
         Rec r = new Rec();
+        r.site = site.getAddress();
         int cs = csOf(site.getAddress());
         List<Instruction> back = predecessors(site, 16);
         Matcher mm = MEM.matcher(site.toString());
@@ -666,6 +827,16 @@ public final class WSJumpTables {
             if ((mem.getShort(ea) & 0xFFFF) == 0) { r.empty++; r.emptySlots.add(r.slots - 1); return null; }
         } catch (Exception e) { return "OUT_OF_ROM"; }
         Address t = read(cs, ea);
+        // J1o: a slot targeting the last byte of a bank overlay is skipped like an empty slot (no
+        // case entry can live there: any instruction either overruns the block or falls out of its
+        // address space, which neither the listing nor the decompiler can follow); the scan continues.
+        if (t != null && isOverlayEnd(t)) {
+            r.empty++;
+            r.emptySlots.add(r.slots - 1);
+            emit.accept(String.format("{\"rule\":\"J1o\",\"site\":\"%s\",\"slot\":%d,\"target\":\"%s\",\"outcome\":\"SKIPPED\"}",
+                r.site, r.slots - 1, t));
+            return null;
+        }
         why = implausible(t, ea);
         if (why != null) { r.slots--; return why; }
         r.slotOf.add(r.slots - 1);
