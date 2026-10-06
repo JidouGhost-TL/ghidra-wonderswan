@@ -29,6 +29,7 @@ import ghidra.util.task.TaskMonitor;
 public final class WSStaticCode {
     public static final String PROPERTY = "WS_STATIC_UNEXECUTED";
     private static final int BACKWARD_BYTES = 1024, MAX_INSTRUCTIONS = 1500;
+    private static final Set<String> WEAK_OPCODES = Set.of("INSB", "INSW", "OUTSB", "OUTSW", "BOUND", "INTO", "ESC", "WAIT", "INT3");
     private final Program program;
     private final Listing listing;
     private final Memory memory;
@@ -155,7 +156,7 @@ public final class WSStaticCode {
     }
 
     private List<Start> starts(MemoryBlock block, byte[] raw, int at, int segment) throws Exception {
-        List<Start> frames = new ArrayList<>(), boundaries = new ArrayList<>();
+        List<Start> frames = new ArrayList<>(), savesFound = new ArrayList<>(), boundaries = new ArrayList<>();
         for (int k = at; k >= Math.max(0, at-BACKWARD_BYTES); k--) {
             Address a = block.getStart().add(k);
             if (!unknown(a)) break;
@@ -163,6 +164,19 @@ public final class WSStaticCode {
                 ((raw[k+1] == (byte)0x89 && raw[k+2] == (byte)0xe5) ||
                  (raw[k+1] == (byte)0x8b && raw[k+2] == (byte)0xec)))
                 frames.add(new Start(a, "frame-prologue"));
+            // At least three register saves, or a segment save plus PUSHA,
+            // establishes a save prologue without needing a BP frame.
+            int saves = 0, width = 0;
+            boolean all = false;
+            while (k+width < raw.length && width < 6) {
+                int op = raw[k+width] & 255;
+                if (op == 0x60) { saves += 2; all = true; }
+                else if (op >= 0x50 && op <= 0x57 && op != 0x54 || op == 0x06 || op == 0x0e || op == 0x16 || op == 0x1e) saves++;
+                else break;
+                width++;
+            }
+            boolean previousSave = k > 0 && isSave(raw[k-1] & 255);
+            if (!previousSave && saves >= 3 && (width >= 3 || all)) savesFound.add(new Start(a, "save-prologue"));
             for (Reference ref : program.getReferenceManager().getReferencesTo(a)) {
                 if (ref.getReferenceType().isFlow() && listing.getInstructionAt(ref.getFromAddress()) != null) {
                     boundaries.add(new Start(a, "code-reference")); break;
@@ -191,8 +205,13 @@ public final class WSStaticCode {
                 } catch (Exception ex) { /* not a boundary */ }
             }
         }
-        frames.addAll(boundaries);
+        frames.addAll(savesFound); frames.addAll(boundaries);
         return frames;
+    }
+
+    private static boolean isSave(int op) {
+        return op == 0x60 || op >= 0x50 && op <= 0x57 && op != 0x54 ||
+            op == 0x06 || op == 0x0e || op == 0x16 || op == 0x1e;
     }
 
     private boolean boundaryAligned(MemoryBlock block, byte[] raw, int at, int segment) {
@@ -249,6 +268,11 @@ public final class WSStaticCode {
                 if (!unknown(q) || body.contains(q)) throw new Reject("defined-or-trial-overlap");
             }
             String text = i.toString().toUpperCase().replace(" ", "");
+            if (WEAK_OPCODES.contains(i.getMnemonicString()) || text.startsWith("LOCK"))
+                throw new Reject("weak-opcode-evidence");
+            byte[] raw = i.getBytes();
+            if (raw.length == 2 && raw[0] == 0 && raw[1] == 0)
+                throw new Reject("zero-fill-instruction");
             if (text.matches("(MOV|POP)CS.*")) throw new Reject("code-segment-write");
             var flow = i.getFlowType();
             if (flow.isComputed()) throw new Reject("computed-transfer");
