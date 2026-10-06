@@ -22,7 +22,9 @@ import ghidra.util.task.TaskMonitor;
  * a reference from existing code, or a preceding decoded flow terminator.
  * Trial decoding is strict: every reachable branch is walked, every path must
  * reach a return or an existing instruction, and transfers may not enter the
- * middle of an instruction. Defined data and inconsistent file-backed aliases
+ * middle of an instruction. Executable blocks that are adjacent in both the
+ * linear space and the ROM file form one walk domain, since routines cross
+ * such edges at runtime. Defined data and inconsistent file-backed aliases
  * veto a candidate. Computed transfers and unresolved bank contexts are kept
  * as unknown, with a rejection reason, except an immediate software interrupt,
  * which behaves like a call returning to its fallthrough. No execution
@@ -52,6 +54,11 @@ public final class WSStaticCode {
     private record Walk(TreeMap<Address, PseudoInstruction> code, AddressSet body,
                         Set<Address> ends, Map<Address, Set<Address>> edges,
                         Set<Address> transfers) { }
+    // A maximal run of executable blocks that are adjacent in both the linear
+    // address space and the ROM file. Routines cross such edges at runtime, so
+    // seeding treats the run as one walk domain instead of stopping at them.
+    private record Run(List<MemoryBlock> blocks, byte[] raw, int[] prefix, AddressSet range) { }
+    private final List<Run> runs = new ArrayList<>();
     private static final class Reject extends Exception {
         Reject(String reason) { super(reason); }
     }
@@ -82,6 +89,68 @@ public final class WSStaticCode {
             if (saves >= 3 && i != null && !(i.getLength() == 1 && isSave(i.getBytes()[0] & 255)))
                 saveProfiles.add(prefix.toString());
         }
+        List<MemoryBlock> eligible = new ArrayList<>();
+        for (MemoryBlock block : memory.getBlocks()) {
+            if (!block.isInitialized() || !block.isExecute() || WonderSwanLoader.isDataOverlay(block)) continue;
+            if (block.getSize() > 65536 || romOffset(block.getStart()) < 0) continue;
+            eligible.add(block);
+        }
+        eligible.sort(Comparator.comparing(MemoryBlock::getStart));
+        List<MemoryBlock> current = new ArrayList<>();
+        for (MemoryBlock block : eligible) {
+            if (!current.isEmpty() && follows(current.get(current.size()-1), block)) current.add(block);
+            else {
+                if (!current.isEmpty()) addRun(current);
+                current = new ArrayList<>(List.of(block));
+            }
+        }
+        if (!current.isEmpty()) addRun(current);
+    }
+
+    private boolean follows(MemoryBlock prev, MemoryBlock next) {
+        if (!prev.getStart().getAddressSpace().equals(next.getStart().getAddressSpace())) return false;
+        try {
+            if (!next.getStart().equals(prev.getEnd().next())) return false;
+        } catch (Exception ex) { return false; }
+        long a = romOffset(prev.getEnd()), b = romOffset(next.getStart());
+        return a >= 0 && b == a + 1;
+    }
+
+    private void addRun(List<MemoryBlock> blocks) throws Exception {
+        int total = 0;
+        int[] prefix = new int[blocks.size()];
+        for (int b = 0; b < blocks.size(); b++) { prefix[b] = total; total += (int)blocks.get(b).getSize(); }
+        byte[] raw = new byte[total];
+        AddressSet range = new AddressSet();
+        for (int b = 0; b < blocks.size(); b++) {
+            memory.getBytes(blocks.get(b).getStart(), raw, prefix[b], (int)blocks.get(b).getSize());
+            range.add(blocks.get(b).getStart(), blocks.get(b).getEnd());
+        }
+        runs.add(new Run(List.copyOf(blocks), raw, prefix, range));
+    }
+
+    private Address addrOf(Run run, int k) {
+        List<MemoryBlock> blocks = run.blocks();
+        for (int b = 0; b < blocks.size(); b++) {
+            int start = run.prefix()[b], end = b + 1 < blocks.size() ? run.prefix()[b+1] : run.raw().length;
+            if (k >= start && k < end) return blocks.get(b).getStart().add(k - start);
+        }
+        throw new IllegalArgumentException("logical index out of run");
+    }
+
+    private int indexOf(Run run, Address a) {
+        MemoryBlock block = memory.getBlock(a);
+        if (block == null) return -1;
+        List<MemoryBlock> blocks = run.blocks();
+        for (int b = 0; b < blocks.size(); b++)
+            if (blocks.get(b).equals(block)) return run.prefix()[b] + (int)a.subtract(block.getStart());
+        return -1;
+    }
+
+    private int segOf(Address a) {
+        MemoryBlock block = memory.getBlock(a);
+        if (block != null && block.getStart() instanceof SegmentedAddress sa) return sa.getSegment();
+        return -1;
     }
 
     public static String apply(Program p, Consumer<String> output, TaskMonitor monitor) throws Exception {
@@ -134,17 +203,15 @@ public final class WSStaticCode {
             for (Function f : program.getFunctionManager().getFunctions(true)) known.add(f.getEntryPoint());
             int before = accepted;
             Set<Address> tried = new HashSet<>();
-            for (MemoryBlock block : memory.getBlocks()) {
-                if (!block.isInitialized() || !block.isExecute() || WonderSwanLoader.isDataOverlay(block)) continue;
-                if (block.getSize() > 65536 || romOffset(block.getStart()) < 0) continue;
-                byte[] raw = new byte[(int)block.getSize()]; memory.getBytes(block.getStart(), raw);
+            for (Run run : runs) {
+                byte[] raw = run.raw();
                 for (int k = 0; k < raw.length; k++) {
                     monitor.checkCancelled();
                     int opcode = raw[k] & 255;
                     if (opcode != 0x9a && opcode != 0xe8) continue;
                     int size = opcode == 0x9a ? 5 : 3;
                     if (k + size > raw.length) continue;
-                    Address anchor = block.getStart().add(k);
+                    Address anchor = addrOf(run, k);
                     if (!unknown(anchor)) continue;
                     int segment = cs(anchor);
                     if (segment < 0) { rejects.merge("unknown-code-segment", 1, Integer::sum); continue; }
@@ -153,10 +220,10 @@ public final class WSStaticCode {
                     catch (Exception ex) { continue; }
                     if (!call.getFlowType().isCall() || Arrays.stream(call.getFlows()).noneMatch(known::contains)) continue;
                     candidates++;
-                    for (Start start : starts(block, raw, k, segment)) {
+                    for (Start start : starts(run, k, segment)) {
                         if (!tried.add(start.address()) || !unknown(start.address())) continue;
                         try {
-                            Walk walk = walk(start.address(), anchor, segment, block);
+                            Walk walk = walk(start.address(), anchor, segment, run);
                             commit(start, anchor, segment, walk);
                             break;
                         } catch (Reject ex) {
@@ -181,18 +248,19 @@ public final class WSStaticCode {
         return j;
     }
 
-    private List<Start> starts(MemoryBlock block, byte[] raw, int at, int segment) throws Exception {
+    private List<Start> starts(Run run, int at, int segment) throws Exception {
         List<Start> frames = new ArrayList<>(), savesFound = new ArrayList<>(), boundaries = new ArrayList<>();
         Map<Address, Integer> saveWidths = new HashMap<>();
+        byte[] raw = run.raw();
         for (int k = at; k >= Math.max(0, at-BACKWARD_BYTES); k--) {
-            Address a = block.getStart().add(k);
+            Address a = addrOf(run, k);
             if (!unknown(a)) break;
             int runEnd = fillEnd(raw, k);
             if (runEnd != k) {
                 // Fill bytes hold no routine entry, but a terminator ending
                 // exactly at the run start supports the code after the fill.
                 if ((k == 0 || raw[k-1] != (byte)0xff) && runEnd < raw.length) {
-                    Address after = block.getStart().add(runEnd);
+                    Address after = addrOf(run, runEnd);
                     Instruction before = listing.getInstructionContaining(a.subtract(1));
                     if (before != null && before.getMaxAddress().next().equals(a) && !before.hasFallthrough())
                         boundaries.add(new Start(after, "terminator-after-fill"));
@@ -200,7 +268,7 @@ public final class WSStaticCode {
                         int q = k-len;
                         if (q < 0) continue;
                         try {
-                            String evidence = terminalEvidence(block, raw, q, len, segment);
+                            String evidence = terminalEvidence(run, q, len, segment);
                             if (evidence != null) boundaries.add(new Start(after, evidence + "-after-fill"));
                         } catch (Exception ex) { /* not a boundary */ }
                     }
@@ -241,7 +309,7 @@ public final class WSStaticCode {
                 int q = k-len;
                 if (q < 0) continue;
                 try {
-                    String evidence = terminalEvidence(block, raw, q, len, segment);
+                    String evidence = terminalEvidence(run, q, len, segment);
                     if (evidence != null) boundaries.add(new Start(a, evidence));
                 } catch (Exception ex) { /* not a boundary */ }
             }
@@ -256,63 +324,66 @@ public final class WSStaticCode {
             op == 0x06 || op == 0x0e || op == 0x16 || op == 0x1e;
     }
 
-    private String terminalEvidence(MemoryBlock block, byte[] raw, int q, int len, int segment) throws Exception {
+    private String terminalEvidence(Run run, int q, int len, int segment) throws Exception {
+        byte[] raw = run.raw();
         int op = raw[q] & 255;
         if (!((len == 1 && (op == 0xc3 || op == 0xcb)) ||
               (len == 2 && op == 0xeb) ||
               (len == 3 && (op == 0xc2 || op == 0xca || op == 0xe9)) ||
               (len == 5 && op == 0xea))) return null;
-        PseudoInstruction term = decode(block.getStart().add(q), segment);
+        PseudoInstruction term = decode(addrOf(run, q), segment);
         if (term.getLength() == len && (term.getFlowType().isTerminal() ||
             term.getFlowType().isJump() && term.getFlowType().isUnConditional()) &&
             !term.hasFallthrough() && !term.getFlowType().isComputed() &&
-            boundaryAligned(block, raw, q, segment))
+            boundaryAligned(run, q, segment))
             return term.getFlowType().isJump() ? "aligned-jump-boundary" : "aligned-return-boundary";
         return null;
     }
 
-    private boolean boundaryAligned(MemoryBlock block, byte[] raw, int at, int segment) {
+    private boolean boundaryAligned(Run run, int at, int segment) {
         // A boundary byte alone does not establish its alignment. Decode from
         // the nearest existing instruction or a frame prologue before it.
-        Address boundary = block.getStart().add(at);
+        byte[] raw = run.raw();
+        Address boundary = addrOf(run, at);
         Instruction previous = listing.getInstructionBefore(boundary);
-        List<Address> origins = new ArrayList<>();
-        if (previous != null && block.contains(previous.getAddress()) && boundary.subtract(previous.getAddress()) <= BACKWARD_BYTES)
-            origins.add(previous.getAddress());
+        List<Integer> origins = new ArrayList<>();
+        if (previous != null) {
+            int o = indexOf(run, previous.getAddress());
+            if (o >= 0 && at - o <= BACKWARD_BYTES) origins.add(o);
+        }
         for (int k = at-1; k >= Math.max(0, at-BACKWARD_BYTES); k--)
             if (k+2 < raw.length && raw[k] == 0x55 &&
                 ((raw[k+1] == (byte)0x89 && raw[k+2] == (byte)0xe5) ||
                  (raw[k+1] == (byte)0x8b && raw[k+2] == (byte)0xec))) {
-                origins.add(block.getStart().add(k)); break;
+                origins.add(k); break;
             }
-        for (Address origin : origins) {
-            Address a = origin;
+        for (int origin : origins) {
+            int j = origin;
             try {
-                while (a.compareTo(boundary) < 0) {
-                    int idx = (int)a.subtract(block.getStart());
-                    int runEnd = idx >= 0 ? fillEnd(raw, idx) : idx;
-                    if (runEnd != idx) {
-                        for (int t = idx; t < runEnd; t++) {
-                            long ro = romOffset(block.getStart().add(t));
+                while (j < at) {
+                    int runEnd = fillEnd(raw, j);
+                    if (runEnd != j) {
+                        for (int t = j; t < runEnd; t++) {
+                            long ro = romOffset(addrOf(run, t));
                             if (definedData.contains(ro)) throw new Reject("data-before-boundary");
                         }
-                        a = block.getStart().add(runEnd);
+                        j = runEnd;
                         continue;
                     }
-                    PseudoInstruction i = decode(a, segment);
+                    PseudoInstruction i = decode(addrOf(run, j), segment);
                     for (int k = 0; k < i.getLength(); k++) {
-                        long ro = romOffset(a.add(k));
+                        long ro = romOffset(addrOf(run, j + k));
                         if (definedData.contains(ro)) throw new Reject("data-before-boundary");
                     }
-                    a = a.add(i.getLength());
+                    j += i.getLength();
                 }
-                if (a.equals(boundary)) return true;
+                if (j == at) return true;
             } catch (Exception ex) { /* try another aligned origin */ }
         }
         return false;
     }
 
-    private Walk walk(Address start, Address anchor, int segment, MemoryBlock block) throws Exception {
+    private Walk walk(Address start, Address anchor, int segment, Run run) throws Exception {
         TreeMap<Address, PseudoInstruction> code = new TreeMap<>();
         AddressSet body = new AddressSet();
         Set<Address> ends = new HashSet<>(), transfers = new HashSet<>();
@@ -323,13 +394,13 @@ public final class WSStaticCode {
             if (code.containsKey(a) || ends.contains(a)) continue;
             if (body.contains(a)) throw new Reject("transfer-into-operand");
             if (listing.getInstructionAt(a) != null) { ends.add(a); continue; }
-            if (!block.contains(a)) throw new Reject("unresolved-cross-block-flow");
+            if (!run.range().contains(a)) throw new Reject("unresolved-cross-block-flow");
             if (!unknown(a)) throw new Reject("defined-overlap");
             if (code.size() >= MAX_INSTRUCTIONS) throw new Reject("region-limit");
             PseudoInstruction i;
             try { i = decode(a, segment); }
             catch (Exception ex) { throw new Reject("invalid-or-undefined"); }
-            if (!block.contains(i.getMaxAddress())) throw new Reject("cross-block-instruction");
+            if (!run.range().contains(i.getMaxAddress())) throw new Reject("cross-block-instruction");
             for (int k = 0; k < i.getLength(); k++) {
                 Address q = a.add(k);
                 if (!unknown(q) || body.contains(q)) throw new Reject("defined-or-trial-overlap");
@@ -401,9 +472,23 @@ public final class WSStaticCode {
         // disassembly, which could claim unvalidated callees or branch targets.
         for (PseudoInstruction i : walk.code().values()) {
             Address a = i.getAddress();
-            context.setValue(csval, a, i.getMaxAddress(), BigInteger.valueOf(segment));
+            // A walk may span contiguous blocks; each address commits under its
+            // own block segment so later analysis resolves it like the loader.
+            // Near-target math is invariant under the trial segment, but segment-
+            // relative operands are re-decoded so committed semantics match.
+            int seg = segOf(a);
+            if (seg < 0) seg = segment;
+            context.setValue(csval, a, i.getMaxAddress(), BigInteger.valueOf(seg));
             context.setValue(hwundef, a, i.getMaxAddress(), BigInteger.ZERO);
-            Instruction inserted = listing.createInstruction(a, i.getPrototype(), i, i.getProcessorContext(), 0);
+            PseudoInstruction use = i;
+            if (seg != segment) {
+                try {
+                    PseudoInstruction fresh = decode(a, seg);
+                    if (fresh.getLength() == i.getLength() &&
+                        Arrays.equals(fresh.getBytes(), i.getBytes())) use = fresh;
+                } catch (Exception ex) { /* keep the validated trial decode */ }
+            }
+            Instruction inserted = listing.createInstruction(a, use.getPrototype(), use, use.getProcessorContext(), 0);
             provenance.add(a, inserted.getLength()); index(inserted);
             instructions++; bytes += inserted.getLength();
         }
@@ -414,7 +499,11 @@ public final class WSStaticCode {
         // code and its provenance without inventing an overlapping function.
         boolean overlaps = program.getFunctionManager().getFunctionsOverlapping(walk.body()).hasNext();
         if (f == null && routine && !overlaps)
-            f = program.getFunctionManager().createFunction(null, start.address(), walk.body(), SourceType.ANALYSIS);
+            try {
+                f = program.getFunctionManager().createFunction(null, start.address(), walk.body(), SourceType.ANALYSIS);
+            } catch (Exception ex) {
+                rejects.merge("function-create-failed", 1, Integer::sum);
+            }
         if (f != null) { f.addTag(PROPERTY); known.add(f.getEntryPoint()); }
         program.getBookmarkManager().setBookmark(start.address(), BookmarkType.ANALYSIS, PROPERTY,
             "Static call evidence; " + start.evidence() + "; no execution observation");
