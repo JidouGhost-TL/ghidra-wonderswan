@@ -56,7 +56,7 @@ public class WSMachine {
     public final PcodeThread<byte[]> thread;
     public final boolean color;
 
-    public int buttons;             // bit1 Start, bit2 A, bit3 B; bits 4-7 X pad; 8-11 Y pad
+    public volatile int buttons;    // bit1 Start, bit2 A, bit3 B; bits 4-7 X pad; 8-11 Y pad
     public static final int LINES = 159, VISIBLE = 144;
     /** Display ports as they were at the start of each visible line of the last frame (raster state). */
     public final int[][] linePorts = new int[VISIBLE][];
@@ -97,11 +97,14 @@ public class WSMachine {
     }
 
     /** Executed instruction linear address -> observed (DS, ES, SS) triples. */
-    public final Map<Long, Set<Integer>> executed = new TreeMap<>();
+    private final WSAddressMap<Set<Integer>> executedArray = new WSAddressMap<>(0x110000);
+    public final Map<Long, Set<Integer>> executed = executedArray;
     /** Executed instruction linear address -> (C0, C2, C3) at execution time, packed. */
-    public final Map<Long, Integer> executedBanks = new HashMap<>();
+    private final WSAddressMap<Integer> executedBanksArray = new WSAddressMap<>(0x110000);
+    public final Map<Long, Integer> executedBanks = executedBanksArray;
     /** Executed ROM0/ROM1 window address (linear 20000-3FFFF) -> every bank value (16-bit, incl. 2003-mapper high byte) it executed under. */
-    public final Map<Long, Set<Integer>> windowBanks = new TreeMap<>();
+    private final WSAddressMap<Set<Integer>> windowBanksArray = new WSAddressMap<>(0x40000);
+    public final Map<Long, Set<Integer>> windowBanks = windowBanksArray;
     public final List<String> dmaLog = new ArrayList<>();
     /** Last 64 executed instructions: "linear  text", newest last. Filled when run() returns or throws
      *  (formatting every step is expensive; the steps are kept in a ring meanwhile). */
@@ -113,10 +116,13 @@ public class WSMachine {
     public long stopAt = -1;
     public volatile boolean stopped;
     public final Map<String, Integer> bankWrites = new TreeMap<>();
-    public final Map<Long, Long> vramFirstWriter = new HashMap<>();
-    public final Map<Long, Long> vramWriterBytes = new TreeMap<>();
+    private final WSAddressMap<Long> vramFirstWriterArray = new WSAddressMap<>(0x10000);
+    public final Map<Long, Long> vramFirstWriter = vramFirstWriterArray;
+    private final WSAddressMap<Long> vramWriterBytesArray = new WSAddressMap<>(0x110000);
+    public final Map<Long, Long> vramWriterBytes = vramWriterBytesArray;
 
     private final Register rCS, rDS, rES, rSS, rSP, rCsval, rIF, rTF;
+    private final WSArrayState registerState;
     /** I/O port space of the V30MZ language (IN/OUT are loads/stores there); null on other languages. */
     public final AddressSpace io;
     private long lastCsval = -1;
@@ -125,7 +131,8 @@ public class WSMachine {
     private static final List<Integer> PREFIXES = List.of(0x26, 0x2E, 0x36, 0x3E, 0xF0, 0xF2, 0xF3);
     private static final Set<String> CS_WRITERS = Set.of("CALLF", "JMPF", "RETF", "IRET", "INT", "INT3", "INTO");
     /** Executed linear address -> CS seen at first execution (needed to disassemble it with the right csval). */
-    public final Map<Long, Integer> csAt = new HashMap<>();
+    private final WSAddressMap<Integer> csAtArray = new WSAddressMap<>(0x110000);
+    public final Map<Long, Integer> csAt = csAtArray;
     /**
      * Observed control-flow edges whose target is not encoded in the instruction: computed JMP/CALL
      * (kind "jump"/"call"), software interrupts ("int") and injected hardware interrupts ("irq").
@@ -136,7 +143,26 @@ public class WSMachine {
     /** Pending computed-branch edges and interrupt-nesting depth (rule E0b). */
     public final WSComputedEdges computedEdges = new WSComputedEdges();
     /** Visits per executed address; DS/ES sets are sampled for the first 64 visits (as the Mesen trace does). */
-    private final Map<Long, Integer> visits = new HashMap<>();
+    private final int[] visits = new int[0x110000];
+    private final Map<Long, Integer> visitOverflow = new HashMap<>();
+    private final Integer[] observedBanks = new Integer[0x10000];
+
+    private int visitCount(long address) {
+        return address >= 0 && address < visits.length ? visits[(int) address] : visitOverflow.getOrDefault(address, 0);
+    }
+
+    private int visit(long address) {
+        if (address >= 0 && address < visits.length) return ++visits[(int) address];
+        return visitOverflow.merge(address, 1, Integer::sum);
+    }
+
+    private Integer observedBank(int value) {
+        Integer result = observedBanks[value];
+        if (result == null) observedBanks[value] = result = value;
+        return result;
+    }
+
+    static boolean isCsWriter(String mnemonic) { return CS_WRITERS.contains(mnemonic); }
 
     /**
      * Addresses that cannot be trusted after a run ends in an error: those among the last 64 executed
@@ -149,7 +175,7 @@ public class WSMachine {
         for (long k = Math.max(0, ringCount - 64); k < ringCount; k++) inTail.merge(ringLin[(int) (k & 63)], 1, Integer::sum);
         Set<Long> out = new TreeSet<>();
         for (Map.Entry<Long, Integer> e : inTail.entrySet())
-            if (visits.getOrDefault(e.getKey(), 0) <= e.getValue()) out.add(e.getKey());
+            if (visitCount(e.getKey()) <= e.getValue()) out.add(e.getKey());
         return out;
     }
 
@@ -196,7 +222,8 @@ public class WSMachine {
     private int curAccesses = 0;
     /** Distinct (direction, space, address, size) accesses of the current instruction: p-code may load the same
      *  operand more than once (read-modify-write forms), the bus reads it once. */
-    private final java.util.Set<Long> curAccessKeys = new java.util.HashSet<>();
+    private long[] curAccessKeys = new long[8];
+    private int curAccessCount;
     private boolean curInterrupted = false;
     /** Cycle-timed mode: V30MZ instruction timing with the prefetch queue (created on the first cycle-timed run). */
     WSCpuTiming timing;
@@ -292,7 +319,9 @@ public class WSMachine {
         for (int[] pv : WSHardware.PORTS_AT_ENTRY) ports[pv[0]] = pv[1];
 
         emu = new WSDebuggerEmulator(lang, new Callbacks());
+        ((WSDebuggerEmulator) emu).setOwner(this);
         thread = threadName == null ? emu.newThread() : emu.newThread(threadName);
+        registerState = (WSArrayState) thread.getState().getLocalState();
         // Internal RAM starts zeroed. Reads of never-written bytes already returned 0 (with an emulator
         // "uninitialized state" warning per access); filling it removes that log flood without changing behaviour.
         write(0, new byte[color ? WSHardware.RAM_COLOR : WSHardware.RAM_MONO]);
@@ -348,14 +377,19 @@ public class WSMachine {
 
     private byte[] romSlice(long off, int n) {
         byte[] out = new byte[n];
-        for (int i = 0; i < n; i++) out[i] = rom[(int) ((off + i) & (rom.length - 1))];
+        for (int i = 0; i < n;) {
+            int source = (int) ((off + i) & (rom.length - 1));
+            int length = Math.min(n - i, rom.length - source);
+            System.arraycopy(rom, source, out, i, length);
+            i += length;
+        }
         return out;
     }
 
     private void mapLinear() {
         for (int seg = 4; seg < 16; seg++) {
             long lin = (long) seg << 16;
-            write(lin, romSlice(WSHardware.linearToRom(lin, ports[0xC0], rom.length), 0x10000));
+            mapRom(lin, WSHardware.linearToRom(lin, ports[0xC0], rom.length));
         }
     }
 
@@ -373,7 +407,22 @@ public class WSMachine {
     }
 
     private void mapBank(int port, long window) {
-        write(window, romSlice(WSHardware.bankToRom(bank(port), rom.length), 0x10000));
+        mapRom(window, WSHardware.bankToRom(bank(port), rom.length));
+    }
+
+    private void mapRom(long window, long offset) {
+        WSArrayState memory = (WSArrayState) emu.getSharedState();
+        boolean same = true;
+        for (int i = 0; i < 0x10000;) {
+            int source = (int) ((offset + i) & (rom.length - 1));
+            int length = Math.min(0x10000 - i, rom.length - source);
+            if (!memory.matches(addr(window + i), rom, source, length)) { same = false; break; }
+            i += length;
+        }
+        if (same) {
+            // A recorder still needs the mapping's range, including when it attached after a bank write.
+            if (traceCallbacks != null) memory.notifyWrite(addr(window), romSlice(offset, 0x10000));
+        } else write(window, romSlice(offset, 0x10000));
     }
 
     /** Rule P2: remap a window; if it holds the next instruction, keep the prefetched bytes (see PREFETCH_BYTES). */
@@ -409,6 +458,8 @@ public class WSMachine {
 
     // ------------------------------------------------------------------ registers
     public long reg(Register r) {
+        if (r.getAddress().getAddressSpace().getAddressableUnitSize() == 1)
+            return registerState.scalar(r.getAddress(), r.getMinimumByteSize());
         byte[] v = thread.getState().getVar(r, Reason.INSPECT);
         long x = 0;
         for (int i = v.length - 1; i >= 0; i--) x = (x << 8) | (v[i] & 0xff);   // little-endian
@@ -636,7 +687,9 @@ public class WSMachine {
      *  byte ports; 4-byte loads such as LES/LDS are two words). */
     private void countAccess(boolean store, boolean port, long a, int size) {
         long key = (store ? 1L << 62 : 0) | (port ? 1L << 61 : 0) | ((long) size << 40) | (a & 0xFFFFFFFFL);
-        if (!curAccessKeys.add(key)) return;
+        for (int i = 0; i < curAccessCount; i++) if (curAccessKeys[i] == key) return;
+        if (curAccessCount == curAccessKeys.length) curAccessKeys = Arrays.copyOf(curAccessKeys, curAccessCount * 2);
+        curAccessKeys[curAccessCount++] = key;
         if (size <= 1) { curAccesses++; return; }
         for (int k = 0; k < size; k += 2) {
             long w = a + k;
@@ -1172,7 +1225,8 @@ public class WSMachine {
     // ------------------------------------------------------------------ interrupts
     /** Inject a hardware interrupt at `level` (6 = VBlank) if enabled; returns true if taken. */
     public final Map<String, Integer> irqStats = new TreeMap<>();
-    public final Map<String, Integer> accessStats = new TreeMap<>();
+    private final WSAccessCounters accessCounters = new WSAccessCounters();
+    public final Map<String, Integer> accessStats = accessCounters;
     /** Full register trace of the first traceLimit instructions, Mesen trace.tsv format. */
     public int traceLimit = 20000;
     /** First logical step recorded in {@link #firstTrace} (1-based; REP iterations count once, as in the Mesen
@@ -1470,13 +1524,15 @@ public class WSMachine {
         @Override
         public <A, U> void dataWritten(PcodeThread<byte[]> t, PcodeExecutorStatePiece<A, U> piece,
                 Address address, int length, U value) {
-            if (traceCallbacks != null) traceCallbacks.dataWritten(t, piece, address, length, value);
+            if (traceCallbacks != null && !address.getAddressSpace().isUniqueSpace())
+                traceCallbacks.dataWritten(t, piece, address, length, value);
         }
 
         @Override
         public <A, U> void dataWritten(PcodeThread<byte[]> t, PcodeExecutorStatePiece<A, U> piece,
                 AddressSpace space, A offset, int length, U value) {
-            if (traceCallbacks != null) traceCallbacks.dataWritten(t, piece, space, offset, length, value);
+            if (traceCallbacks != null && !space.isUniqueSpace())
+                traceCallbacks.dataWritten(t, piece, space, offset, length, value);
         }
 
         @Override
@@ -1495,53 +1551,57 @@ public class WSMachine {
 
         /** io varnodes the current instruction writes directly (constant port numbers compile to
          *  plain varnodes in the io space, not LOAD/STORE ops, so the load/store callbacks miss them). */
-        private final List<Varnode> pendingIoWrites = new ArrayList<>();
+        private final Varnode[] noIoWrites = new Varnode[0];
+        private Varnode[] pendingIoWrites = noIoWrites;
 
         @Override
         public void beforeExecuteInstruction(PcodeThread<byte[]> t, Instruction ins, PcodeProgram program) {
-            pendingIoWrites.clear();
+            pendingIoWrites = noIoWrites;
             curStart = ins.getAddress().getOffset();
             if (pfLo >= 0 && (curStart != pfExpect || curStart < pfLo || curStart >= pfHi)) prefetchRelease();
             ifBefore = flag(rIF);
             tfBefore = flag(rTF);
             curSplitWords = 0;
             curAccesses = 0;
-            curAccessKeys.clear();
+            curAccessCount = 0;
             curInterrupted = false;
             curInBefore = 0;
-            try {
-                curBytes = ins.getParsedBytes();
-                curLen = ins.getLength();
-            } catch (Exception e) { curBytes = new byte[0]; curLen = 1; }
-            if (pfLo >= 0) pfExpect = curStart + curLen;
-            if (cycleTiming) {
-                int q = 0;
-                while (q < curBytes.length - 1 && PREFIXES.contains(curBytes[q] & 0xFF)) q++;
-                int o = q < curBytes.length ? curBytes[q] & 0xFF : -1;
-                if (o == 0xE4 || o == 0xE5) curInBefore = 6;
-                else if (o == 0xEC || o == 0xED) curInBefore = 5;
-            }
-            for (PcodeOp op : program.getCode()) {
-                for (int i = 0; i < op.getNumInputs(); i++) {
-                    Varnode in = op.getInput(i);
-                    if (in.getAddress().getAddressSpace() == io) {
-                        int port = (int) in.getOffset() & 0xFF;
-                        if (cycleTiming) countAccess(false, true, port, in.getSize());
-                        int v = portIn(port, in.getSize());
-                        byte[] b = new byte[in.getSize()];
-                        for (int k = 0; k < b.length; k++) b[k] = (byte) (v >> (8 * k));
-                        emu.getSharedState().setVar(in.getAddress(), b.length, false, b);
-                        accessStats.merge("in:direct", 1, Integer::sum);
+            WSInstructionDecoder.MemoInstruction memo = ins instanceof WSInstructionDecoder.MemoInstruction m ? m : null;
+            if (memo != null) {
+                curBytes = memo.parsedBytes;
+                curLen = memo.getLength();
+                curInBefore = cycleTiming ? memo.inCycles : 0;
+                memo.prepareIo(program, io);
+                pendingIoWrites = memo.ioWrites;
+                for (Varnode input : memo.ioReads) directInput(input);
+                if (cycleTiming) for (Varnode output : pendingIoWrites)
+                    countAccess(true, true, (int) output.getOffset() & 0xFF, output.getSize());
+            } else {
+                try { curBytes = ins.getParsedBytes(); curLen = ins.getLength(); }
+                catch (Exception e) { curBytes = new byte[0]; curLen = 1; }
+                if (cycleTiming) {
+                    int q = 0;
+                    while (q < curBytes.length - 1 && WSCpuTiming.isPrefix(curBytes[q] & 0xFF)) q++;
+                    int o = q < curBytes.length ? curBytes[q] & 0xFF : -1;
+                    curInBefore = o == 0xE4 || o == 0xE5 ? 6 : o == 0xEC || o == 0xED ? 5 : 0;
+                }
+                List<Varnode> writes = new ArrayList<>();
+                for (PcodeOp op : program.getCode()) {
+                    for (int i = 0; i < op.getNumInputs(); i++) {
+                        Varnode input = op.getInput(i);
+                        if (input.getAddress().getAddressSpace() == io) directInput(input);
+                    }
+                    Varnode output = op.getOutput();
+                    if (output != null && output.getAddress().getAddressSpace() == io) {
+                        if (cycleTiming) countAccess(true, true, (int) output.getOffset() & 0xFF, output.getSize());
+                        writes.add(output);
                     }
                 }
-                Varnode out = op.getOutput();
-                if (out != null && out.getAddress().getAddressSpace() == io) {
-                    if (cycleTiming) countAccess(true, true, (int) out.getOffset() & 0xFF, out.getSize());
-                    pendingIoWrites.add(out);
-                }
+                pendingIoWrites = writes.toArray(Varnode[]::new);
             }
+            if (pfLo >= 0) pfExpect = curStart + curLen;
             long lin = ins.getAddress().getOffset();
-            boolean repIteration = lin == lastTraced && ins.getMnemonicString().contains(".REP");
+            boolean repIteration = lin == lastTraced && (memo != null ? memo.repeat : ins.getMnemonicString().contains(".REP"));
             lastTraced = lin;
             if (!repIteration) { traceSteps++; framePcSum = (framePcSum + lin) & 0xFFFFFFFFL; }
             if (!repIteration && traceSteps >= traceFrom && traceSteps < traceFrom + traceLimit) {
@@ -1561,24 +1621,45 @@ public class WSMachine {
             // context; edges pre-empted by an interrupt stay pending across the handler flow.
             computedEdges.resolveAt(lin, (int) reg(rCS), (from, to, cs, kind) ->
                 edges.merge(String.format("%x,%x,%x,%s", from, to, cs, kind), 1, Integer::sum));
-            if (ins.getFlowType().isComputed() && (ins.getFlowType().isJump() || ins.getFlowType().isCall())) {
-                computedEdges.noteComputedBranch(lin, ins.getFlowType().isCall() ? "call" : "jump");
+            var flow = memo != null ? memo.flow : ins.getFlowType();
+            if (flow.isComputed() && (flow.isJump() || flow.isCall())) {
+                computedEdges.noteComputedBranch(lin, flow.isCall() ? "call" : "jump");
             }
-            if (lin >= 0x20000 && lin < 0x40000)    // B1: every ROM bank a window address executes under
-                windowBanks.computeIfAbsent(lin, k -> new TreeSet<>()).add(bank(lin < 0x30000 ? 0xC2 : 0xC3));
-            int v = visits.merge(lin, 1, Integer::sum);
-            if (v == 1) csAt.put(lin, (int) reg(rCS));
+            if (lin >= 0x20000 && lin < 0x40000) { // B1: every bank a window address executes under
+                Set<Integer> banks = windowBanksArray.get(lin);
+                if (banks == null) { banks = new TreeSet<>(); windowBanksArray.putAt(lin, banks); }
+                banks.add(observedBank(bank(lin < 0x30000 ? 0xC2 : 0xC3)));
+            }
+            int v = visit(lin);
+            if (v == 1) csAtArray.putAt(lin, (int) reg(rCS));
             if (v <= 64) {
-                Set<Integer> s = executed.get(lin);
-                if (s == null) { s = new HashSet<>(); executed.put(lin, s); executedBanks.put(lin, ports[0xC0] << 16 | ports[0xC2] << 8 | ports[0xC3]); }
+                Set<Integer> s = executedArray.get(lin);
+                if (s == null) { s = new HashSet<>(); executedArray.putAt(lin, s); executedBanksArray.putAt(lin, ports[0xC0] << 16 | ports[0xC2] << 8 | ports[0xC3]); }
                 s.add((int) (reg(rDS) << 16 | reg(rES)));
             }
         }
 
+        private void directInput(Varnode input) {
+            int port = (int) input.getOffset() & 0xFF;
+            if (cycleTiming) countAccess(false, true, port, input.getSize());
+            int value = portIn(port, input.getSize());
+            byte[] bytes = new byte[input.getSize()];
+            for (int i = 0; i < bytes.length; i++) bytes[i] = (byte) (value >> (8 * i));
+            emu.getSharedState().setVar(input.getAddress(), bytes.length, false, bytes);
+            accessCounters.increment(WSAccessCounters.IN);
+        }
+
+        private void countStat(boolean store, AddressSpace space) {
+            if (space == ram) accessCounters.increment(store ? WSAccessCounters.STORE_RAM : WSAccessCounters.LOAD_RAM);
+            else if (space == io) accessCounters.increment(store ? WSAccessCounters.STORE_IO : WSAccessCounters.LOAD_IO);
+            else accessStats.merge((store ? "store:" : "load:") + space.getName(), 1, Integer::sum);
+        }
+
         @Override
         public void afterExecuteInstruction(PcodeThread<byte[]> t, Instruction ins) {
-            String mn = ins.getMnemonicString();
-            if (CS_WRITERS.contains(mn)) csMayHaveChanged = true;
+            WSInstructionDecoder.MemoInstruction memo = ins instanceof WSInstructionDecoder.MemoInstruction m ? m : null;
+            String mn = memo != null ? memo.mnemonic : ins.getMnemonicString();
+            if (memo != null ? memo.changesCS : CS_WRITERS.contains(mn)) csMayHaveChanged = true;
             if ("IRET".equals(mn)) computedEdges.noteIret();   // E0b: the interrupted context resumes
             // Interrupt shadow (WSdev NEC V30MZ interrupts, datasheet [DS:2843-2853]; ws-test-suite
             // interrupt_timing): STI/POPF/IRET that set IF delay maskable interrupts by one instruction;
@@ -1586,20 +1667,20 @@ public class WSMachine {
             // SOURCE-CONFLICT (brief 10 #5): STSWS says any segment register; datasheet/WSdev/Mesen 2
             // say SS only -> SS only.
             boolean ifSet = !ifBefore && flag(rIF), tfSet = !tfBefore && flag(rTF);
-            boolean ssLoad = ("MOV".equals(mn) || "POP".equals(mn)) && loadsSS(ins);
+            boolean ssLoad = memo != null ? memo.loadsSS : ("MOV".equals(mn) || "POP".equals(mn)) && loadsSS(ins);
             suppressIrq = ifSet || tfSet || ssLoad;
             suppressTrap = tfSet || ssLoad;
             for (Varnode out : pendingIoWrites) {
                 byte[] b = emu.getSharedState().getVar(out.getAddress(), out.getSize(), false, Reason.INSPECT);
                 portOut((int) out.getOffset() & 0xFF, out.getSize(), (int) le(b));
-                accessStats.merge("out:direct", 1, Integer::sum);
+                accessCounters.increment(WSAccessCounters.OUT);
             }
-            pendingIoWrites.clear();
+            pendingIoWrites = noIoWrites;
         }
 
         @Override
         public void beforeLoad(PcodeThread<byte[]> t, PcodeOp op, AddressSpace space, byte[] offset, int size) {
-            accessStats.merge("load:" + space.getName(), 1, Integer::sum);
+            countStat(false, space);
             if (cycleTiming && (space == ram || space == io)) countAccess(false, space == io, le(offset), size);
             if (space == ram && memoryWatch != null) {
                 long a = le(offset);
@@ -1630,7 +1711,7 @@ public class WSMachine {
 
         @Override
         public void afterStore(PcodeThread<byte[]> t, PcodeOp op, AddressSpace space, byte[] offset, int size, byte[] value) {
-            accessStats.merge("store:" + space.getName(), 1, Integer::sum);
+            countStat(true, space);
             if (cycleTiming && (space == ram || space == io)) countAccess(true, space == io, le(offset), size);
             if (space == io) {
                 portOut((int) le(offset) & 0xFF, size, (int) le(value));
@@ -1654,8 +1735,10 @@ public class WSMachine {
             }
             if (a < 0x2000 || a >= 0xFE00) return;
             long pc = t.getCounter().getOffset();
-            for (int i = 0; i < size; i++) vramFirstWriter.putIfAbsent(a + i, pc);
-            vramWriterBytes.merge(pc, (long) size, Long::sum);
+            for (int i = 0; i < size; i++)
+                if (vramFirstWriterArray.get(a + i) == null) vramFirstWriterArray.putAt(a + i, pc);
+            Long written = vramWriterBytesArray.get(pc);
+            vramWriterBytesArray.putAt(pc, written == null ? (long) size : written + size);
         }
 
         @Override

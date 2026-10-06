@@ -6,6 +6,7 @@ import java.util.Collection;
 import ghidra.pcode.emu.PcodeMachine;
 import ghidra.pcode.emu.PcodeThread;
 import ghidra.pcode.exec.PcodeExecutionException;
+import ghidra.pcode.exec.PcodeFrame;
 import ghidra.trace.model.Trace;
 import ghidra.trace.model.thread.TraceThread;
 import ghidra.trace.model.thread.TraceThreadManager;
@@ -23,6 +24,15 @@ import ghidra.util.task.TaskMonitor;
 public class WSFrameScheduler implements Scheduler {
     /** Fallback step count when the machine is not a WonderSwan emulator. */
     public static final int FALLBACK_STEPS = 40000;
+    private final int frames;
+
+    public WSFrameScheduler() { this(1); }
+
+    /** Run consecutive frame steps in one debugger task and one trace write-down. */
+    public WSFrameScheduler(int frames) {
+        if (frames <= 0) throw new IllegalArgumentException("Frame count must be positive");
+        this.frames = frames;
+    }
 
     @Override
     public TickStep nextSlice(Trace trace) {
@@ -40,29 +50,46 @@ public class WSFrameScheduler implements Scheduler {
             thread = all.iterator().next();
         }
         PcodeThread<?> emuThread = machine.getThread(thread.getPath(), true);
-        int steps = 0;
+        long[] steps = {0};
         try {
-            if (machine instanceof WSDebuggerEmulator wsemu) {
-                @SuppressWarnings("unchecked")
-                PcodeThread<byte[]> typed = (PcodeThread<byte[]>) emuThread;
-                steps = wsemu.stepFrame(typed);
-            }
-            else {
-                for (; steps < FALLBACK_STEPS; steps++) {
-                    monitor.checkCancelled();
-                    emuThread.stepInstruction();
+            monitor.initialize(frames);
+            for (int frame = 0; frame < frames; frame++) {
+                monitor.checkCancelled();
+                monitor.setMessage("Running frame " + (frame + 1) + " of " + frames);
+                if (machine instanceof WSDebuggerEmulator wsemu) {
+                    @SuppressWarnings("unchecked")
+                    PcodeThread<byte[]> typed = (PcodeThread<byte[]>) emuThread;
+                    wsemu.stepFrame(typed, monitor, count -> steps[0] += count);
                 }
+                else {
+                    for (int i = 0; i < FALLBACK_STEPS; i++) {
+                        monitor.checkCancelled();
+                        if (emuThread.getFrame() != null) emuThread.finishInstruction();
+                        else emuThread.stepInstruction();
+                        steps[0]++;
+                    }
+                }
+                monitor.setProgress(frame + 1);
             }
         }
         catch (PcodeExecutionException e) {
-            return new RecordRunResult(
-                TraceSchedule.snap(0).steppedForward(thread, steps).assumeRecorded(), e);
+            TraceSchedule completed = TraceSchedule.snap(0).steppedForward(thread, steps[0]);
+            PcodeFrame frame = emuThread.getFrame();
+            if (frame == null) return new RecordRunResult(completed.assumeRecorded(), e);
+            // Follow Ghidra's scheduler: retry the failing op and retain completed p-code steps.
+            frame.stepBack();
+            int count = frame.resetCount();
+            if (count == 0) {
+                emuThread.dropInstruction();
+                return new RecordRunResult(completed, e);
+            }
+            return new RecordRunResult(completed.steppedPcodeForward(thread, count + 1).assumeRecorded(), e);
         }
         catch (CancelledException e) {
             return new RecordRunResult(
-                TraceSchedule.snap(0).steppedForward(thread, steps).assumeRecorded(), e);
+                TraceSchedule.snap(0).steppedForward(thread, steps[0]).assumeRecorded(), e);
         }
         return new RecordRunResult(
-            TraceSchedule.snap(0).steppedForward(thread, steps).assumeRecorded(), null);
+            TraceSchedule.snap(0).steppedForward(thread, steps[0]).assumeRecorded(), null);
     }
 }

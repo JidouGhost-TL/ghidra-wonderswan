@@ -162,6 +162,7 @@ public final class WSGuiSmoke {
 
         Language lang = DefaultLanguageService.getLanguageService()
             .getLanguage(new LanguageID("V30MZ:LE:16:default"));
+        WSEmulationChecks.run(lang);
         CompilerSpec cspec = lang.getDefaultCompilerSpec();
         check(lang != null, "V30MZ language available");
 
@@ -290,7 +291,8 @@ public final class WSGuiSmoke {
         check(onEdt(screen::isInTool), "screen provider in tool");
         check(onEdt(input::isInTool), "input provider in tool");
         var dbgActions = onEdt(() -> tool.getDockingActionsByOwnerName(dbgPlugin.getName()));
-        check(hasAction(dbgActions, "Step Frame (VBlank)"), "Step Frame action present");
+        check(hasAction(dbgActions, "Step Frame (VBlank)") && hasAction(dbgActions, "Run N Frames"),
+            "Step Frame and Run N Frames actions present");
         onEdt(() -> {
             tool.showComponentProvider(screen, true);
             tool.showComponentProvider(input, true);

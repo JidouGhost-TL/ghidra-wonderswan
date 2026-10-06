@@ -8,6 +8,7 @@ import javax.swing.SwingUtilities;
 
 import docking.action.builder.ActionBuilder;
 import docking.action.DockingAction;
+import docking.widgets.dialogs.NumberInputDialog;
 import ghidra.app.plugin.PluginCategoryNames;
 import ghidra.app.plugin.core.debug.DebuggerPluginPackage;
 import ghidra.app.services.DebuggerEmulationService;
@@ -57,6 +58,7 @@ public class WSDebuggerPlugin extends Plugin implements DebuggerEmulationService
     private WSScreenProvider screen;
     private WSInputProvider input;
     private DockingAction actionStepFrame;
+    private DockingAction actionRunFrames;
 
     public WSDebuggerPlugin(PluginTool tool) {
         super(tool);
@@ -79,6 +81,16 @@ public class WSDebuggerPlugin extends Plugin implements DebuggerEmulationService
             .enabledWhen(ctx -> getCurrentTrace() != null && isWonderSwanTrace(getCurrentTrace()))
             .onAction(ctx -> stepFrame())
             .buildAndInstall(tool);
+        actionRunFrames = new ActionBuilder("Run N Frames", getName())
+            .description("Run several WonderSwan frames in one cancellable debugger task")
+            .menuPath(DebuggerPluginPackage.NAME, "Run N Frames...")
+            .menuGroup("Debugger")
+            .enabledWhen(ctx -> getCurrentTrace() != null && isWonderSwanTrace(getCurrentTrace()))
+            .onAction(ctx -> {
+                NumberInputDialog dialog = new NumberInputDialog("Run N Frames", "Frames:", 10, 1, 1000000, false);
+                if (dialog.show()) runFrames(dialog.getValue());
+            })
+            .buildAndInstall(tool);
         emulationService.addStateListener(this);
     }
 
@@ -90,6 +102,7 @@ public class WSDebuggerPlugin extends Plugin implements DebuggerEmulationService
         if (screen != null) tool.removeComponentProvider(screen);
         if (input != null) tool.removeComponentProvider(input);
         if (actionStepFrame != null) tool.removeAction(actionStepFrame);
+        if (actionRunFrames != null) tool.removeAction(actionRunFrames);
         super.dispose();
     }
 
@@ -125,12 +138,16 @@ public class WSDebuggerPlugin extends Plugin implements DebuggerEmulationService
     }
 
     private void stepFrame() {
+        runFrames(1);
+    }
+
+    private void runFrames(int frames) {
         DebuggerCoordinates current = traceManager.getCurrent();
         Trace trace = current.getTrace();
         TracePlatform platform = current.getPlatform();
         TraceSchedule time = current.getTime();
         if (trace == null || platform == null || time == null) return;
-        emulationService.backgroundRun(platform, time, new WSFrameScheduler());
+        emulationService.backgroundRun(platform, time, new WSFrameScheduler(frames));
     }
 
     @Override

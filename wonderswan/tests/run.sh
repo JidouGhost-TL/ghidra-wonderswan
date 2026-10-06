@@ -6,7 +6,7 @@
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/src/main/java/jidoughost/wonderswan"
-OUT="$(mktemp -d /tmp/wstrace-test.XXXXXX)"
+OUT="$(mktemp -d "${TMPDIR:-/tmp}/wstrace-test.XXXXXX")"
 trap 'rm -rf "$OUT"' EXIT
 javac -d "$OUT" "$SRC/WSHardware.java" "$SRC/WSHeader.java" "$SRC/WSMesenTrace.java" "$SRC/WSEvidence.java" \
   "$SRC/WSComputedEdges.java" "$ROOT/tests/stubs/WSMachine.java" "$ROOT/tests/WSMesenTraceTest.java"

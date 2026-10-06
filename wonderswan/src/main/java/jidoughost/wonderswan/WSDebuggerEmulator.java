@@ -4,10 +4,14 @@ package jidoughost.wonderswan;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.util.Collection;
+import java.util.Objects;
 import java.util.function.IntConsumer;
+import java.util.function.LongConsumer;
 
 import ghidra.debug.api.emulation.PcodeDebuggerAccess;
 import ghidra.pcode.emu.*;
+import ghidra.pcode.exec.PcodeExecutorState;
+import ghidra.pcode.exec.PcodeUseropLibrary;
 import ghidra.pcode.exec.trace.TraceEmulationIntegration.Writer;
 import ghidra.pcode.exec.trace.data.AbstractPcodeTraceDataAccess;
 import ghidra.pcode.exec.trace.data.PcodeTraceDataAccess;
@@ -16,8 +20,12 @@ import ghidra.pcode.exec.trace.data.PcodeTraceRegistersAccess;
 import ghidra.program.model.address.*;
 import ghidra.program.model.lang.Language;
 import ghidra.program.model.lang.Register;
+import ghidra.program.model.lang.RegisterValue;
+import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.Program;
 import ghidra.trace.model.thread.TraceThread;
+import ghidra.util.exception.CancelledException;
+import ghidra.util.task.TaskMonitor;
 
 /**
  * WonderSwan-aware p-code emulator for Ghidra's Debugger.
@@ -34,8 +42,8 @@ import ghidra.trace.model.thread.TraceThread;
  *
  * <p>
  * Trace recording flows through {@link WSMachine#traceCallbacks} (set by {@link #attachTrace}):
- * every state write is forwarded to the Debugger's trace writer, so register and memory views
- * show the run. The machine's peripheral state (ports, timers, interrupt latch, EEPROMs) is not
+ * register and memory writes are forwarded to the Debugger's trace writer, so those views
+ * show the run. Unique-space temporaries stay in the emulator. The machine's peripheral state (ports, timers, interrupt latch, EEPROMs) is not
  * part of the trace; when the service re-emulates from a mid-trace snapshot with a fresh machine,
  * {@link #attachTrace} restores a best-effort approximation (registers, RAM, bank windows and
  * ports read back from the trace, timers and interrupt state reset). Stepping back in time always
@@ -45,6 +53,7 @@ import ghidra.trace.model.thread.TraceThread;
 public class WSDebuggerEmulator extends PcodeEmulator {
     /** Machine this emulator belongs to; null until {@link #bind}. */
     public WSMachine ws;
+    private WSMachine owner;
     /** Debugger stepping (boundary + line advance per step); false = plain PcodeEmulator. */
     public boolean steppingEnabled;
     /** Nominal instructions per frame; lines advance by instruction count like WSMachine.run. */
@@ -60,8 +69,64 @@ public class WSDebuggerEmulator extends PcodeEmulator {
 
     /** Thread with debugger stepping: each step runs the machine boundary around the real step. */
     public static class WSThread extends BytesPcodeThread {
+        private static final boolean CHECK_CONTEXT = Boolean.getBoolean("wonderswan.checkContextMemo");
+        private Object lastContextSink;
+        private boolean contextWritten;
         public WSThread(String name, AbstractPcodeMachine<byte[]> machine) {
             super(name, machine);
+        }
+
+        @Override
+        protected SleighInstructionDecoder createInstructionDecoder(PcodeExecutorState<byte[]> sharedState) {
+            return new WSInstructionDecoder(language, sharedState);
+        }
+
+        private RegisterValue finishedContext(RegisterValue commits) {
+            return new RegisterValue(contextreg, BigInteger.ZERO)
+                .combineValues(defaultContext.getDefaultValue(contextreg, getCounter()))
+                .combineValues(defaultContext.getFlowValue(getContext()))
+                .combineValues(commits);
+        }
+
+        /** Preserve DefaultPcodeThread's finish order, including injects, commits and callbacks. */
+        @Override
+        protected void advanceAfterFinished() {
+            if (!(instruction instanceof WSInstructionDecoder.MemoInstruction memo)) {
+                super.advanceAfterFinished();
+                return;
+            }
+            if (frame.isFallThrough()) writeCounter(getCounter().addWrap(decoder.getLastLengthWithDelays()));
+            if (contextreg != Register.NO_CONTEXT) {
+                // Commits and defaults can depend on the destination of a dynamic branch.
+                if (!Objects.equals(memo.finishInput, getContext()) || !Objects.equals(memo.finishCounter, getCounter())) {
+                    memo.finishOutput = finishedContext(memo.committedContext(getCounter().getOffset()));
+                    memo.finishBytes = arithmetic.fromConst(memo.finishOutput.getUnsignedValueIgnoreMask(),
+                        contextreg.getMinimumByteSize(), true);
+                    memo.finishInput = getContext();
+                    memo.finishCounter = getCounter();
+                } else if (CHECK_CONTEXT) {
+                    RegisterValue computed = finishedContext(memo.freshCommittedContext(getCounter().getOffset()));
+                    if (!memo.finishOutput.equals(computed)) {
+                        throw new AssertionError("Context memo differs from the framework formula: " +
+                            instruction.getAddress() + " to " + getCounter() + ": cached=" + memo.finishOutput +
+                            ", computed=" + computed + ", input=" + getContext());
+                    }
+                }
+                WSDebuggerEmulator emulator = (WSDebuggerEmulator) getMachine();
+                Object sink = emulator.owner == null ? emulator.cb : emulator.owner.traceCallbacks;
+                boolean bytesMatch = state.getLocalState() instanceof WSArrayState flat &&
+                    flat.matches(contextreg.getAddress(), memo.finishBytes);
+                // A new recorder needs its first context write. Raw p-code writes must also be repaired.
+                if (!contextWritten || lastContextSink != sink || !getContext().equals(memo.finishOutput) || !bytesMatch) {
+                    writeContext(memo.finishOutput);
+                    contextWritten = true;
+                    lastContextSink = sink;
+                }
+            }
+            postExecuteInstruction();
+            ((WSDebuggerEmulator) getMachine()).instructionFinished(this, instruction);
+            frame = null;
+            instruction = null;
         }
 
         @Override
@@ -77,6 +142,15 @@ public class WSDebuggerEmulator extends PcodeEmulator {
         void plainStep() {
             super.stepInstruction();
         }
+
+        @Override
+        public void finishInstruction() {
+            WSDebuggerEmulator emulator = (WSDebuggerEmulator) getMachine();
+            if (emulator.ws == null || !emulator.steppingEnabled) super.finishInstruction();
+            else emulator.debuggerFinish(this);
+        }
+
+        void plainFinish() { super.finishInstruction(); }
     }
 
     public WSDebuggerEmulator(Language language, PcodeEmulationCallbacks<byte[]> cb) {
@@ -92,6 +166,29 @@ public class WSDebuggerEmulator extends PcodeEmulator {
         return new WSThread(name, this);
     }
 
+    @Override
+    protected PcodeExecutorState<byte[]> createSharedState() {
+        return new WSArrayState(language, cb.wrapFor(null));
+    }
+
+    @Override
+    protected PcodeUseropLibrary<byte[]> createUseropLibrary() {
+        return super.createUseropLibrary().compose(new WSSegmentLibrary(), true);
+    }
+
+    @Override
+    protected PcodeExecutorState<byte[]> createLocalState(PcodeThread<byte[]> thread) {
+        return new WSArrayState(language, cb.wrapFor(thread));
+    }
+
+    void setOwner(WSMachine owner) {
+        this.owner = owner;
+    }
+
+    private void instructionFinished(WSThread thread, Instruction instruction) {
+        cb.afterExecuteInstruction(thread, instruction);
+    }
+
     /** Build a program-bound emulator for headless use (no trace); stepping is enabled. */
     public static WSDebuggerEmulator forProgram(Program program, boolean color, String threadName) {
         WSMachine ws = new WSMachine(program, color, threadName);
@@ -103,6 +200,7 @@ public class WSDebuggerEmulator extends PcodeEmulator {
     /** Bind to the machine (enables debugger stepping from the frame start). */
     public void bind(WSMachine ws) {
         this.ws = ws;
+        this.owner = ws;
         this.steppingEnabled = true;
         this.line = 0;
         this.lineCount = 0;
@@ -177,6 +275,16 @@ public class WSDebuggerEmulator extends PcodeEmulator {
         ws.debuggerPreStep();
         if (ws.beforeStep != null) ws.beforeStep.accept(this.ws);
         t.plainStep();
+        completeDebuggerStep();
+    }
+
+    private void debuggerFinish(WSThread thread) {
+        if (thread != ws.thread) throw new IllegalStateException("WonderSwan has one CPU");
+        thread.plainFinish();
+        completeDebuggerStep();
+    }
+
+    private void completeDebuggerStep() {
         ws.instructions++;
         ws.afterStep();
         if (shadowAddr != null) {
@@ -205,17 +313,32 @@ public class WSDebuggerEmulator extends PcodeEmulator {
      * mid-VBlank runs to the next frame's VBlank. Returns the instructions stepped.
      */
     public int stepFrame(PcodeThread<byte[]> thread) {
+        try { return stepFrame(thread, TaskMonitor.DUMMY); }
+        catch (CancelledException e) { throw new AssertionError(e); }
+    }
+
+    /** Cancellable frame step; cancellation is checked at every instruction boundary. */
+    public int stepFrame(PcodeThread<byte[]> thread, TaskMonitor monitor) throws CancelledException {
+        return stepFrame(thread, monitor, ignored -> {});
+    }
+
+    int stepFrame(PcodeThread<byte[]> thread, TaskMonitor monitor, LongConsumer completed)
+            throws CancelledException {
         if (thread.getMachine() != this)
             throw new IllegalArgumentException("stepFrame needs a thread of this machine");
+        monitor.checkCancelled();
         if (line == WSMachine.VISIBLE && needPrologue) {
             enterLine();
             return 0;
         }
         int steps = 0, cap = perLine() * (WSMachine.LINES + 2);
         while (steps < cap) {
+            monitor.checkCancelled();
             int before = line;
-            thread.stepInstruction();
+            if (thread.getFrame() != null) thread.finishInstruction();
+            else thread.stepInstruction();
             steps++;
+            completed.accept(1);
             if (line == WSMachine.VISIBLE && before != WSMachine.VISIBLE) {
                 enterLine();
                 return steps;
