@@ -47,7 +47,7 @@ public final class WSStaticCode {
     private final Memory memory;
     private final ProgramContext context;
     private final Register csval, hwundef;
-    private final PseudoDisassembler decoder;
+    private PseudoDisassembler decoder;
     private final TaskMonitor monitor;
     private final Consumer<String> emit;
     private final Set<Long> definedData = new HashSet<>();
@@ -106,6 +106,10 @@ public final class WSStaticCode {
                 saveProfiles.add(prefix.toString());
         }
         mapStaticBankViews();
+        // A disassembler built before the new overlay spaces exist cannot decode
+        // in them, so rebuild it once the views are mapped (the pre-scan above
+        // only touches disk-loaded spaces with the first instance).
+        decoder = new PseudoDisassembler(p);
         List<MemoryBlock> eligible = new ArrayList<>();
         for (MemoryBlock block : memory.getBlocks()) {
             if (!block.isInitialized() || !block.isExecute() || WonderSwanLoader.isDataOverlay(block)) continue;
