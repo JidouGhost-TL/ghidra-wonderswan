@@ -60,6 +60,7 @@ public final class WSStaticCode {
     private record Run(List<MemoryBlock> blocks, byte[] raw, int[] prefix, AddressSet range) { }
     private final List<Run> runs = new ArrayList<>();
     private static final class Reject extends Exception {
+        int evidenceCount;
         Reject(String reason) { super(reason); }
     }
 
@@ -214,20 +215,33 @@ public final class WSStaticCode {
                     Address anchor = addrOf(run, k);
                     if (!unknown(anchor)) continue;
                     int segment = cs(anchor);
-                    if (segment < 0) { rejects.merge("unknown-code-segment", 1, Integer::sum); continue; }
+                    if (segment < 0) {
+                        rejects.merge("unknown-code-segment", 1, Integer::sum);
+                        logReject(anchor, null, 0, "unknown-code-segment");
+                        continue;
+                    }
                     PseudoInstruction call;
                     try { call = decode(anchor, segment); }
                     catch (Exception ex) { continue; }
-                    if (!call.getFlowType().isCall() || Arrays.stream(call.getFlows()).noneMatch(known::contains)) continue;
+                    if (!call.getFlowType().isCall() || Arrays.stream(call.getFlows()).noneMatch(known::contains)) {
+                        logReject(anchor, null, 0, "anchor-not-known-call");
+                        continue;
+                    }
                     candidates++;
-                    for (Start start : starts(run, k, segment)) {
-                        if (!tried.add(start.address()) || !unknown(start.address())) continue;
+                    List<Start> possible = starts(run, k, segment);
+                    if (possible.isEmpty()) logReject(anchor, null, 0, "no-routine-start");
+                    for (Start start : possible) {
+                        if (!tried.add(start.address()) || !unknown(start.address())) {
+                            logReject(anchor, start, 0, "already-tried-or-defined");
+                            continue;
+                        }
                         try {
                             Walk walk = walk(start.address(), anchor, segment, run);
                             commit(start, anchor, segment, walk);
                             break;
                         } catch (Reject ex) {
                             rejects.merge(ex.getMessage(), 1, Integer::sum);
+                            logReject(anchor, start, ex.evidenceCount, ex.getMessage());
                         }
                     }
                 }
@@ -235,6 +249,14 @@ public final class WSStaticCode {
             emit.accept(String.format("{\"rule\":\"static-call\",\"pass\":%d,\"accepted_total\":%d}", passes, accepted));
             if (accepted == before) break;
         }
+    }
+
+    // Evidence counts are known-entry calls in the partial trial walk. A zero
+    // count means the anchor was filtered or no trial instructions reached it.
+    private void logReject(Address anchor, Start start, int evidenceCount, String reason) {
+        emit.accept(String.format("{\"rule\":\"static-call\",\"event\":\"reject\",\"pass\":%d,\"anchor\":\"%s\",\"candidate_start\":%s,\"start_evidence\":%s,\"evidence_count\":%d,\"reject_reason\":\"%s\"}",
+            passes, anchor, start == null ? "null" : "\"" + start.address() + "\"",
+            start == null ? "null" : "\"" + start.evidence() + "\"", evidenceCount, reason));
     }
 
     // Erased flash reads back as FF. A run of two or more FF bytes can never
@@ -384,6 +406,16 @@ public final class WSStaticCode {
     }
 
     private Walk walk(Address start, Address anchor, int segment, Run run) throws Exception {
+        int[] evidenceCount = {0};
+        try {
+            return trialWalk(start, anchor, segment, run, evidenceCount);
+        } catch (Reject ex) {
+            ex.evidenceCount = evidenceCount[0];
+            throw ex;
+        }
+    }
+
+    private Walk trialWalk(Address start, Address anchor, int segment, Run run, int[] evidenceCount) throws Exception {
         TreeMap<Address, PseudoInstruction> code = new TreeMap<>();
         AddressSet body = new AddressSet();
         Set<Address> ends = new HashSet<>(), transfers = new HashSet<>();
@@ -423,6 +455,7 @@ public final class WSStaticCode {
                 && i.getMnemonicString().equals("INT") && encoded.length == 2 && encoded[0] == (byte)0xcd;
             if (flow.isComputed() && !softInterrupt) throw new Reject("computed-transfer");
             code.put(a, i); body.add(a, i.getMaxAddress());
+            if (flow.isCall() && Arrays.stream(i.getFlows()).anyMatch(known::contains)) evidenceCount[0]++;
             Set<Address> next = new HashSet<>(); edges.put(a, next);
             Address[] targets = i.getFlows();
             if ((flow.isCall() || flow.isJump()) && !softInterrupt) {
