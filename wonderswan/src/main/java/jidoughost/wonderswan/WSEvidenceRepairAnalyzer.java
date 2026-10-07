@@ -22,9 +22,9 @@ import ghidra.util.task.TaskMonitor;
  *   N1  clear "does not return" where a call's fall-through executed, restore the cut-off code;
  *   E1R re-seed executed addresses that later analysis removed;
  *   J1  CS-relative jump/call tables by rule ({@link WSJumpTables}), checked against observed targets;
- *   D1  DS context at function entries; A1 classify decode artefacts;
+ *   D1  DS/SS context at function entries; A1 classify decode artefacts;
  *   P1  functions whose entry has no bytes are phantoms: removed and reported with their creating references;
- *   D0  title DS default from execution evidence ({@link WSCompilerRules}), before D1;
+ *   D0  title DS/SS defaults from execution evidence ({@link WSCompilerRules}), before D1;
  *   C1  every function whose signature no user or importer set gets the title's convention: __lsic86 when
  *       rule K1 identifies LSI C-86 code, else the compiler spec's default (Ghidra's analyzers otherwise
  *       leave __cdecl16near / unknown, which the decompiler reads as stack arguments);
@@ -194,13 +194,20 @@ public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
         return "P1 phantom functions removed " + phantoms.size();
     }
 
-    /** D0 ({@link WSCompilerRules}). */
+    /** D0 ({@link WSCompilerRules}): the resolved DS/SS defaults are always applied, because the
+     *  loader only stamps LIN_* blocks and the bank overlays would otherwise keep UNSET context. */
     static String applyDsDefault(Program program, WSEvidence ev, WSEvidenceAnalyzer.Seeder s) throws Exception {
         int v = WSCompilerRules.dominantDs(ev);
-        if (v < 0) { s.emit("{\"rule\":\"D0\",\"ds_default\":\"0000\",\"outcome\":\"KEPT\"}"); return "D0 DS default 0 kept"; }
-        int blocks = WSCompilerRules.applyDsDefault(program, v);
-        s.emit("{\"rule\":\"D0\",\"ds_default\":\"%04x\",\"share\":%.3f,\"blocks\":%d,\"outcome\":\"SET\"}", v, WSCompilerRules.share(ev, v), blocks);
-        return String.format("D0 DS default %04X (%.0f%% of single-DS executed addresses)", v, 100 * WSCompilerRules.share(ev, v));
+        int sv = WSCompilerRules.dominantSs(ev);
+        int blocks = WSCompilerRules.applyDsDefault(program, v < 0 ? 0 : v);
+        WSCompilerRules.applySsDefault(program, sv < 0 ? 0 : sv);
+        s.emit("{\"rule\":\"D0\",\"ds_default\":\"%04x\",\"share\":%.3f,\"ss_default\":\"%04x\",\"ss_share\":%.3f,\"blocks\":%d,\"outcome\":\"%s\",\"ss_outcome\":\"%s\"}",
+            v < 0 ? 0 : v, v < 0 ? WSCompilerRules.share(ev, 0) : WSCompilerRules.share(ev, v),
+            sv < 0 ? 0 : sv, sv < 0 ? WSCompilerRules.shareSs(ev, 0) : WSCompilerRules.shareSs(ev, sv),
+            blocks, v < 0 ? "KEPT" : "SET", sv < 0 ? "KEPT" : "SET");
+        return String.format("D0 DS default %04X (%.0f%% of single-DS executed addresses), SS default %04X (%.0f%% single-SS)",
+            v < 0 ? 0 : v, 100 * (v < 0 ? WSCompilerRules.share(ev, 0) : WSCompilerRules.share(ev, v)),
+            sv < 0 ? 0 : sv, 100 * (sv < 0 ? WSCompilerRules.shareSs(ev, 0) : WSCompilerRules.shareSs(ev, sv)));
     }
 
     static String applyCsDefault(Program program, WSEvidenceAnalyzer.Seeder s) throws Exception {

@@ -20,9 +20,12 @@ import ghidra.program.model.mem.MemoryBlock;
  *         stackArgRatio = functions reading [BP+4..0x3f] after a frame / ROM functions <= 0.20.
  *       Calibrated on the licensed library: 28 of 29 titles that link the LSI C-86 runtime, no false positives
  *       (the miss has 49 % stack-argument functions).
- *   D0  title DS default: the loader's DS = 0 default holds unless execution shows another DS dominating:
- *       among executed addresses that ran with a single DS, if one value v != 0 covers >= 50 %, DS = v
- *       becomes the default context over the ROM (rule D1 still sets observed DS at function entries).
+ *   D0  title DS/SS defaults: the loader's DS = SS = 0 default holds unless execution shows another
+ *       value dominating: among executed addresses that ran with a single DS (SS), if one value v != 0
+ *       covers >= 50 %, DS = v (SS = v) becomes the default context over the ROM (rule D1 still sets
+ *       observed DS/SS at function entries). The loader only stamps LIN_* blocks, so D0 always applies
+ *       the resolved defaults to the bank overlays too (they would otherwise keep UNSET context and
+ *       decompile with unaffected DS/SS inputs).
  */
 final class WSCompilerRules {
     static final double LSI_SAVE_MIN = 0.10, STACK_ARGS_MAX = 0.20, DS_DOMINANT_MIN = 0.50;
@@ -74,9 +77,18 @@ final class WSCompilerRules {
 
     /** D0: the dominant single DS among executed addresses, or -1 when DS = 0 stays the default. */
     static int dominantDs(WSEvidence ev) {
+        return dominant(ev.ds);
+    }
+
+    /** D0: the dominant single SS among executed addresses, or -1 when SS = 0 stays the default. */
+    static int dominantSs(WSEvidence ev) {
+        return dominant(ev.ss);
+    }
+
+    private static int dominant(Map<Long, Set<Integer>> values) {
         Map<Integer, Integer> n = new HashMap<>();
         int single = 0;
-        for (Set<Integer> s : ev.ds.values()) {
+        for (Set<Integer> s : values.values()) {
             if (s.size() != 1) continue;
             single++;
             n.merge(s.iterator().next(), 1, Integer::sum);
@@ -87,21 +99,38 @@ final class WSCompilerRules {
     }
 
     static double share(WSEvidence ev, int v) {
+        return shareOf(ev.ds, v);
+    }
+
+    static double shareSs(WSEvidence ev, int v) {
+        return shareOf(ev.ss, v);
+    }
+
+    private static double shareOf(Map<Long, Set<Integer>> values, int v) {
         int single = 0, hit = 0;
-        for (Set<Integer> s : ev.ds.values()) if (s.size() == 1) { single++; if (s.contains(v)) hit++; }
+        for (Set<Integer> s : values.values()) if (s.size() == 1) { single++; if (s.contains(v)) hit++; }
         return single == 0 ? 0 : (double) hit / single;
     }
 
     /** D0: set DS = v over every initialized ROM block (linear window and bank overlays). Data overlays stay untouched. */
     static int applyDsDefault(Program p, int v) throws Exception {
+        return applyDefault(p, "DS", v);
+    }
+
+    /** D0: set SS = v over every initialized ROM block (linear window and bank overlays). Data overlays stay untouched. */
+    static int applySsDefault(Program p, int v) throws Exception {
+        return applyDefault(p, "SS", v);
+    }
+
+    private static int applyDefault(Program p, String register, int v) throws Exception {
         ProgramContext ctx = p.getProgramContext();
-        Register ds = ctx.getRegister("DS");
+        Register r = ctx.getRegister(register);
         int blocks = 0;
         for (MemoryBlock b : p.getMemory().getBlocks()) {
             if (!b.isInitialized() || !b.isExecute() || b.getName().equals("RAM")) continue;
             if (WonderSwanLoader.isDataOverlay(b)) continue;
             Address s = b.getStart(), e = b.getEnd();
-            ctx.setValue(ds, s, e, BigInteger.valueOf(v));
+            ctx.setValue(r, s, e, BigInteger.valueOf(v));
             blocks++;
         }
         return blocks;

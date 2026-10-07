@@ -7,10 +7,10 @@ import java.util.*;
 import java.util.regex.*;
 
 /**
- * Execution evidence for one program: which linear addresses executed (with the CS and DS values seen
- * there) and the control-flow edges static analysis cannot see (computed jumps/calls, software and
- * hardware interrupt entries). Produced by a {@link WSMachine} run or loaded from a WSEmulate output
- * directory (coverage.json + edges.tsv).
+ * Execution evidence for one program: which linear addresses executed (with the CS, DS and SS values
+ * seen there) and the control-flow edges static analysis cannot see (computed jumps/calls, software
+ * and hardware interrupt entries). Produced by a {@link WSMachine} run or loaded from a WSEmulate
+ * output directory (coverage.json + edges.tsv).
  */
 public final class WSEvidence {
     /** One observed transfer. from = -1 for an injected hardware interrupt. */
@@ -36,6 +36,8 @@ public final class WSEvidence {
     public final Map<Long, Integer> cs = new TreeMap<>();
     /** Executed linear address -> DS values seen (first 64 visits). */
     public final Map<Long, Set<Integer>> ds = new HashMap<>();
+    /** Executed linear address -> SS values seen (first 64 visits; rule D0 gives SS the same treatment as DS). */
+    public final Map<Long, Set<Integer>> ss = new HashMap<>();
     public final List<Edge> edges = new ArrayList<>();
     /** Executed ROM0/ROM1 window address (linear 20000-3FFFF) -> ROM bank values it executed under (rule B1). */
     public final Map<Long, Set<Integer>> windowBanks = new TreeMap<>();
@@ -74,6 +76,10 @@ public final class WSEvidence {
             for (int packed : x.getValue()) d.add(packed >>> 16);
             e.ds.put(x.getKey(), d);
         }
+        for (Map.Entry<Long, Set<Integer>> x : m.executedSs.entrySet()) {
+            if (drop.contains(x.getKey())) continue;
+            e.ss.put(x.getKey(), new TreeSet<>(x.getValue()));
+        }
         for (Map.Entry<String, Integer> x : m.edges.entrySet()) {
             String[] f = x.getKey().split(",");
             long from = Long.parseLong(f[0], 16), to = Long.parseLong(f[1], 16);
@@ -109,6 +115,13 @@ public final class WSEvidence {
             Set<Integer> s = new TreeSet<>();
             for (String v : b.group(2).split(",\\s*")) if (!v.isBlank()) s.add(Integer.parseInt(v.trim()));
             e.windowBanks.put(Long.parseLong(b.group(1)), s);
+        }
+        // Files written before SS sampling have no "ss" key: the SS map then stays empty (SS default 0).
+        Matcher s = Pattern.compile("\"linear\":(\\d+)[^}]*\"ss\":\\[([\\d, ]*)\\]").matcher(Files.readString(dir.resolve("coverage.json")));
+        while (s.find()) {
+            Set<Integer> v = new TreeSet<>();
+            for (String w : s.group(2).split(",\\s*")) if (!w.isBlank()) v.add(Integer.parseInt(w.trim()));
+            if (!v.isEmpty()) e.ss.put(Long.parseLong(s.group(1)), v);
         }
         Path ed = dir.resolve("edges.tsv");
         if (Files.exists(ed)) {
@@ -163,6 +176,8 @@ public final class WSEvidence {
             if (coverage != null && coverage.byLinear.containsKey(lin)) ds.addAll(coverage.byLinear.get(lin).ds());
             if (trace != null && trace.ds.containsKey(lin)) ds.addAll(trace.ds.get(lin));
             if (!ds.isEmpty()) e.ds.put(lin, ds);
+            // SS evidence comes from the trace window only (coverage logs have no SS column).
+            if (trace != null && trace.ss.containsKey(lin)) e.ss.put(lin, new TreeSet<>(trace.ss.get(lin)));
             int cs;
             if (trace != null && trace.firstCs.containsKey(lin)) { cs = trace.firstCs.get(lin); csFromTrace++; }
             else if (wsmCs != null && wsmCs.containsKey(lin)) { cs = wsmCs.get(lin); csFromWsm++; }
@@ -253,7 +268,7 @@ public final class WSEvidence {
 
     /**
      * Merge two evidences; {@code primary} wins CS conflicts (same linear observed with different
-     * segment values), DS sets and window banks unite, edges with the same
+     * segment values), DS/SS sets and window banks unite, edges with the same
      * (from, to, targetCs, kind) sum their counts, transfers concatenate.
      */
     public static WSEvidence merge(WSEvidence primary, WSEvidence secondary) {
@@ -264,6 +279,10 @@ public final class WSEvidence {
             e.ds.computeIfAbsent(x.getKey(), k -> new TreeSet<>()).addAll(x.getValue());
         for (Map.Entry<Long, Set<Integer>> x : primary.ds.entrySet())
             e.ds.computeIfAbsent(x.getKey(), k -> new TreeSet<>()).addAll(x.getValue());
+        for (Map.Entry<Long, Set<Integer>> x : secondary.ss.entrySet())
+            e.ss.computeIfAbsent(x.getKey(), k -> new TreeSet<>()).addAll(x.getValue());
+        for (Map.Entry<Long, Set<Integer>> x : primary.ss.entrySet())
+            e.ss.computeIfAbsent(x.getKey(), k -> new TreeSet<>()).addAll(x.getValue());
         Map<String, Edge> edges = new LinkedHashMap<>();
         for (Edge x : secondary.edges) edges.put(edgeKey(x), x);
         for (Edge x : primary.edges)

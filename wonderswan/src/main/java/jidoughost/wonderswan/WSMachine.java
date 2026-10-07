@@ -96,9 +96,12 @@ public class WSMachine {
         return WSCartridge.detect(file, program.getName());
     }
 
-    /** Executed instruction linear address -> observed (DS, ES, SS) triples. */
+    /** Executed instruction linear address -> observed (DS, ES) pairs, packed DS << 16 | ES. */
     private final WSAddressMap<Set<Integer>> executedArray = new WSAddressMap<>(0x110000);
     public final Map<Long, Set<Integer>> executed = executedArray;
+    /** Executed instruction linear address -> observed SS values (rule D0 gives SS the same treatment as DS). */
+    private final WSAddressMap<Set<Integer>> executedSsArray = new WSAddressMap<>(0x110000);
+    public final Map<Long, Set<Integer>> executedSs = executedSsArray;
     /** Executed instruction linear address -> (C0, C2, C3) at execution time, packed. */
     private final WSAddressMap<Integer> executedBanksArray = new WSAddressMap<>(0x110000);
     public final Map<Long, Integer> executedBanks = executedBanksArray;
@@ -142,7 +145,7 @@ public class WSMachine {
     public final Map<String, Integer> edges = new TreeMap<>();
     /** Pending computed-branch edges and interrupt-nesting depth (rule E0b). */
     public final WSComputedEdges computedEdges = new WSComputedEdges();
-    /** Visits per executed address; DS/ES sets are sampled for the first 64 visits (as the Mesen trace does). */
+    /** Visits per executed address; DS/ES/SS sets are sampled for the first 64 visits (as the Mesen trace does). */
     private final int[] visits = new int[0x110000];
     private final Map<Long, Integer> visitOverflow = new HashMap<>();
     private final Integer[] observedBanks = new Integer[0x10000];
@@ -1672,6 +1675,9 @@ public class WSMachine {
                 Set<Integer> s = executedArray.get(lin);
                 if (s == null) { s = new HashSet<>(); executedArray.putAt(lin, s); executedBanksArray.putAt(lin, ports[0xC0] << 16 | ports[0xC2] << 8 | ports[0xC3]); }
                 s.add((int) (reg(rDS) << 16 | reg(rES)));
+                Set<Integer> ss = executedSsArray.get(lin);
+                if (ss == null) { ss = new HashSet<>(); executedSsArray.putAt(lin, ss); }
+                ss.add((int) reg(rSS));
             }
         }
 

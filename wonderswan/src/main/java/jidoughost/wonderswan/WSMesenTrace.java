@@ -72,6 +72,8 @@ public final class WSMesenTrace {
         public final Map<Long, Integer> firstCs = new HashMap<>();
         /** Linear -> DS values seen in the trace window. */
         public final Map<Long, Set<Integer>> ds = new HashMap<>();
+        /** Linear -> SS values seen in the trace window. */
+        public final Map<Long, Set<Integer>> ss = new HashMap<>();
         /** Linear -> C0 values seen in the trace window (linear-window addresses). */
         public final Map<Long, Set<Integer>> c0 = new HashMap<>();
         /** Linear -> C2/C3 values seen in the trace window (ROM0/ROM1-window addresses). */
@@ -151,6 +153,7 @@ public final class WSMesenTrace {
                 long lin = (((long) cs << 4) + ip) & 0xFFFFF;
                 int ds = t.length > 12 ? Integer.parseInt(t[11].trim(), 16) : 0;
                 int es = t.length > 13 ? Integer.parseInt(t[12].trim(), 16) : 0;
+                int ss = t.length > 14 ? Integer.parseInt(t[13].trim(), 16) : 0;
                 int c0 = t.length > 15 ? Integer.parseInt(t[15].trim(), 16) : -1;
                 int c1 = t.length > 16 ? Integer.parseInt(t[16].trim(), 16) : -1;
                 int c2 = t.length > 17 ? Integer.parseInt(t[17].trim(), 16) : -1;
@@ -159,6 +162,7 @@ public final class WSMesenTrace {
                 d.steps.add(s);
                 d.firstCs.putIfAbsent(lin, cs);
                 if (t.length > 12) d.ds.computeIfAbsent(lin, k -> new TreeSet<>()).add(ds);
+                if (t.length > 14) d.ss.computeIfAbsent(lin, k -> new TreeSet<>()).add(ss);
                 if (c0 >= 0 && lin >= 0x40000) d.c0.computeIfAbsent(lin, k -> new TreeSet<>()).add(c0);
                 if (lin >= 0x20000 && lin < 0x30000 && c2 >= 0)
                     d.windowBanks.computeIfAbsent(lin, k -> new TreeSet<>()).add(c2);

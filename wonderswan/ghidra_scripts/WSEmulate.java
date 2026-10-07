@@ -5,7 +5,7 @@
 //       connected, default 1), eep=XX (blank cartridge EEPROM fill, default FF as delivered; Mesen 2 uses 00), owner=NAME[:volume] (console
 //       owner data in the internal EEPROM, default blank; Mesen 2 uses WONDERSWAN / WONDERSWANCOLOR:3), cyc=0|1 (cycle-timed
 //       lines, timers and interrupts instead of `slice` instructions per frame)]
-// Writes coverage.json (executed instruction linear addresses with ROM offset, CS and DS/ES sets), edges.tsv,
+// Writes coverage.json (executed instruction linear addresses with ROM offset, CS and DS/ES/SS sets), edges.tsv,
 // banks.json (bank writes + DMA log), ram.bin, vram_writers.json, saves/ (internal.eeprom, cart.eeprom,
 // cart.sram as present after the run) and eeprom.log (every EEPROM operation and refused request).
 // Default input: Start on frames f>=100 with f%40<3, A on 20<=f%40<23. An input script replaces it: one
@@ -106,8 +106,10 @@ public class WSEmulate extends GhidraScript {
                 Set<Integer> wb = m.windowBanks.get(lin);   // bank-window code: ROM offset per bank it ran under
                 long romOff = wb != null ? WSHardware.bankToRom(wb.iterator().next(), m.rom.length) | (lin & 0xFFFF)
                     : lin >= 0x40000 ? m.romOffset(lin) : -1;
-                w.print((first ? "" : ",") + String.format("{\"linear\":%d,\"rom_off\":%d,\"cs\":%d,\"ds\":%s,\"es\":%s%s}",
-                    lin, romOff, m.csAt.getOrDefault(lin, -1), d, x, wb == null ? "" : ",\"banks\":" + wb));
+                Set<Integer> ssv = m.executedSs.get(lin);
+                w.print((first ? "" : ",") + String.format("{\"linear\":%d,\"rom_off\":%d,\"cs\":%d,\"ds\":%s,\"es\":%s,\"ss\":%s%s}",
+                    lin, romOff, m.csAt.getOrDefault(lin, -1), d, x,
+                    ssv == null ? "[]" : new TreeSet<>(ssv), wb == null ? "" : ",\"banks\":" + wb));
                 first = false;
             }
             w.print("]");

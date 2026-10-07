@@ -40,7 +40,7 @@ import ghidra.util.task.TaskMonitor;
  *   E2  a call / int / irq edge target is a function entry (RAM and last-overlay-byte targets excluded).
  *   E3  a computed JMP site gets COMPUTED_JUMP references to every observed target, and a JumpTable
  *       override listing them (observed targets only; a static table rule may add more later).
- *   D1  a function entry where only one non-zero DS value was observed gets that DS as context.
+ *   D1  a function entry where only one non-zero DS (SS) value was observed gets that DS (SS) as context.
  *   B2  ROM0/ROM1 window code: for every (window, bank) the evidence executed in (rule B1, WSMachine), an
  *       overlay block of that ROM bank is created over the window, and E1/E2/E3 seed into it. A window
  *       address that executed under several banks is seeded in each of them.
@@ -230,10 +230,10 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
         final MessageLog log;
         final SegmentedAddressSpace space;
         final ProgramContext ctx;
-        final Register csval, rDS, colorsoc;
+        final Register csval, rDS, rSS, colorsoc;
         final boolean colorHw;
         final PrintWriter out;
-        int e1, e1skip, e2, e2conflict, e3, e3t, d1, a1runs, a1insns, n1, n1sites, b2, b2ambiguous, b3, b3multi, b3unobserved, b3conflict, b3jump, h1runs;
+        int e1, e1skip, e2, e2conflict, e3, e3t, d1, d1ss, a1runs, a1insns, n1, n1sites, b2, b2ambiguous, b3, b3multi, b3unobserved, b3conflict, b3jump, h1runs;
         /** Mesen-sourced edges (resolved trace transfers, CDL sub-entries), by identity. */
         final Set<WSEvidence.Edge> mesenEdges = Collections.newSetFromMap(new IdentityHashMap<>());
         int e1already, e1alreadyM, e1m, e2m, e3m, e3tm, xferFall, xferIrq, xferCall, xferJump, xferInt, xferDrop, xferNoSrc;
@@ -244,6 +244,7 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
             ctx = p.getProgramContext();
             csval = ctx.getRegister("csval");
             rDS = ctx.getRegister("DS");
+            rSS = ctx.getRegister("SS");
             colorsoc = ctx.getRegister("colorsoc");
             colorHw = p.getOptions(WonderSwanLoader.OPTIONS_CATEGORY).getBoolean("Color", false);
             out = report == null || report.isBlank() ? null : new PrintWriter(append
@@ -728,17 +729,28 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
             if (!refall.isEmpty()) new DisassembleCommand(refall, null, true).applyTo(p, monitor);
         }
 
-        /** D1: DS context at function entries with a single non-zero observed DS. */
+        /** D1: DS/SS context at function entries with a single non-zero observed DS/SS. */
         void seedDs() throws Exception {
             for (Function f : p.getFunctionManager().getFunctions(true)) {
                 long lin = f.getEntryPoint().getOffset();
                 Set<Integer> d = ev.ds.get(lin);
-                if (d == null || d.size() != 1) continue;
-                int v = d.iterator().next();
-                if (v == 0) continue;
-                ctx.setValue(rDS, f.getEntryPoint(), f.getEntryPoint(), BigInteger.valueOf(v));
-                d1++;
-                emit("{\"rule\":\"D1\",\"entry\":\"%s\",\"ds\":\"%04x\"}", f.getEntryPoint(), v);
+                if (d != null && d.size() == 1) {
+                    int v = d.iterator().next();
+                    if (v != 0) {
+                        ctx.setValue(rDS, f.getEntryPoint(), f.getEntryPoint(), BigInteger.valueOf(v));
+                        d1++;
+                        emit("{\"rule\":\"D1\",\"entry\":\"%s\",\"ds\":\"%04x\"}", f.getEntryPoint(), v);
+                    }
+                }
+                Set<Integer> s = ev.ss.get(lin);
+                if (s != null && s.size() == 1) {
+                    int v = s.iterator().next();
+                    if (v != 0) {
+                        ctx.setValue(rSS, f.getEntryPoint(), f.getEntryPoint(), BigInteger.valueOf(v));
+                        d1ss++;
+                        emit("{\"rule\":\"D1\",\"entry\":\"%s\",\"ss\":\"%04x\"}", f.getEntryPoint(), v);
+                    }
+                }
             }
         }
 
@@ -782,8 +794,8 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
         }
 
         String summary() {
-            return String.format("B2 bank overlays %d (edges into multi-bank code %d), B3 window flows overridden %d (jumps fenced %d, multi-bank %d, unobserved %d, context conflicts %d), E1 seeded %d (skipped %d), H1 RAM runs %d, E2 functions %d (offcut targets skipped %d), E3 jump sites %d (targets %d), N1 no-return cleared %d (%d call sites), D1 DS entries %d, A1 artefact runs %d (%d instructions cleared)",
-                b2, b2ambiguous, b3, b3jump, b3multi, b3unobserved, b3conflict, e1, e1skip, h1runs, e2, e2conflict, e3, e3t, n1, n1sites, d1, a1runs, a1insns);
+            return String.format("B2 bank overlays %d (edges into multi-bank code %d), B3 window flows overridden %d (jumps fenced %d, multi-bank %d, unobserved %d, context conflicts %d), E1 seeded %d (skipped %d), H1 RAM runs %d, E2 functions %d (offcut targets skipped %d), E3 jump sites %d (targets %d), N1 no-return cleared %d (%d call sites), D1 DS entries %d (SS %d), A1 artefact runs %d (%d instructions cleared)",
+                b2, b2ambiguous, b3, b3jump, b3multi, b3unobserved, b3conflict, e1, e1skip, h1runs, e2, e2conflict, e3, e3t, n1, n1sites, d1, d1ss, a1runs, a1insns);
         }
 
         @Override public void close() { if (out != null) out.close(); }

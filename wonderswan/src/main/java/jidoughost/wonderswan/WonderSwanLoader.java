@@ -320,8 +320,9 @@ public class WonderSwanLoader extends AbstractProgramWrapperLoader {
         // DS = SS = 0 default context over the ROM code (measured on commercial titles: reset code sets
         // DS=ES=SS=0; 86-96 % of executed code runs with DS=0; ROM data is reached by temporarily loading DS,
         // which the decompiler tracks within a function). Evidence overrides it: rule D0 (WSCompilerRules) replaces
-        // the default when execution shows another DS dominating the title (e.g. 1000 = SRAM in LSI C-86 titles),
-        // and rule D1 sets the DS observed at function entries.
+        // the default when execution shows another DS or SS dominating the title (e.g. 1000 = SRAM in titles
+        // whose stack lives there), always stamps the resolved defaults on the bank overlays too (they do not
+        // exist at load time), and rule D1 sets the DS/SS observed at function entries.
         try {
             Register ds = program.getProgramContext().getRegister("DS"), ss = program.getProgramContext().getRegister("SS");
             for (MemoryBlock b : program.getMemory().getBlocks()) {

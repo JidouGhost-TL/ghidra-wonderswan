@@ -39,6 +39,8 @@ public class WSMesenTraceTest {
         check(d.firstCs.get(0xb0000L) == 0xb000, "v2 firstCs");
         check(d.firstCs.get(0x20010L) == 0x2000, "v2 firstCs window");
         check(d.ds.get(0xb0003L).equals(Set.of(0x1000)), "v2 ds set");
+        check(d.ss.get(0xb0003L).equals(Set.of(0x1000)), "v2 ss set");
+        check(d.ss.get(0xb0000L).equals(Set.of(0)), "v2 ss zero");
         check(d.c0.get(0xb0000L).equals(Set.of(0xff)), "v2 c0 aggregate");
         check(d.windowBanks.get(0x20010L).equals(Set.of(0xf2)), "v2 window banks from trace");
         check(d.transfers.size() == 5, "v2 5 consecutive transfers");
@@ -52,6 +54,7 @@ public class WSMesenTraceTest {
         check(d.steps.get(0).c0() == -1 && d.steps.get(0).c3() == -1, "v1 banks unknown");
         check(d.c0.isEmpty() && d.windowBanks.isEmpty(), "v1 no bank aggregates");
         check(d.firstCs.get(0xb0003L) == 0xb000, "v1 firstCs");
+        check(d.ss.get(0xb0003L).equals(Set.of(0)), "v1 ss set");
         check(d.transfers.size() == 2, "v1 2 transfers");
     }
 
@@ -143,6 +146,7 @@ public class WSMesenTraceTest {
         check(e.windowBanks.get(0x20010L).equals(Set.of(0xf2, 0xff)), "mesen window banks union");
         check(e.ds.get(0xb0003L).equals(Set.of(0x1000)), "mesen ds union");
         check(e.ds.containsKey(0x15000L), "mesen ds covers unseeded sram");
+        check(e.ss.get(0xb0003L).equals(Set.of(0x1000)), "mesen ss from trace");
         check(e.transfers.size() == 5, "mesen transfers carried");
         WSEvidence.MesenStats m = e.mesenStats;
         check(m.csFromTrace() == 6, "mesen csFromTrace");
@@ -201,12 +205,14 @@ public class WSMesenTraceTest {
         WSEvidence p = new WSEvidence(), s = new WSEvidence();
         p.cs.put(0xb0000L, 0xb000);
         p.ds.put(0xb0000L, new TreeSet<>(Set.of(0x1000)));
+        p.ss.put(0xb0000L, new TreeSet<>(Set.of(0x1000)));
         p.windowBanks.put(0x20010L, new TreeSet<>(Set.of(0xf2)));
         p.edges.add(new WSEvidence.Edge(1, 2, 0xb000, "jump", 3));
         p.transfers.add(new WSEvidence.Transfer(1, 0xb000, 2, 0xb000, 1));
         s.cs.put(0xb0000L, 0xa000);
         s.cs.put(0xc0000L, 0xc000);
         s.ds.put(0xb0000L, new TreeSet<>(Set.of(0)));
+        s.ss.put(0xb0000L, new TreeSet<>(Set.of(0)));
         s.windowBanks.put(0x20010L, new TreeSet<>(Set.of(0xff)));
         s.edges.add(new WSEvidence.Edge(1, 2, 0xb000, "jump", 4));
         s.edges.add(new WSEvidence.Edge(5, 6, 0xc000, "call", 1));
@@ -216,6 +222,7 @@ public class WSMesenTraceTest {
         check(e.cs.get(0xb0000L) == 0xb000, "merge primary wins cs");
         check(e.cs.get(0xc0000L) == 0xc000, "merge keeps secondary-only");
         check(e.ds.get(0xb0000L).equals(Set.of(0, 0x1000)), "merge ds union");
+        check(e.ss.get(0xb0000L).equals(Set.of(0, 0x1000)), "merge ss union");
         check(e.windowBanks.get(0x20010L).equals(Set.of(0xf2, 0xff)), "merge banks union");
         check(e.edges.size() == 2, "merge edges deduped");
         check(e.edges.stream().filter(x -> x.from() == 1).findFirst().get().count() == 7, "merge counts summed");
