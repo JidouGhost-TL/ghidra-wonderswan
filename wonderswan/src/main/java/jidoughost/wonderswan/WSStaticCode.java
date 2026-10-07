@@ -196,7 +196,15 @@ public final class WSStaticCode {
     private int cs(Address a) {
         BigInteger value = context.getValue(csval, a, false);
         if (value != null && value.intValue() != 0) return value.intValue();
-        return a instanceof SegmentedAddress sa ? sa.getSegment() : -1;
+        if (a instanceof SegmentedAddress sa) return sa.getSegment();
+        // An executable overlay without a segment runs under its base: a 64KB
+        // bank view at base B executes as segment B>>4 when mapped.
+        MemoryBlock block = memory.getBlock(a);
+        if (block != null && block.isExecute()) {
+            long base = block.getStart().getOffset();
+            if ((base & 0xffff) == 0) return (int)((base >> 4) & 0xffff);
+        }
+        return -1;
     }
 
     private PseudoInstruction decode(Address a, int segment) throws Exception {
