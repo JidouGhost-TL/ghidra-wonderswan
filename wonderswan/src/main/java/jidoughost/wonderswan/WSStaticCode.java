@@ -33,7 +33,10 @@ import ghidra.util.task.TaskMonitor;
  * evidence is synthesized. Before boundary seeding, finite CS-indexed near
  * and far tables are reserved and defined as pointers. Recognized dispatches
  * are resolved transfers; their targets use the same strict walk. All table
- * bytes veto later starts in every file-backed alias.
+ * bytes veto later starts in every file-backed alias. A bank the evidence
+ * never executed has no window
+ * view; when its data bytes hold a far call to a known entry, executable
+ * window views of that bank are mapped first, then seeded like any other view.
  */
 public final class WSStaticCode {
     public static final String PROPERTY = "WS_STATIC_UNEXECUTED";
@@ -102,6 +105,7 @@ public final class WSStaticCode {
             if (saves >= 3 && i != null && !(i.getLength() == 1 && isSave(i.getBytes()[0] & 255)))
                 saveProfiles.add(prefix.toString());
         }
+        mapStaticBankViews();
         List<MemoryBlock> eligible = new ArrayList<>();
         for (MemoryBlock block : memory.getBlocks()) {
             if (!block.isInitialized() || !block.isExecute() || WonderSwanLoader.isDataOverlay(block)) continue;
@@ -118,6 +122,101 @@ public final class WSStaticCode {
             }
         }
         if (!current.isEmpty()) addRun(current);
+    }
+
+    /** Overlay name for a static-evidence view of file bank `bank` in window `seg` (pure for unit tests). */
+    static String staticBankViewName(int seg, int bank) {
+        return String.format("ROM%d_BANK_%04X", seg == WSHardware.SEG_ROM0 ? 0 : 1, bank);
+    }
+
+    /** True when two [start, start+len) file ranges overlap (pure for unit tests). */
+    static boolean fileRangesOverlap(long aStart, long aLen, long bStart, long bLen) {
+        return aStart < bStart + bLen && bStart < aStart + aLen;
+    }
+
+    // A ROM bank the evidence never executed has no window overlay: its bytes
+    // are visible only in a read-only data overlay the seeder never scans. When
+    // the data overlay holds a far-call anchor to a known entry, map the bank as
+    // an executable view in each bank window so the unchanged seeder can
+    // trial-walk it. Acceptance still requires the anchor gate, start evidence
+    // and the strict walk; banks without anchors, and bytes already under an
+    // executable view, are left alone. Views are named by file bank; an executed
+    // overlay of the same name always covers the same bytes (bank value BB on an
+    // N-bank image maps to file bank BB mod N, which is BB when BB < N), so an
+    // existing block is reused.
+    private void mapStaticBankViews() throws Exception {
+        for (Function f : program.getFunctionManager().getFunctions(true)) known.add(f.getEntryPoint());
+        List<MemoryBlock> data = new ArrayList<>();
+        for (MemoryBlock block : memory.getBlocks())
+            if (WonderSwanLoader.isDataOverlay(block)) data.add(block);
+        data.sort(Comparator.comparing(MemoryBlock::getName));
+        for (MemoryBlock block : data) {
+            int bank = WonderSwanLoader.dataOverlayBank(block);
+            long fileOff = romOffset(block.getStart());
+            long size = block.getSize();
+            if (bank < 0 || fileOff < 0 || size <= 0 || size > 0x10000) continue;
+            if (hasExecutableView(fileOff, size)) continue;
+            if (!hasFarAnchor(block)) continue;
+            for (int seg : new int[] { WSHardware.SEG_ROM0, WSHardware.SEG_ROM1 })
+                createStaticBankView(seg, bank, size);
+        }
+    }
+
+    private boolean hasExecutableView(long fileOff, long size) {
+        for (MemoryBlock block : memory.getBlocks()) {
+            if (!block.isExecute() || !block.isInitialized() || WonderSwanLoader.isDataOverlay(block)) continue;
+            long start = romOffset(block.getStart());
+            if (start < 0) continue;
+            if (fileRangesOverlap(start, block.getSize(), fileOff, size)) return true;
+        }
+        return false;
+    }
+
+    private boolean hasFarAnchor(MemoryBlock block) throws Exception {
+        byte[] raw = new byte[(int) block.getSize()];
+        memory.getBytes(block.getStart(), raw);
+        for (int k = 0; k + 5 <= raw.length; k++) {
+            if ((raw[k] & 255) != 0x9a) continue;
+            Address anchor = block.getStart().add(k);
+            if (!unknown(anchor)) continue;
+            PseudoInstruction call;
+            try { call = decode(anchor, WSHardware.SEG_ROM1); }
+            catch (Exception ex) { continue; }
+            if (call.getFlowType().isCall() && Arrays.stream(call.getFlows()).anyMatch(known::contains)) return true;
+        }
+        return false;
+    }
+
+    private void createStaticBankView(int seg, int bank, long size) throws Exception {
+        String name = staticBankViewName(seg, bank);
+        if (memory.getBlock(name) != null) return;
+        if (memory.getAllFileBytes().isEmpty()) return;
+        ghidra.program.database.mem.FileBytes fb = memory.getAllFileBytes().get(0);
+        SegmentedAddressSpace space = (SegmentedAddressSpace) program.getAddressFactory().getDefaultAddressSpace();
+        long effLen = WSHardware.effectiveSize(fb.getSize());
+        long off = ((long) bank) << 16;
+        MemoryBlock b;
+        if (effLen == fb.getSize()) {
+            long len = Math.min(Math.min(size, 0x10000), fb.getSize() - off);
+            if (len <= 0) return;
+            b = memory.createInitializedBlock(name, space.getAddress(seg, 0), fb, off, len, true);
+        } else {
+            byte[] file = new byte[(int) fb.getSize()];
+            fb.getOriginalBytes(0, file);
+            byte[] win = new byte[0x10000];
+            long pad = effLen - file.length;
+            for (int i = 0; i < win.length; i++) {
+                long f = off + i - pad;
+                win[i] = f < 0 ? (byte) WSHardware.PAD_BYTE : file[(int) f];
+            }
+            b = memory.createInitializedBlock(name, space.getAddress(seg, 0),
+                new java.io.ByteArrayInputStream(win), 0x10000, monitor, true);
+        }
+        b.setPermissions(true, false, true);
+        b.setComment(String.format("ROM bank 0x%02X (file offset 0x%06X) in the %s window: static call evidence with no execution-mapped view (static bank view)",
+            bank, off, seg == WSHardware.SEG_ROM0 ? "ROM0" : "ROM1"));
+        emit.accept(String.format("{\"rule\":\"static-bank-view\",\"overlay\":\"%s\",\"window\":\"%04x\",\"bank\":\"%04x\",\"rom_offset\":\"%06x\"}",
+            name, seg, bank, off));
     }
 
     private boolean follows(MemoryBlock prev, MemoryBlock next) {

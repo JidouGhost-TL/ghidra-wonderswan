@@ -11,6 +11,7 @@ public final class MapperTestAll {
         WSRtcTest.run();
         WSKarnakTest.run();
         WSRomBanksTest.run();
+        WSStaticBankViewTest.run();
         WSComputedEdgesTest.run();
         System.out.println("MapperTestAll: PASS (" + Check.count + " checks)");
     }
