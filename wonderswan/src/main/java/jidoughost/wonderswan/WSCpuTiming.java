@@ -135,7 +135,8 @@ public final class WSCpuTiming {
             case 0x69 -> { idle(3); modRm.run(); code(2); }          // IMUL r, r/m, imm16
             case 0x6B -> { idle(3); modRm.run(); code(1); }          // IMUL r, r/m, imm8
             case 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x7F,
-                 0xE3, 0xEB -> { idle(); code(); if (taken) { idle(2); branchFlush = true; } }   // Jcc, JCXZ, JMP short
+                 0xE3 -> { idle(); code(); if (taken) { idle(2); branchFlush = true; } }   // Jcc, JCXZ
+            case 0xEB -> { idle(); code(); idle(2); branchFlush = true; }   // JMP short: unconditional, always taken (also JMP $+2)
             case 0x80, 0x81, 0x82, 0x83 -> { idle(); modRm.run(); code(op == 0x81 ? 2 : 1); }   // group 1
             case 0x84, 0x85 -> { idle(); modRm.run(); }              // TEST r/m, r
             case 0x86, 0x87 -> { idle(3); modRm.run(); }             // XCHG r/m, r
