@@ -38,6 +38,9 @@ import ghidra.util.task.TaskMonitor;
  *   fails the guard is kept and reported (SKIPPED). Lying inside a function entered outside the run is not a veto:
  *   with no reference and no fall-through the bytes are unreachable from that function too, and clearing them
  *   frees a fall-through tail for the routine-start rule (the carve is reported with the former container).
+ * J1u: a flow the cleared decode had blocked (an ERROR conflict bookmark whose conflicting instruction was cleared and
+ *   whose source instruction is still decoded) is re-flowed from the bookmark's address, so live fall-through or branch
+ *   code that lost to the superseded decode is disassembled again instead of only losing its error bookmark.
  * J1i: a base held in a second register: ADD idx,reg2 where reg2's last write before the ADD (same fall-through
  *   chain) is MOV reg2,imm or LEA reg2,[imm] adds that constant to the table address and leaves idx as the index
  *   (e.g. LEA AX,[tbl]; SHL BX,1; ADD BX,AX; JMP/CALL CS:[BX]). The constant must reach the ADD on every path: no
@@ -663,10 +666,13 @@ public final class WSJumpTables {
         return out;
     }
 
-    /** ERROR bookmarks of a conflict with code J1h cleared are stale: removed (the re-flow reports any real one again). */
+    /** ERROR bookmarks of a conflict with code J1h cleared are stale: removed. J1u: a flow those cleared bytes
+     *  blocked (the bookmark's own address, reached from an instruction that is still decoded) is re-flowed, so
+     *  live fall-through or branch code that lost to the superseded decode is disassembled again. */
     void removeStaleConflicts(AddressSetView cleared) {
         BookmarkManager bm = p.getBookmarkManager();
         List<Bookmark> stale = new ArrayList<>();
+        List<Address> blocked = new ArrayList<>();
         Iterator<Bookmark> it = bm.getBookmarksIterator(BookmarkType.ERROR);
         while (it.hasNext()) {
             Bookmark b = it.next();
@@ -674,17 +680,33 @@ public final class WSJumpTables {
             if (cleared.contains(b.getAddress())) { stale.add(b); continue; }
             if (m.find()) {
                 Address c = p.getAddressFactory().getAddress(m.group(1));
-                if (c != null && cleared.contains(c)) stale.add(b);
+                if (c != null && cleared.contains(c)) {
+                    stale.add(b);
+                    Matcher f = FLOW_FROM.matcher(b.getComment());
+                    Address from = f.find() ? p.getAddressFactory().getAddress(f.group(1)) : null;
+                    if (from != null && listing.getInstructionAt(from) != null) blocked.add(b.getAddress());
+                }
             }
         }
         for (Bookmark b : stale) bm.removeBookmark(b);
+        for (Address a : blocked) {
+            if (listing.getInstructionAt(a) != null || listing.getDefinedDataContaining(a) != null) continue;
+            new DisassembleCommand(a, null, true).applyTo(p, TaskMonitor.DUMMY);
+            if (listing.getInstructionAt(a) != null) {
+                reflowedBlocked++;
+                emit.accept(String.format("{\"rule\":\"J1u\",\"start\":\"%s\",\"outcome\":\"REFLOWED\"}", a));
+            }
+        }
     }
 
+    int reflowedBlocked;
+
     static final Pattern CONFLICT = Pattern.compile("conflicting instruction at (\\S+)");
+    static final Pattern FLOW_FROM = Pattern.compile("flow from (\\S+?)\\)");
 
     String summary() {
-        return String.format("J1 jump/call table sites %d (passes %d): recovered %d (J1i register base %d), unresolved %d, quarantined %d (refs dropped %d), new code %d, observed targets added %d, offcut targets %d (retried %d), deshadowed %d, superseded refs %d, orphan bytes cleared %d, dispatches restored %d (recovered %d), site errors %d",
-            seen.size(), passes, recovered, computedBases, reported.size(), quarantines, droppedRefs, newCode, observedMissing, offcut, offcutRetried, deshadowed, supersededRefs, clearedOrphans, restoredDispatches, restoredRecovered, errors);
+        return String.format("J1 jump/call table sites %d (passes %d): recovered %d (J1i register base %d), unresolved %d, quarantined %d (refs dropped %d), new code %d, observed targets added %d, offcut targets %d (retried %d), deshadowed %d, superseded refs %d, orphan bytes cleared %d (blocked flows re-flowed %d), dispatches restored %d (recovered %d), site errors %d",
+            seen.size(), passes, recovered, computedBases, reported.size(), quarantines, droppedRefs, newCode, observedMissing, offcut, offcutRetried, deshadowed, supersededRefs, clearedOrphans, reflowedBlocked, restoredDispatches, restoredRecovered, errors);
     }
 
     /** J1n: clear single-byte data shadowing a proven table target so it disassembles. The shadowing byte
