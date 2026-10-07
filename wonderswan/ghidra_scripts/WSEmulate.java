@@ -26,10 +26,18 @@ public class WSEmulate extends GhidraScript {
         int slice = a.length > 2 ? Integer.parseInt(a[2]) : 40000;
         int shotEvery = a.length > 4 ? Integer.parseInt(a[4]) : 100;
         boolean color = currentProgram.getOptions("WonderSwan").getBoolean("Color", true);
+        // model=mono|color (environment key): the console to emulate. Default: the loader's choice from the cartridge
+        // footer (a mono cartridge runs on the mono console, 16 KB internal RAM); model=color runs it on a Color unit.
+        if (a.length > 7 && !a[7].equals("-"))
+            for (String kv : a[7].split(","))
+                if (kv.startsWith("model=")) color = switch (kv.substring(6)) {
+                    case "color" -> true; case "mono" -> false;
+                    default -> throw new IllegalArgumentException("model must be mono or color: " + kv); };
         WSMachine m = new WSMachine(currentProgram, color);
         if (a.length > 3 && !a[3].equals("-")) m.stopAt = Long.parseLong(a[3], 16);
         boolean[] sigOut = { false };
-        // Arg 8 (optional): boot environment, comma-separated: hp=0|1 (headphones), eep=XX (blank cart EEPROM fill).
+        // Arg 8 (optional): boot environment, comma-separated: hp=0|1 (headphones), eep=XX (blank cart EEPROM fill),
+        // model=mono|color (console model, see above).
         if (a.length > 7 && !a[7].equals("-")) {
             for (String kv : a[7].split(",")) {
                 String[] e = kv.split("=", 2);
@@ -43,6 +51,7 @@ public class WSEmulate extends GhidraScript {
                     case "cyc" -> m.cycleTiming = !e[1].equals("0");
                     case "trace" -> { String[] w = e[1].split(":"); m.traceFrom = Long.parseLong(w[0]); if (w.length > 1) m.traceLimit = Integer.parseInt(w[1]); }
                     case "sig" -> sigOut[0] = !e[1].equals("0");
+                    case "model" -> { }   // applied before the machine is built
                     default -> throw new IllegalArgumentException("unknown environment key: " + e[0]);
                 }
             }

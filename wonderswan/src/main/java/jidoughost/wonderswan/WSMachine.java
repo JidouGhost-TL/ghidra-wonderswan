@@ -346,6 +346,11 @@ public class WSMachine {
         // Internal RAM starts zeroed. Reads of never-written bytes already returned 0 (with an emulator
         // "uninitialized state" warning per access); filling it removes that log flood without changing behaviour.
         write(0, new byte[color ? WSHardware.RAM_COLOR : WSHardware.RAM_MONO]);
+        if (!color) {   // mono: internal RAM ends at 3FFFh; the rest of 0000-FFFF reads 90h (WSMan memory map)
+            byte[] open = new byte[0x10000 - WSHardware.RAM_MONO];
+            Arrays.fill(open, (byte) 0x90);
+            emu.getSharedState().setVar(addr(WSHardware.RAM_MONO), open.length, false, open);
+        }
         mapLinear(); mapBank(0xC2, 0x20000); mapBank(0xC3, 0x30000);
         if (color) {   // WSC palette RAM reads 0xFF at cartridge entry
             byte[] ff = new byte[0x200];
@@ -390,6 +395,18 @@ public class WSMachine {
         emu.getSharedState().setVar(addr(linear), b.length, false, b);
         if (sram != null)
             for (int i = 0; i < b.length; i++) if (inSramWindow(linear + i)) sram[sramOffset(linear + i)] = b[i];
+        monoUnmapped(linear, b.length);
+    }
+
+    /** Mono model: writes to 4000h-FFFFh have no effect and reads return 90h (WSMan memory map: internal RAM ends
+     *  at 3FFFh on the WonderSwan). Restores the open-bus value after any store that reached that range. */
+    private void monoUnmapped(long linear, int n) {
+        if (color) return;
+        long lo = Math.max(linear & 0xFFFFF, WSHardware.RAM_MONO), hi = Math.min((linear & 0xFFFFF) + n, 0x10000);
+        if (lo >= hi) return;
+        byte[] open = new byte[(int) (hi - lo)];
+        Arrays.fill(open, (byte) 0x90);
+        emu.getSharedState().setVar(addr(lo), open.length, false, open);
     }
 
     private static boolean inSramWindow(long linear) {
@@ -1783,6 +1800,7 @@ public class WSMachine {
             if (space != ram) return;
             long a = le(offset);
             if (memoryWatch != null) memoryWatch.access(WSMachine.this, true, a, size, le(value), t.getCounter().getOffset());
+            monoUnmapped(a, size);
             if (flashMode() && a >= 0x10000 && a < 0x20000) {
                 for (int i = 0; i < size; i++) {
                     if (flash != null) flash.write(flashOffset(a + i), value[i] & 0xFF);
