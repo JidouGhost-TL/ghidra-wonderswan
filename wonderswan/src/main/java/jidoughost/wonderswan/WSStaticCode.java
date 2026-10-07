@@ -4,6 +4,8 @@ package jidoughost.wonderswan;
 import java.math.BigInteger;
 import java.util.*;
 import java.util.function.Consumer;
+import java.util.regex.*;
+import ghidra.program.model.data.PointerDataType;
 import ghidra.app.util.PseudoDisassembler;
 import ghidra.app.util.PseudoDisassemblerContext;
 import ghidra.app.util.PseudoInstruction;
@@ -28,7 +30,10 @@ import ghidra.util.task.TaskMonitor;
  * veto a candidate. Computed transfers and unresolved bank contexts are kept
  * as unknown, with a rejection reason, except an immediate software interrupt,
  * which behaves like a call returning to its fallthrough. No execution
- * evidence is synthesized.
+ * evidence is synthesized. Before boundary seeding, finite CS-indexed near
+ * and far tables are reserved and defined as pointers. Recognized dispatches
+ * are resolved transfers; their targets use the same strict walk. All table
+ * bytes veto later starts in every file-backed alias.
  */
 public final class WSStaticCode {
     public static final String PROPERTY = "WS_STATIC_UNEXECUTED";
@@ -49,6 +54,13 @@ public final class WSStaticCode {
     private final Set<String> saveProfiles = new HashSet<>();
     private final IntPropertyMap provenance;
     private int passes, accepted, instructions, bytes, candidates;
+    private final Map<Address, Table> tables = new LinkedHashMap<>();
+    private final Set<Address> tableAttempts = new HashSet<>();
+    private final Set<Long> reservedData = new HashSet<>();
+    private record Table(Address site, Address setup, Address base, int width,
+                         List<Address> targets, String bound, String stop) { }
+    private static final Pattern TABLE_MEM = Pattern.compile(
+        "(?:word|dword) ptr CS:\\[(BX|BP|SI|DI)(?: ?([+-]) ?0x([0-9a-f]+))?\\]", Pattern.CASE_INSENSITIVE);
 
     private record Start(Address address, String evidence) { }
     private record Walk(TreeMap<Address, PseudoInstruction> code, AddressSet body,
@@ -157,8 +169,8 @@ public final class WSStaticCode {
     public static String apply(Program p, Consumer<String> output, TaskMonitor monitor) throws Exception {
         WSStaticCode rule = new WSStaticCode(p, output, monitor);
         rule.run();
-        return String.format("passes=%d candidates=%d accepted=%d instructions=%d bytes=%d rejects=%s",
-            rule.passes, rule.candidates, rule.accepted, rule.instructions, rule.bytes, rule.rejects);
+        return String.format("passes=%d candidates=%d accepted=%d instructions=%d bytes=%d tables=%d rejects=%s",
+            rule.passes, rule.candidates, rule.accepted, rule.instructions, rule.bytes, rule.tables.size(), rule.rejects);
     }
 
     private long romOffset(Address a) {
@@ -177,7 +189,7 @@ public final class WSStaticCode {
     private boolean unknown(Address a) {
         CodeUnit unit = listing.getCodeUnitContaining(a);
         long ro = romOffset(a);
-        return ro >= 0 && !definedData.contains(ro) && !codeBytes.contains(ro)
+        return ro >= 0 && !definedData.contains(ro) && !reservedData.contains(ro) && !codeBytes.contains(ro)
             && unit instanceof Data d && !d.isDefined();
     }
 
@@ -197,12 +209,302 @@ public final class WSStaticCode {
         return i;
     }
 
+
+    private Run runOf(Address a) {
+        for (Run run : runs) if (run.range().contains(a)) return run;
+        return null;
+    }
+
+    private Address segmented(Address site, int segment, int offset) {
+        SegmentedAddressSpace space = (SegmentedAddressSpace)program.getAddressFactory().getDefaultAddressSpace();
+        Address a = space.getAddress(segment, offset & 0xffff);
+        AddressSpace ss = site.getAddressSpace();
+        if (ss.isOverlaySpace() && memory.contains(ss.getAddress(a.getOffset())))
+            return ss.getAddress(a.getOffset());
+        return a;
+    }
+
+    private String compact(Instruction i) { return i.toString().toUpperCase().replace(" ", ""); }
+    private int immediate(String t) { return WSJumpTables.hex(t); }
+
+    // Decode only short, contiguous setup slices. An existing listing offcut
+    // or a non-fallthrough instruction cannot be used as a slice origin.
+    private List<List<Instruction>> slices(Address site, Run run, int segment) {
+        List<List<Instruction>> result = new ArrayList<>();
+        int at = indexOf(run, site);
+        for (int k = Math.max(0, at - 48); k < at; k++) {
+            Address a = addrOf(run, k);
+            if (!unknown(a) && listing.getInstructionAt(a) == null) continue;
+            List<Instruction> slice = new ArrayList<>();
+            try {
+                for (int n = 0; n < 16 && a.compareTo(site) < 0; n++) {
+                    Instruction i = listing.getInstructionAt(a);
+                    if (i == null) i = decode(a, segment);
+                    if (i.getFallThrough() == null || !i.getFallThrough().equals(i.getMaxAddress().next()) ||
+                        i.getFlowType().isCall() || i.getFlowType().isComputed() || i.getFlowType().isTerminal()) break;
+                    for (int z = 0; z < i.getLength(); z++) {
+                        Address q = a.add(z);
+                        if (listing.getInstructionAt(a) == null && !unknown(q)) throw new Reject("slice-overlap");
+                    }
+                    slice.add(i); a = i.getFallThrough();
+                }
+                if (a.equals(site) && !slice.isEmpty()) result.add(slice);
+            } catch (Exception ex) { /* not an aligned setup */ }
+        }
+        return result;
+    }
+
+    private Table describeTable(Instruction site, List<Instruction> slice, int segment) throws Exception {
+        boolean far = site.getMnemonicString().endsWith("F");
+        // Far memory operands omit the segment override in their display;
+        // the encoded CS prefix supplies that evidence explicitly.
+        String operand = site.toString();
+        if (far && site.getBytes()[0] == (byte)0x2e)
+            operand = operand.replace("[", "dword ptr CS:[");
+        Matcher m = TABLE_MEM.matcher(operand);
+        int width = far ? 4 : 2;
+        Instruction load = site;
+        int loadAt = slice.size();
+        if (!m.find()) {
+            if (!site.getFlowType().isCall() || site.getNumOperands() != 1 || site.getRegister(0) == null) return null;
+            String dest = site.getRegister(0).getName().toUpperCase();
+            load = null;
+            for (int k = slice.size()-1; k >= 0; k--) {
+                Instruction q = slice.get(k); String t = compact(q);
+                if (t.startsWith("MOV" + dest + ",")) { load = q; loadAt = k; break; }
+                if (WSJumpTables.writesReg(q, t, dest, program.getRegister(dest))) return null;
+                if (slice.size()-k > 3) return null;
+            }
+            if (load == null) return null;
+            m = TABLE_MEM.matcher(load.toString());
+            if (!m.find()) return null;
+            far = false; width = 2;
+        }
+        String idx = m.group(1).toUpperCase();
+        int base = WSJumpTables.disp(m);
+        boolean constant = base != 0;
+        int scale = 0, firstScale = loadAt;
+        String index = idx;
+        Address setup = null;
+        for (int k = loadAt-1; k >= 0; k--) {
+            Instruction q = slice.get(k); String t = compact(q);
+            if (t.startsWith("MOV"+idx+",0X")) {
+                // Before scaling this is the index's initial value, whereas
+                // an unscaled register receiving a constant holds the base.
+                if(scale==0 || !index.equals(idx)) { base += immediate(t); constant=true; }
+                setup=q.getAddress(); break;
+            }
+            if (t.startsWith("LEA"+idx+",[0X")) { base += immediate(t); constant = true; setup = q.getAddress(); break; }
+            if (t.startsWith("ADD"+idx+",0X")) { base += immediate(t); constant = true; setup = q.getAddress(); continue; }
+            if (t.matches("ADD"+idx+",(BX|CX|DX|AX|SI|DI|BP)") && !t.equals("ADD"+idx+","+idx)) {
+                index = t.substring(t.indexOf(',')+1); setup = q.getAddress(); continue;
+            }
+            if (t.equals("ADD"+idx+","+idx) || t.equals("SHL"+idx+",1") || t.equals("SHL"+idx+",0X1") ||
+                width == 4 && (t.equals("SHL"+idx+",0X2") || t.equals("SHL"+idx+",2"))) {
+                scale += t.endsWith(",2") || t.endsWith(",0X2") ? 2 : 1;
+                firstScale = Math.min(firstScale,k); setup = q.getAddress(); continue;
+            }
+            if (WSJumpTables.writesReg(q, t, idx, program.getRegister(idx))) {
+                // The source index load is part of the dispatcher setup.
+                if (t.startsWith("MOV") || t.startsWith("XOR")) setup = q.getAddress();
+                break;
+            }
+        }
+        if (!index.equals(idx)) {
+            for (int k = 0; k < loadAt; k++) {
+                String t = compact(slice.get(k));
+                if (t.equals("SHL"+index+",1") || t.equals("SHL"+index+",0X1") || t.equals("ADD"+index+","+index) ||
+                    width == 4 && (t.equals("SHL"+index+",2") || t.equals("SHL"+index+",0X2"))) {
+                    scale += t.endsWith(",2") || t.endsWith(",0X2") ? 2 : 1;
+                    firstScale = Math.min(firstScale,k);
+                }
+            }
+        }
+        if (!constant || scale != (width == 4 ? 2 : 1) || setup == null) return null;
+        // Prefer the earlier byte-index load/clear immediately before scaling.
+        int sk = 0;
+        while (sk < slice.size() && !slice.get(sk).getAddress().equals(setup)) sk++;
+        for (int k = sk-1; k >= Math.max(0, sk-2); k--) {
+            Instruction q = slice.get(k); String t = compact(q);
+            String low = index.length()==2 && index.endsWith("X") ? index.charAt(0)+"L" : index;
+            String high = index.length()==2 && index.endsWith("X") ? index.charAt(0)+"H" : index;
+            if (t.startsWith("MOV"+low+",") || t.equals("XOR"+high+","+high)) setup=q.getAddress(); else break;
+        }
+        int count = -1; String bound = "plausible-target-run";
+        for (int k = 0; k+1 < firstScale; k++) {
+            Instruction q = slice.get(k); String t = compact(q);
+            if (!t.startsWith("CMP"+index+",0X")) continue;
+            boolean clobbered=false;
+            for(int z=k+2;z<firstScale;z++) {
+                Instruction between=slice.get(z);
+                if(WSJumpTables.writesReg(between,compact(between),index,program.getRegister(index))) clobbered=true;
+            }
+            if(clobbered) continue;
+            String branch = slice.get(k+1).getMnemonicString();
+            if (branch.equals("JA") || branch.equals("JBE")) count = immediate(t)+1;
+            else if (branch.equals("JNC") || branch.equals("JAE") || branch.equals("JC") || branch.equals("JB")) count = immediate(t);
+            else continue;
+            // Only a branch away from the dispatch fallthrough is a bound.
+            if (!branch.equals("JA") && !branch.equals("JNC") && !branch.equals("JAE")) { count=-1; continue; }
+            bound = q + "; " + slice.get(k+1);
+            if(q.getAddress().compareTo(setup)<0) setup=q.getAddress();
+            break;
+        }
+        if (count > 256 || count == 0) return null;
+        Address table = segmented(site.getAddress(), segment, base);
+        if (runOf(table) == null) return null;
+        if (listing.getInstructionAt(site.getAddress()) == null && Math.abs(table.subtract(site.getAddress())) > 4096) return null;
+        List<Address> targets = new ArrayList<>();
+        String stop = "cap"; long min = Long.MAX_VALUE, max = Long.MIN_VALUE;
+        for (int k = 0; k < (count < 0 ? 256 : count); k++) {
+            Address slot = table.add((long)width*k);
+            Address slotEnd = slot.add(width-1);
+            if (targets.stream().anyMatch(t -> t.compareTo(slot)>=0 && t.compareTo(slotEnd)<=0)) { stop="own-target"; break; }
+            boolean slotOK = true;
+            for (int z=0; z<width; z++) {
+                Address q=slot.add(z); long ro=romOffset(q);
+                if (ro<0 || codeBytes.contains(ro) || listing.getInstructionContaining(q)!=null) slotOK=false;
+            }
+            if (!slotOK) { stop="slot-not-data"; break; }
+            int off = memory.getShort(slot)&0xffff;
+            int seg = far ? memory.getShort(slot.add(2))&0xffff : segment;
+            Address target = segmented(site.getAddress(), seg, off);
+            MemoryBlock block = memory.getBlock(target);
+            Instruction existing = listing.getInstructionContaining(target);
+            if (block==null || !block.isExecute() || !block.isInitialized() || runOf(target)==null ||
+                WonderSwanLoader.isDataOverlay(block) || target.equals(slot) ||
+                existing!=null && !existing.getAddress().equals(target) ||
+                existing==null && !unknown(target)) { stop="implausible-target"; break; }
+            try { if (existing==null) decode(target, seg); }
+            catch (Exception ex) { stop="undecodable-target"; break; }
+            if (count<0 && !targets.isEmpty() && Math.abs(target.getOffset()-targets.get(targets.size()-1).getOffset())>8192) {
+                stop="target-cluster-end"; break;
+            }
+            min=Math.min(min,target.getOffset()); max=Math.max(max,target.getOffset());
+            if (count<0 && max-min>32768) { stop="target-cluster-end"; break; }
+            targets.add(target);
+        }
+        if (count>=0 && targets.size()!=count || count<0 && (targets.size()<3 || stop.equals("cap"))) return null;
+        if ((base & 0xffff) + targets.size()*width > 0x10000) return null;
+        Address end = table.add((long)targets.size()*width-1);
+        for (Address target : targets) if (target.getAddressSpace().equals(table.getAddressSpace()) &&
+            target.compareTo(table)>=0 && target.compareTo(end)<=0) return null;
+        return new Table(site.getAddress(),setup,table,width,List.copyOf(targets),bound,count>=0 ? "index-limit" : stop);
+    }
+
+    private void recoverTables() throws Exception {
+        List<Table> found = new ArrayList<>();
+        for (Run run : runs) {
+            byte[] raw=run.raw();
+            for (int k=0;k+2<raw.length;k++) {
+                int b=raw[k]&255;
+                boolean memorySite = b==0x2e && raw[k+1]==(byte)0xff && ((raw[k+2]>>3)&7)>=2 && ((raw[k+2]>>3)&7)<=5;
+                boolean registerCall = b==0xff && (raw[k+1]&0xf8)==0xd0;
+                if (!memorySite && !registerCall) continue;
+                Address site=addrOf(run,k);
+                if (tables.containsKey(site) || tableAttempts.contains(site)) continue;
+                if (!unknown(site) && listing.getInstructionAt(site)==null) continue;
+                int segment=cs(site); if(segment<0) continue;
+                Instruction ins;
+                try { ins=listing.getInstructionAt(site); if(ins==null) ins=decode(site,segment); }
+                catch(Exception ex) { continue; }
+                if (!ins.getFlowType().isComputed() || !(ins.getFlowType().isCall() || ins.getFlowType().isJump())) continue;
+                for (List<Instruction> slice : slices(site,run,segment)) {
+                    Table table;
+                    try { table=describeTable(ins,slice,segment); } catch(Exception ex) { continue; }
+                    if(table==null) continue;
+                    tables.put(site,table);
+                    List<Long> reserved=new ArrayList<>();
+                    for(int z=0;z<table.targets().size()*table.width();z++) {
+                        long ro=romOffset(table.base().add(z));
+                        if(reservedData.add(ro)) reserved.add(ro);
+                    }
+                    try {
+                        if(listing.getInstructionAt(site)==null) {
+                            Run setupRun=runOf(table.setup());
+                            walk(table.setup(),site,segment,setupRun);
+                        }
+                        found.add(table); tableAttempts.add(site); break;
+                    } catch(Exception ex) {
+                        tables.remove(site); reservedData.removeAll(reserved);
+                    }
+                }
+            }
+        }
+        // Any proven dispatch target is code, including a target of another
+        // table. Establish these boundaries globally before defining slots.
+        Set<Long> entries = new HashSet<>();
+        for (Table table : tables.values()) for(Address target : table.targets()) entries.add(romOffset(target));
+        for (int n=0; n<found.size(); n++) {
+            Table table=found.get(n); int limit=table.targets().size();
+            for(int k=0; k<limit; k++) {
+                Address slot=table.base().add((long)k*table.width());
+                for(int z=0; z<table.width(); z++)
+                    if(entries.contains(romOffset(slot.add(z)))) { limit=k; break; }
+            }
+            if(limit == 0 || limit < table.targets().size() && !table.bound().equals("plausible-target-run")) {
+                tables.remove(table.site()); found.remove(n--); continue;
+            }
+            if(limit < table.targets().size()) {
+                Table trimmed=new Table(table.site(),table.setup(),table.base(),table.width(),
+                    List.copyOf(table.targets().subList(0,limit)),table.bound(),"dispatch-target-boundary");
+                found.set(n,trimmed); tables.put(table.site(),trimmed);
+            }
+        }
+        reservedData.clear();
+        for(Table table : tables.values())
+            for(int z=0;z<table.targets().size()*table.width();z++) reservedData.add(romOffset(table.base().add(z)));
+        // Recheck provisional dispatcher walks against every reserved object.
+        // Discovery must not commit code before a later table can veto it.
+        for (Iterator<Table> it=found.iterator();it.hasNext();) {
+            Table table=it.next();
+            if(listing.getInstructionAt(table.site())!=null) continue;
+            try { walk(table.setup(),table.site(),cs(table.site()),runOf(table.setup())); }
+            catch(Reject ex) { tables.remove(table.site()); it.remove(); }
+        }
+        reservedData.clear();
+        for(Table table : tables.values())
+            for(int z=0;z<table.targets().size()*table.width();z++) reservedData.add(romOffset(table.base().add(z)));
+        // Mark all discovered objects before walking any target. This ordering
+        // also protects tables discovered in aliases of the same ROM bytes.
+        for(Table table : found) {
+            for(int k=0;k<table.targets().size();k++) {
+                Address slot=table.base().add((long)k*table.width());
+                boolean undef=true;
+                for(int z=0;z<table.width();z++) {
+                    CodeUnit u=listing.getCodeUnitContaining(slot.add(z));
+                    if(!(u instanceof Data d) || d.isDefined()) undef=false;
+                }
+                if(undef) listing.createData(slot,new PointerDataType(null,table.width(),program.getDataTypeManager()),table.width());
+                for(int z=0;z<table.width();z++) definedData.add(romOffset(slot.add(z)));
+                program.getReferenceManager().addMemoryReference(slot,table.targets().get(k),RefType.DATA,SourceType.ANALYSIS,0);
+            }
+            emit.accept(String.format("{\"rule\":\"static-table\",\"event\":\"table\",\"site\":\"%s\",\"setup\":\"%s\",\"table_start\":\"%s\",\"table_end\":\"%s\",\"rom_start\":\"%06x\",\"rom_end\":\"%06x\",\"width\":%d,\"entries\":%d,\"bound\":\"%s\",\"stop\":\"%s\",\"targets\":%s}",
+                table.site(),table.setup(),table.base(),table.base().add((long)table.width()*table.targets().size()-1),
+                romOffset(table.base()),romOffset(table.base())+table.width()*table.targets().size(),table.width(),table.targets().size(),
+                table.bound(),table.stop(),table.targets().stream().map(a->"\""+a+"\"").toList()));
+        }
+        for(Table table : found) {
+            if(!unknown(table.setup()) || listing.getInstructionAt(table.site())!=null) continue;
+            int segment=cs(table.site());
+            Walk dispatch=walk(table.setup(),table.site(),segment,runOf(table.setup()));
+            commit(new Start(table.setup(),"table-dispatch"),table.site(),segment,dispatch);
+        }
+        for(Table table : tables.values()) for(Address target : new LinkedHashSet<>(table.targets())) {
+            if(!unknown(target)) continue;
+            int segment=table.width()==2 ? cs(table.site()) : target instanceof SegmentedAddress sa ? sa.getSegment() : cs(target);
+            try { commit(new Start(target,"table-pointer"),null,segment,walk(target,null,segment,runOf(target))); }
+            catch(Reject ex) { emit.accept(String.format("{\"rule\":\"static-table\",\"event\":\"target-reject\",\"site\":\"%s\",\"target\":\"%s\",\"reason\":\"%s\"}",table.site(),target,ex.getMessage())); }
+        }
+    }
+
     private void run() throws Exception {
         while (true) {
             monitor.checkCancelled(); passes++;
             known.clear();
             for (Function f : program.getFunctionManager().getFunctions(true)) known.add(f.getEntryPoint());
             int before = accepted;
+            recoverTables();
             Set<Address> tried = new HashSet<>();
             for (Run run : runs) {
                 byte[] raw = run.raw();
@@ -453,12 +755,14 @@ public final class WSStaticCode {
             byte[] encoded = i.getBytes();
             boolean softInterrupt = flow.isComputed() && flow.isCall() && !flow.isJump()
                 && i.getMnemonicString().equals("INT") && encoded.length == 2 && encoded[0] == (byte)0xcd;
-            if (flow.isComputed() && !softInterrupt) throw new Reject("computed-transfer");
+            Table table = tables.get(a);
+            boolean resolvedTable = flow.isComputed() && table != null;
+            if (flow.isComputed() && !softInterrupt && !resolvedTable) throw new Reject("computed-transfer");
             code.put(a, i); body.add(a, i.getMaxAddress());
             if (flow.isCall() && Arrays.stream(i.getFlows()).anyMatch(known::contains)) evidenceCount[0]++;
             Set<Address> next = new HashSet<>(); edges.put(a, next);
             Address[] targets = i.getFlows();
-            if ((flow.isCall() || flow.isJump()) && !softInterrupt) {
+            if ((flow.isCall() || flow.isJump()) && !softInterrupt && !resolvedTable) {
                 if (targets.length == 0) throw new Reject("unresolved-transfer");
                 for (Address target : targets) {
                     transfers.add(target);
@@ -469,7 +773,11 @@ public final class WSStaticCode {
                         throw new Reject("call-not-start-or-unknown");
                 }
             }
-            if (flow.isTerminal()) {
+            if (resolvedTable && flow.isJump()) {
+                // A proven finite dispatch is an end of this fragment. Its
+                // destinations are each checked by this same strict walk.
+                ends.add(a);
+            } else if (flow.isTerminal()) {
                 if (!i.getMnemonicString().startsWith("RET") && !i.getMnemonicString().equals("IRET"))
                     throw new Reject("non-return-terminal");
                 ends.add(a);
@@ -477,10 +785,13 @@ public final class WSStaticCode {
                 next.add(i.getFallThrough()); queue.add(i.getFallThrough());
             } else if (!flow.isJump()) throw new Reject("no-flow-end");
         }
-        if (!code.containsKey(anchor)) throw new Reject("anchor-not-reached");
-        PseudoInstruction call = code.get(anchor);
-        if (!call.getFlowType().isCall() || Arrays.stream(call.getFlows()).noneMatch(known::contains))
-            throw new Reject("anchor-not-known-call");
+        if (anchor != null) {
+            if (!code.containsKey(anchor)) throw new Reject("anchor-not-reached");
+            PseudoInstruction call = code.get(anchor);
+            if (!tables.containsKey(anchor) && (!call.getFlowType().isCall() ||
+                Arrays.stream(call.getFlows()).noneMatch(known::contains)))
+                throw new Reject("anchor-not-known-call");
+        }
         for (Address target : transfers)
             if (body.contains(target) && !code.containsKey(target)) throw new Reject("transfer-into-operand");
         // Reverse reachability requires a flow end even for a branch cycle.
