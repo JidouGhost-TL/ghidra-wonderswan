@@ -82,10 +82,10 @@ public class WSCompilerRulesTest {
         assertEquals(0.05, WSCompilerRules.shareSs(e, 0), 1e-9);
     }
 
-    // Mesen evidence carries per-address SS from the trace window (coverage logs
+    // Reference-trace evidence carries per-address SS from the trace window (coverage logs
     // have no SS column, so only traced addresses contribute).
     @Test
-    public void fromMesenCarriesTraceSs() {
+    public void traceEvidenceCarriesSs() {
         WSMesenTrace.TraceData t = new WSMesenTrace.TraceData();
         t.firstCs.put(0x0123L, 0);
         t.ds.put(0x0123L, Set.of(0));

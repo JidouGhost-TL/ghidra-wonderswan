@@ -146,7 +146,7 @@ public class WSMesenTraceTest {
         check(e.windowBanks.get(0x20010L).equals(Set.of(0xf2, 0xff)), "mesen window banks union");
         check(e.ds.get(0xb0003L).equals(Set.of(0x1000)), "mesen ds union");
         check(e.ds.containsKey(0x15000L), "mesen ds covers unseeded sram");
-        check(e.ss.get(0xb0003L).equals(Set.of(0x1000)), "mesen ss from trace");
+        check(e.ss.get(0xb0003L).equals(Set.of(0x1000)), "ss from the trace window");
         check(e.transfers.size() == 5, "mesen transfers carried");
         WSEvidence.MesenStats m = e.mesenStats;
         check(m.csFromTrace() == 6, "mesen csFromTrace");

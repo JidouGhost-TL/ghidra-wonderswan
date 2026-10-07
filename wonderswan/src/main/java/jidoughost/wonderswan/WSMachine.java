@@ -145,7 +145,7 @@ public class WSMachine {
     public final Map<String, Integer> edges = new TreeMap<>();
     /** Pending computed-branch edges and interrupt-nesting depth (rule E0b). */
     public final WSComputedEdges computedEdges = new WSComputedEdges();
-    /** Visits per executed address; DS/ES/SS sets are sampled for the first 64 visits (as the Mesen trace does). */
+    /** Visits per executed address; DS/ES/SS sets are sampled for the first 64 visits (as the reference trace capture does). */
     private final int[] visits = new int[0x110000];
     private final Map<Long, Integer> visitOverflow = new HashMap<>();
     private final Integer[] observedBanks = new Integer[0x10000];
