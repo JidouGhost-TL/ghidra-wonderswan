@@ -218,6 +218,21 @@ public class WSMachine {
     private int sweepTimer = 0, sweepScaler = 0;
     /** Cycles of the current IN before its port read (6 imm / 5 DX) for sweep read-early. */
     private int curInBefore = 0;
+    /**
+     * Cycle-timed mode: an OUT's port write takes effect at the end of the instruction, after the display events of
+     * the cycles it spans. Writes are queued while the instruction executes and applied once its cycles are charged,
+     * so an interrupt acknowledge (port B6) issued by an OUT that straddles HBlank cycle 224 also clears the
+     * HBlank-timer request latched during it. Evidence: cycle-exact reference traces, where a handler's acknowledge
+     * spanning cycles 220-226 leaves no pending HBlank-timer interrupt (WSdev gives OUT's cycle count, not the
+     * position of its I/O write).
+     */
+    private boolean deferIoWrites = false;
+    private final List<int[]> deferredIo = new ArrayList<>();
+    private void flushDeferredIo() {
+        if (deferredIo.isEmpty()) return;
+        for (int[] w : deferredIo) portOut(w[0], w[1], w[2]);
+        deferredIo.clear();
+    }
     /** Split word accesses (odd or 8-bit bus) seen during the current instruction. */
     private int curSplitWords = 0;
     /** Cycle-timed mode: data/port bus accesses of the current instruction (split accesses counted twice) and
@@ -1476,6 +1491,8 @@ public class WSMachine {
             timing.flush(linearPC());
         }
         long prevPc = -1;
+        deferIoWrites = true;
+        try {
         for (int f = 0; f < frames; f++) {
             if (onFrame != null) onFrame.accept(f);
             long frameStart = cycles;
@@ -1492,6 +1509,7 @@ public class WSMachine {
                     thread.stepInstruction();
                     finishRepExit(pcBefore);
                 } catch (RuntimeException e) {
+                    flushDeferredIo();
                     if (onFault == null || !onFault.test(this, e)) throw e;
                     suppressIrq = suppressTrap = false;
                     prevPc = -1;
@@ -1505,12 +1523,14 @@ public class WSMachine {
                 tickOverride = true;
                 try { timing.instruction(curBytes, taken, pcAfter, curAccesses, repFirst, repMore, curInterrupted, curEntryAccesses); }
                 finally { tickOverride = false; }
+                flushDeferredIo();
                 afterStep();                                     // single-step trap (charged as an interrupt)
                 prevPc = pcBefore;
                 if (stopped) throw new IllegalStateException(String.format("stopAt %05x reached", stopAt));
                 if (cycles - frameStart > 4L * CYCLES_PER_FRAME) break;   // display off: end the frame anyway
             }
         }
+        } finally { flushDeferredIo(); deferIoWrites = false; }
     }
 
     // ------------------------------------------------------------------ debugger hooks
@@ -1714,7 +1734,8 @@ public class WSMachine {
             suppressTrap = tfSet || ssLoad;
             for (Varnode out : pendingIoWrites) {
                 byte[] b = emu.getSharedState().getVar(out.getAddress(), out.getSize(), false, Reason.INSPECT);
-                portOut((int) out.getOffset() & 0xFF, out.getSize(), (int) le(b));
+                if (deferIoWrites) deferredIo.add(new int[] { (int) out.getOffset() & 0xFF, out.getSize(), (int) le(b) });
+                else portOut((int) out.getOffset() & 0xFF, out.getSize(), (int) le(b));
                 accessCounters.increment(WSAccessCounters.OUT);
             }
             pendingIoWrites = noIoWrites;
