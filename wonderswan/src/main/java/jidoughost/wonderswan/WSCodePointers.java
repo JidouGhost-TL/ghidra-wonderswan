@@ -34,6 +34,8 @@ import ghidra.util.task.TaskMonitor;
  *     at every call to it the constant values of those registers are code pointers (F2 applied to the call site).
  * F4  pushed return address: the constant segment:offset pair pushed directly below the dispatch pair of an F1
  *     push-return dispatch is where the dispatched code returns: code (no function, it continues the caller).
+ * F5  unreferenced short data that an accepted target's straight-line flow runs through is cleared first (see
+ *     clearWeakDataInFlow), so a loose analysis guess cannot cut a pointer-proven routine down to one instruction.
  * A target is accepted only when it lies in an initialised executable block, does not fall inside an existing
  * instruction or defined data, and decodes; otherwise it is reported (OFFCUT, DATA, UNDECODABLE, WINDOW (bank
  * unknown), RAM, OUT_OF_ROM). The rule repeats until no new targets appear (new code can hold more stores).
@@ -95,8 +97,8 @@ final class WSCodePointers {
     }
 
     String summary() {
-        return String.format("F1-F4 code pointers: far variables %d, near variables %d, passes %d, new functions %d, new code %d, return points %d, existing %d, rejected %d %s",
-            farVars.size(), nearVars.size(), passes, newFunctions, newCode, returnPoints, existing, rejected, rejects);
+        return String.format("F1-F5 code pointers: far variables %d, near variables %d, passes %d, new functions %d, new code %d, return points %d, existing %d, rejected %d %s, weak data cleared %d",
+            farVars.size(), nearVars.size(), passes, newFunctions, newCode, returnPoints, existing, rejected, rejects, weakDataCleared);
     }
 
     // ---- one pass ------------------------------------------------------------------------------------------
@@ -152,6 +154,48 @@ final class WSCodePointers {
         for (Target t : targets) if (accept(t)) accepted++;
         return accepted;
     }
+
+    /** F5: unreferenced defined data inside a pointer target's straight-line flow does not block it. The target is
+     *  decoded ahead (no listing change) up to its first terminator; every defined datum the decode crosses must be
+     *  short (at most 8 bytes), have no references and not be user-defined. Only if the whole run decodes to a
+     *  terminator is that data cleared, so the code-pointer evidence wins over an analysis guess about loose bytes.
+     *  Anything else (a decode error, an existing instruction, referenced or long data) leaves the listing as it is. */
+    void clearWeakDataInFlow(Address a, Target t) throws Exception {
+        ghidra.app.util.PseudoDisassembler pd = new ghidra.app.util.PseudoDisassembler(p);
+        List<Data> weak = new ArrayList<>();
+        Address cur = a;
+        for (int n = 0; n < 64 && cur != null; n++) {
+            ghidra.app.util.PseudoInstruction pi;
+            try { pi = pd.disassemble(cur); } catch (Exception e) { return; }
+            if (pi == null) return;
+            for (Address x = pi.getMinAddress(); x.compareTo(pi.getMaxAddress()) <= 0; x = x.next()) {
+                if (listing.getInstructionContaining(x) != null) return;
+                Data d = listing.getDefinedDataContaining(x);
+                if (d == null) continue;
+                if (weak.contains(d)) continue;
+                if (d.getLength() > 8 || p.getReferenceManager().getReferencesTo(d.getMinAddress()).hasNext()
+                        || d.getMinAddress().compareTo(a) < 0) return;
+                SourceType src = null;
+                Symbol sym = p.getSymbolTable().getPrimarySymbol(d.getMinAddress());
+                if (sym != null) src = sym.getSource();
+                if (src == SourceType.USER_DEFINED || src == SourceType.IMPORTED) return;
+                weak.add(d);
+            }
+            ghidra.program.model.symbol.FlowType ft = pi.getFlowType();
+            if (ft.isTerminal() || (ft.isJump() && !ft.isConditional())) {
+                for (Data d : weak) {
+                    listing.clearCodeUnits(d.getMinAddress(), d.getMaxAddress(), false);
+                    weakDataCleared++;
+                    emit.accept(String.format("{\"rule\":\"F5\",\"target\":\"%s\",\"data\":\"%s\",\"length\":%d,\"via\":\"%s\",\"outcome\":\"DATA_CLEARED\"}",
+                        a, d.getMinAddress(), d.getLength(), t.via()));
+                }
+                return;
+            }
+            cur = pi.getFallThrough();
+        }
+    }
+
+    int weakDataCleared;
 
     boolean isFarVar(long m) { return farVars.containsKey(m) || (m < 0x400 && (m & 3) == 0); }
 
@@ -427,6 +471,7 @@ final class WSCodePointers {
             ctx.setValue(csval, a, a, BigInteger.valueOf(t.seg()));
             BigInteger soc = colorsoc == null || t.from() == null ? null : ctx.getValue(colorsoc, t.from(), false);
             if (soc != null) ctx.setValue(colorsoc, a, a, soc);
+            clearWeakDataInFlow(a, t);
             new DisassembleCommand(a, null, true).applyTo(p, monitor);
             outcome = "NEW_CODE";
             newCode++;
