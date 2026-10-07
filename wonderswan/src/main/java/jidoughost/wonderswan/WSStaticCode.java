@@ -29,7 +29,9 @@ import ghidra.util.task.TaskMonitor;
  * such edges at runtime. Defined data and inconsistent file-backed aliases
  * veto a candidate. Computed transfers and unresolved bank contexts are kept
  * as unknown, with a rejection reason, except an immediate software interrupt,
- * which behaves like a call returning to its fallthrough. No execution
+ * which behaves like a call returning to its fallthrough. Once the stricter
+ * rules settle, indirect calls can also be walked through their fallthrough
+ * without claiming a destination. No execution
  * evidence is synthesized. Before boundary seeding, finite CS-indexed near
  * and far tables are reserved and defined as pointers. Recognized dispatches
  * are resolved transfers; their targets use the same strict walk. All table
@@ -610,6 +612,7 @@ public final class WSStaticCode {
     }
 
     private void run() throws Exception {
+        allowIndirectCalls = false;
         while (true) {
             monitor.checkCancelled(); passes++;
             known.clear();
@@ -664,9 +667,16 @@ public final class WSStaticCode {
             // boundary search that previously recovered its caller's bytes.
             if (accepted == before) followDirectTargets();
             emit.accept(String.format("{\"rule\":\"static-call\",\"pass\":%d,\"accepted_total\":%d}", passes, accepted));
-            if (accepted == before) break;
+            if (accepted == before) {
+                if (allowIndirectCalls) break;
+                // Preserve all recovery from the stricter rules before
+                // expanding bodies containing returning indirect calls.
+                allowIndirectCalls = true;
+            }
         }
     }
+
+    private boolean allowIndirectCalls;
 
     // Existing instructions supply an aligned destination directly. A callee
     // need not contain a call to another known entry to become a candidate.
@@ -902,14 +912,17 @@ public final class WSStaticCode {
             byte[] encoded = i.getBytes();
             boolean softInterrupt = flow.isComputed() && flow.isCall() && !flow.isJump()
                 && i.getMnemonicString().equals("INT") && encoded.length == 2 && encoded[0] == (byte)0xcd;
+            boolean opaqueCall = softInterrupt || allowIndirectCalls && flow.isComputed()
+                && flow.isCall() && !flow.isJump() && i.getFallThrough() != null
+                && (i.getMnemonicString().equals("CALL") || i.getMnemonicString().equals("CALLF"));
             Table table = tables.get(a);
             boolean resolvedTable = flow.isComputed() && table != null;
-            if (flow.isComputed() && !softInterrupt && !resolvedTable) throw new Reject("computed-transfer");
+            if (flow.isComputed() && !opaqueCall && !resolvedTable) throw new Reject("computed-transfer");
             code.put(a, i); body.add(a, i.getMaxAddress());
             if (flow.isCall() && Arrays.stream(i.getFlows()).anyMatch(known::contains)) evidenceCount[0]++;
             Set<Address> next = new HashSet<>(); edges.put(a, next);
             Address[] targets = i.getFlows();
-            if ((flow.isCall() || flow.isJump()) && !softInterrupt && !resolvedTable) {
+            if ((flow.isCall() || flow.isJump()) && !opaqueCall && !resolvedTable) {
                 if (targets.length == 0) throw new Reject("unresolved-transfer");
                 for (Address target : targets) {
                     transfers.add(target);

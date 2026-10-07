@@ -70,6 +70,13 @@ public class WSDirectFixtures extends GhidraScript {
         fixture("weak-target","e8bd00","0000c3",false);
         fixture("unmapped-call","e8bd00","9a00000020c3",false);
         fixture("computed-source","ffd0","b80100c3",false);
+        fixture("indirect-register","e8bd00","ffd0b80100c3",true);
+        fixture("indirect-memory","e8bd00","2eff970003b80100c3",true);
+        fixture("indirect-far","e8bd00","2eff1fb80100c3",true);
+        fixture("indirect-jump","e8bd00","ffe0",false);
+        fixture("indirect-unmapped-direct-call","e8bd00","ffd09a00000020c3",false);
+        fixture("indirect-weak-body","e8bd00","ffd00000c3",false);
+        fixture("indirect-no-flow-end","e8bd00","ffd0ebfe",false);
         println("WSDirectFixtures: PASS checks="+checks);
     }
 }
