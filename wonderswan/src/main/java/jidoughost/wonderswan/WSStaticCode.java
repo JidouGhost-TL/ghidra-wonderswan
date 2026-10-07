@@ -659,8 +659,44 @@ public final class WSStaticCode {
                     }
                 }
             }
+            // Preserve the existing rules' fixed point before adding explicit
+            // destinations. Otherwise a callee committed early can cut off a
+            // boundary search that previously recovered its caller's bytes.
+            if (accepted == before) followDirectTargets();
             emit.accept(String.format("{\"rule\":\"static-call\",\"pass\":%d,\"accepted_total\":%d}", passes, accepted));
             if (accepted == before) break;
+        }
+    }
+
+    // Existing instructions supply an aligned destination directly. A callee
+    // need not contain a call to another known entry to become a candidate.
+    // Snapshot the callers: transfers discovered in newly accepted bodies
+    // are considered in the next pass, under the same data and walk vetoes.
+    private void followDirectTargets() throws Exception {
+        List<Instruction> sources = new ArrayList<>();
+        for (Instruction i : listing.getInstructions(true)) {
+            var flow = i.getFlowType();
+            if (runOf(i.getAddress()) != null && !flow.isComputed() &&
+                (flow.isCall() || flow.isJump())) sources.add(i);
+        }
+        Set<Address> tried = new HashSet<>();
+        for (Instruction source : sources) {
+            monitor.checkCancelled();
+            for (Address target : source.getFlows()) {
+                Run run = runOf(target);
+                if (run == null || !unknown(target) || !tried.add(target)) continue;
+                int segment = cs(target);
+                if (segment < 0) continue;
+                Start start = new Start(target, source.getFlowType().isCall()
+                    ? "direct-call-target" : "code-reference");
+                candidates++;
+                try {
+                    commit(start, source.getAddress(), segment, walk(target, null, segment, run));
+                } catch (Reject ex) {
+                    rejects.merge(ex.getMessage(), 1, Integer::sum);
+                    logReject(source.getAddress(), start, ex.evidenceCount, ex.getMessage());
+                }
+            }
         }
     }
 
