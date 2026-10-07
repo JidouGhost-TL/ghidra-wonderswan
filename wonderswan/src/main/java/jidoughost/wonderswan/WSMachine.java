@@ -216,6 +216,8 @@ public class WSMachine {
     private boolean sdmaDec = false, sdmaHyper = false;
     /** Channel-3 sweep counters (visible freq in 84/85, value 8C, period 8D, ctrl 90, test 95). */
     private int sweepTimer = 0, sweepScaler = 0;
+    /** Channel-4 noise LFSR (control 8E, read back in 92/93); clocked by channel 4's period in cycle-timed mode. */
+    final WSNoise noise = new WSNoise();
     /** Cycles of the current IN before its port read (6 imm / 5 DX) for sweep read-early. */
     private int curInBefore = 0;
     /**
@@ -569,7 +571,11 @@ public class WSMachine {
             case 0x02: return currentLine;
             case 0x91:   // sound output control; bit 7 is read-only: headphone adapter connected (environment)
                 return (ports[0x91] & 0x7F) | (headphones ? 0x80 : 0)
-                    | (size == 2 ? ports[0x92] << 8 : 0);
+                    | (size == 2 ? (noiseRead() & 0xFF) << 8 : 0);
+            case 0x92: case 0x93: {   // REG_SND_RANDOM: the 15-bit noise LFSR (read only)
+                int r = noiseRead();
+                return port == 0x92 ? (size == 2 ? r : r & 0xFF) : r >> 8;
+            }
             case 0x43: case 0x4D: case 0x51: case 0x53: return 0;   // DMA gaps read 0
             case 0x84: case 0x85: {   // CH3 freq: sweep counts cycles; IN reads a cycle early
                 int f = (ports[0x84] | ports[0x85] << 8) & 0xFFF;
@@ -643,6 +649,8 @@ public class WSMachine {
                 b &= 0xDF;                                       // bit 5 reserved
             } else if (p == 0x85) b &= 0x07;                     // CH3 freq high is 3 bits
             else if (p == 0x8D) b &= 0x1F;                       // sweep period is 5 bits
+            else if (p == 0x8E) b = noise.control(b);            // noise: reset clears the LFSR, reads 0
+            else if (p == 0x92 || p == 0x93) continue;           // LFSR is read only
             else if (p == 0xA0) {
                 // REG_HW_FLAGS (WSMan): bits 2-3 (bus width, cart ROM speed) are writable; bit 1 (colour system) is
                 // read-only; bits 0 (BIOS out) and 7 (BIST passed) lock once set. A boot write such as OUT 0A0h,05
@@ -764,6 +772,13 @@ public class WSMachine {
     }
     /** GDMA refuses SRAM, slow ROM and 8-bit ROM, at start and mid-transfer (WSdev DMA). */
     private boolean gdmaRefused(long linear) { return !isWordBus(linear) || waitStates(linear) > 1; }
+    /** Noise LFSR as an IN sees it: in cycle-timed mode the read lands {@link #curInBefore} cycles into the IN,
+     *  whose cycles are charged after it executes. */
+    private int noiseRead() {
+        if (!(cycleTiming && curInBefore > 0)) return noise.lfsr;
+        return noise.peek(curInBefore, ports[0x90], ports[0x8E], ports[0x86], ports[0x87]);
+    }
+    private void tickNoise() { noise.tick(ports[0x90], ports[0x8E], ports[0x86], ports[0x87]); }
     private boolean sweepCounting() {
         return (ports[0x90] & 0x04) != 0 && (ports[0x90] & 0x40) != 0;
     }
@@ -841,8 +856,8 @@ public class WSMachine {
 
     // ------------------------------------------------------------------ snapshots
     /** Magic ("WSST") and version of the snapshot format below (v2 appends RTC/flash/KARNAK state, v3 the cycle
-     *  timing and DMA counters; older versions still read, with defaults for the missing parts). */
-    public static final int STATE_MAGIC = 0x57535354, STATE_VERSION = 3;
+     *  timing and DMA counters, v4 the noise LFSR; older versions still read, with defaults for the missing parts). */
+    public static final int STATE_MAGIC = 0x57535354, STATE_VERSION = 4;
 
     /**
      * Save the full machine state: CPU registers and program counter, the 64 KiB RAM (work RAM,
@@ -921,6 +936,9 @@ public class WSMachine {
         o.writeInt(sdmaFreq);
         o.writeInt(sweepTimer);
         o.writeInt(sweepScaler);
+        // v4: noise LFSR and channel-4 period counter.
+        o.writeInt(noise.lfsr);
+        o.writeInt(noise.counter);
     }
 
     /** Restore state written by {@link #saveState}; the ROM and hardware model must match. */
@@ -1027,6 +1045,8 @@ public class WSMachine {
             sdmaSrcReload = sdmaSrc(); sdmaLenReload = sdmaLen(); sdmaTimer = 0;
             sdmaFreq = 0; sweepTimer = 0; sweepScaler = 0;
         }
+        if (version >= 4) { noise.lfsr = o.readInt() & 0x7FFF; noise.counter = o.readInt(); }
+        else { noise.lfsr = 0; noise.counter = 0; }
         sdmaControl(ports[0x52]);
         curInBefore = 0; curSplitWords = 0;
         computedEdges.reset();
@@ -1110,7 +1130,7 @@ public class WSMachine {
             }
         }
         // 6+N steal (N=1 here): advance lines/sweep but not nested SDMA slots.
-        for (int i = 0; i < 7; i++) { cycles++; tickSweep(); tickLine(); }
+        for (int i = 0; i < 7; i++) { cycles++; tickSweep(); tickNoise(); tickLine(); }
         if (!sdmaHyper) ports[0x89] = sample & 0xFF;
     }
     /**
@@ -1138,7 +1158,7 @@ public class WSMachine {
         } else cycleInLine = c + 1;
     }
     private void tickCycles(int n) {
-        for (int i = 0; i < n; i++) { cycles++; tickSweep(); tickLine(); }
+        for (int i = 0; i < n; i++) { cycles++; tickSweep(); tickNoise(); tickLine(); }
     }
 
     // ---- Accuracy: V30MZ cycle costs (NEC/WSdev base + bus/branch extras) -----------------------
@@ -1497,7 +1517,7 @@ public class WSMachine {
     private void runCycleFrames(int frames, java.util.function.IntConsumer onFrame) {
         if (timing == null) {
             timing = new WSCpuTiming(new WSCpuTiming.Bus() {
-                public void cycle() { cycles++; tickSweep(); tickLine(); }
+                public void cycle() { cycles++; tickSweep(); tickNoise(); tickLine(); }
                 public int waitStates(long linear) { return WSMachine.this.waitStates(linear); }
                 public boolean wordBus(long linear) { return isWordBus(linear); }
             });

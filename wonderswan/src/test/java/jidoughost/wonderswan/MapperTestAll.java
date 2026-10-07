@@ -13,6 +13,7 @@ public final class MapperTestAll {
         WSRomBanksTest.run();
         WSStaticBankViewTest.run();
         WSComputedEdgesTest.run();
+        WSNoiseTest.run();
         System.out.println("MapperTestAll: PASS (" + Check.count + " checks)");
     }
 }
