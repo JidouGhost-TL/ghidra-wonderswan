@@ -38,6 +38,8 @@ import ghidra.util.task.TaskMonitor;
  *   fails the guard is kept and reported (SKIPPED). Lying inside a function entered outside the run is not a veto:
  *   with no reference and no fall-through the bytes are unreachable from that function too, and clearing them
  *   frees a fall-through tail for the routine-start rule (the carve is reported with the former container).
+ *   An automatic function wholly inside the cleared run is removed with its decode; RAM hypotheses and
+ *   user/imported functions are retained.
  * J1u: a flow the cleared decode had blocked (an ERROR conflict bookmark whose conflicting instruction was cleared and
  *   whose source instruction is still decoded) is re-flowed from the bookmark's address, so live fall-through or branch
  *   code that lost to the superseded decode is disassembled again instead of only losing its error bookmark.
@@ -655,6 +657,13 @@ public final class WSJumpTables {
         }
         if (skipped != null && out.isEmpty())
             emit.accept(String.format("{\"rule\":\"J1h\",\"start\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"%s\"}", t, skipped));
+        Function orphan = p.getFunctionManager().getFunctionAt(t);
+        boolean removeOrphan = orphan != null && out.contains(orphan.getBody())
+            && !orphan.isExternal() && !orphan.isThunk() && !WSRamCode.isRam(p, t)
+            && orphan.getSymbol().getSource() != SourceType.USER_DEFINED
+            && orphan.getSymbol().getSource() != SourceType.IMPORTED
+            && orphan.getSignatureSource() != SourceType.USER_DEFINED
+            && orphan.getSignatureSource() != SourceType.IMPORTED;
         for (AddressRange r : out) {
             listing.clearCodeUnits(r.getMinAddress(), r.getMaxAddress(), false);
             p.getBookmarkManager().setBookmark(r.getMinAddress(), BookmarkType.ANALYSIS, "WSEvidence",
@@ -664,6 +673,8 @@ public final class WSJumpTables {
                 : "{\"rule\":\"J1h\",\"start\":\"%s\",\"end\":\"%s\",\"outcome\":\"CLEARED\",\"from\":\"%s\"}",
                 r.getMinAddress(), r.getMaxAddress(), container == null ? "" : container));
         }
+        if (removeOrphan && p.getFunctionManager().removeFunction(t))
+            emit.accept(String.format("{\"rule\":\"J1h\",\"start\":\"%s\",\"outcome\":\"ORPHAN_FUNCTION_REMOVED\"}", t));
         return out;
     }
 
