@@ -15,11 +15,15 @@ Package `jidoughost.wonderswan`. Requires the `v30mz` extension (language `V30MZ
 | `WSDebuggerEmulator` | `WSMachine` as a Debugger p-code machine: per-step interrupts, line/timer advance, trace recording |
 | `WSEmulatorFactory` | Debugger emulator factory (*WonderSwan Concrete P-code Emulator*) |
 | `WSFrameScheduler` | Run-until-VBlank scheduler for the frame-step action |
-| `WSDebuggerPlugin` | Debugger plugin: screen view, controller input, frame-step action |
+| `WSDebuggerPlugin` | Debugger plugin: screen view, controller input, frame-step and *Run N Frames...* actions |
 | `WSRender` | Screen renderer (diagnostic) |
 | `WSEvidenceAnalyzer` | Auto-analysis phase 1: runs `WSMachine` (or loads WSEmulate output) and seeds code from execution evidence |
 | `WSEvidenceRepairAnalyzer` | Auto-analysis phase 2: checks Ghidra's results against the same evidence; jump tables; calling convention |
 | `WSJumpTables` | Rule J1 (used by phase 2) |
+| `WSCodeContext` | Rule C0: a default code segment for undecoded ROM bytes before flow (loader, phases 1 and 2) |
+| `WSRamCode` | Rule H2: RAM/SRAM code without a captured image is kept and tagged as an unresolved hypothesis (phase 2) |
+| `WSExecutedFunctions` | Rule E5: executed code outside every function gets a function (phase 2) |
+| `WSStaticCode` + `ghidra_scripts/WSSeedStatic.java` | Post-analysis static call seeding in undefined ROM (strict trial decode; no execution evidence synthesized) |
 | `WSCodePointers` | Rules F1-F4: code reached through code-pointer variables and pushed return addresses (phase 2) |
 | `WSGapCode` | Rules G1/U1: dead code and unreferenced functions found structurally after a terminator (phase 2) |
 | `WSMerge` | Rules M1/T1: merge split routines back together (post-script `WSMergeRoutines`) |
@@ -43,8 +47,9 @@ Package `jidoughost.wonderswan`. Requires the `v30mz` extension (language `V30MZ
 
 ## Loader
 
-Detects a cartridge by its 16-byte footer (`EA` far JMP) and the file extension; the load spec is
-preferred when the footer checksum verifies. Load specs: `V30MZ:LE:16:default` (preferred) and
+Detects a cartridge by its 16-byte footer (`EA` far JMP) alone; the load spec is preferred when the
+footer checksum verifies. The file extension plays no part in detection: after it, `.wsc` selects
+colour hardware and `.pc2` the Pocket Challenge V2 mapper (below). Load specs: `V30MZ:LE:16:default` (preferred) and
 `x86:LE:16:Real Mode` (comparison only; no csval/io setup).
 
 The mapper comes from footer byte $D ($00 = 2001, $01 = 2003), the save hardware from the save
@@ -67,9 +72,14 @@ Program Options → *WonderSwan* (`Mapper`, `RTC`, `Flash`, …).
 
 Also: `WSCartridgeFooter` structure at `F000:FFF0`, an external entry + one-address `reset`
 function at the reset vector (Ghidra's entry-point analyzer skips *named* entries otherwise),
-`csval` context = reset segment at the entry, `DS`/`SS` = 0 and, for colour cartridges, `colorsoc` = 1
-(MUL sets ZF on the colour SoC; a colour cartridge only runs there) over the ROM, header facts under
-Program Options → *WonderSwan*.
+`csval` context = reset segment at the entry, `DS`/`SS` = 0 over the linear ROM, header facts under
+Program Options → *WonderSwan*. Rule C0 (`WSCodeContext`) gives every undecoded byte of the linear
+ROM blocks a default `csval` before any flow: the 64 KiB-aligned segment of its linear address
+(`(linear >> 4) & 0xF000`), one span per 64 KiB, skipping existing instructions and any `csval` already
+stored there; RAM and the `ROM_xx` data views get none. The loader does not store `colorsoc` (MUL
+sets ZF on the colour SoC) as a range over the ROM: a stored context range over undecoded bytes would
+override the flowing context. The evidence analyzer sets `colorsoc` = 1 with `csval` at each executed
+address of a colour-hardware program, and it flows from there.
 The whole ROM is stored as FileBytes so analyzers can add banks as overlays later.
 
 Hardware model (`Color` option): colour when the footer flag is set **or** the file is a `.wsc` (colour releases
@@ -88,15 +98,21 @@ leave them as pure data; the decompiler only sees functions.
 
 ## Evidence analyzers
 
-Every decision can be written to a JSON-lines report (analysis option *Evidence report file*).
+Every decision can be written to a JSON-lines report (analysis option *Evidence report file*). Phase 1
+(and `WSImportTrace`, which applies the same seeding to imported evidence) overwrites the file; phase 2 and the post-analysis scripts
+`WSMergeRoutines` and `WSJumpTableFinish` append to it. `WSSeedStatic` writes its own optional output
+file and overwrites it. Copy a report before rerunning a step that overwrites it if a later script
+still needs it.
 
 | Rule | Phase | What |
 |---|---|---|
 | E0b | 0 | Evidence hygiene in `WSMachine` (`WSComputedEdges`): a computed JMP/CALL resolves to the next instruction in its own interrupt context — an edge pre-empted by an interrupt stays pending across the handler flow (nested interrupts included) and is recorded at the post-IRET instruction, never inside the handler |
+| C0 | 1-2 | Before flow, undecoded bytes of the linear and executable bank-window ROM blocks get a default code segment (`csval` = the block's 64 KiB-aligned segment), so code reached by later disassembly resolves near branches in a plausible segment instead of CS = 0. It is a default only: existing instructions and stored segment observations (E1, D2, F2, …) are kept and win. Run by the loader and at the start of both phases (phase 1 report line `rom_context_spans`); each B2 bank overlay also gets its window segment over the whole block |
 | B2 | 1 | Code executed in the ROM0/ROM1 windows: one overlay block per (window, bank) observed (`ROM0_BANK_xxxx`, from FileBytes), seeded like linear code; a window address that ran under several banks is seeded in each |
 | B3 | 1 | Direct call/jump into a window whose target ran under exactly one bank: resolved to that bank's overlay and disassembled there; calls get a call-override reference, jumps a data reference (a cross-space jump override fails every decompile it reaches) |
 | E1 | 1 | Executed address = instruction start, `csval` = observed CS (executed RAM is H1 instead) |
 | H1 | 1 | Executed work RAM is never decoded (load-time bytes are loader zero-fill): each run is bookmarked (*RAM code, no image yet*) and reported |
+| H2 | 2 | Code in RAM/SRAM (below `2000:0000`) without a captured image of what ran there is an unresolved hypothesis, not an artefact: each decoded run is kept, bookmarked `ram-code: unknown, no evidence` (category `ram-code`) and its functions tagged the same; the cleanup rules (A1, J1h, J1r, J1t, P1, D2) skip it instead of clearing or removing it (report line `unknown_ram_runs`, outcome `KEPT`) |
 | E2 | 1 | Call / interrupt edge target = function entry |
 | E3 | 1 | Computed jump: observed targets as references + JumpTable override |
 | S1 | 1 | Code seed file (option *Code seed file*; TSV `address class method start start_kind …`): class `function`, or `code-strong` with start kind `prologue` / `after-terminator`, seeds a function at the start column (not inside an existing function); other `code-strong`, `executed*` and `code` seeds are instruction starts (`csval` = the seed's segment); other classes and seeds that conflict with existing code are reported, not applied |
@@ -111,7 +127,7 @@ Every decision can be written to a JSON-lines report (analysis option *Evidence 
 | F4 | 2 | The constant segment:offset pushed below a push-return dispatch pair is the dispatched code's return point: code, no function |
 | G1 | 2 | Dead code: the undefined bytes after an unconditional near JMP inside a function that decode (trial flow walk) into a run that rejoins that function: disassembled, no function, bookmarked |
 | U1 | 2 | Unreferenced function: the undefined bytes after any terminator, or after a run of >= 16 identical 00/FF fill bytes in a block that holds code, that decode into a closed flow (every path ends in RET/RETF/IRET or joins existing code; no overlap, no undecodable or implausible instruction, no computed branch, calls only to existing function entries or to undefined bytes of the same block, which are walked too and become functions) with at least 3 instructions and 2 anchors (a call to an existing function, a RAM / I/O operand existing code also uses, or 2 for a push/pop discipline that balances at every return); tag `WS_UNREFERENCED`. Weaker candidates are reported (`WEAK`) and left as bytes |
-| J1f/g/h | 2 | Table ends at another CS table's base (TABLE_BASE); computed refs not in a proven table are superseded; code decoded only from superseded refs is cleared (bytes kept, never executed / still referenced / fallen into from kept code; containment in a function entered elsewhere is reported, not a veto, since unreachable bytes are freed for the routine-start rule) and proven targets re-flowed |
+| J1f/g/h | 2 | Table ends at another CS table's base (TABLE_BASE); computed refs not in a proven table are superseded; code decoded only from superseded refs is cleared (bytes kept, never executed / still referenced / fallen into from kept code / RAM code, `RAM_CODE_KEPT`; containment in a function entered elsewhere is reported, not a veto, since unreachable bytes are freed for the routine-start rule) and proven targets re-flowed; an automatic function whose whole body lies in the cleared run is removed with its decode (`ORPHAN_FUNCTION_REMOVED`), while user-defined, imported, thunk, external and RAM functions stay |
 | J1l | 2 | An unresolved site with a decode conflict in its function, or a guessed target that is an offcut / ERROR / undecodable, is quarantined: guessed (non-observed, non-user) references deleted, their orphan decode cleared, the site re-attempted every pass; still-unresolved sites keep the guesses deleted (the addresses stay in the evidence for rule J1m) |
 | J1m | 2 | Post-analysis script `WSJumpTableFinish` (after the merges): at a quarantined site, re-deletes any guessed reference a later analysis re-derived and locks the switch to its observed targets with a stored jump-table override; with no observed target the site stays an opaque indirect branch; unresolved sites with E3 targets get the same lock; J1p re-locks recovered jump sites (merges strip the recovery override); J1q filters every lock to the site's address space |
 | J1n | 2 | A kept table target shadowed by single-byte data (a data pointer read the slot first) is deshadowed so it disassembles; user/imported and multi-byte data stay |
@@ -130,6 +146,7 @@ and appends its M1/T1 evidence lines to the same report. It is idempotent: a sec
 nothing left to merge.
 | R1 | 2 | A register read-before-written after a call at 3+ call sites, and written (not POP-restored) on a path to a RET of the callee (a CALL/INT provides the call-clobbered AX/BX/CX), becomes the callee's return (byte when every access is 8-bit, else word; several registers = one multi-register storage); user/imported signatures and thunks are left alone |
 | V1 | 2 | A RAM address stored on an interrupt handler's flow and loaded (never stored) in a backward-conditional-branch loop elsewhere is split out of the RAM block into a tiny volatile block, so spin-wait loops decompile as loops |
+| E5 | 2 | Executed code left outside every function: connected pieces by flow, each piece entry becomes a function (default address space only; work RAM skipped, rule H1) — `WSExecutedFunctions` |
 | D1 | 2 | DS context at entries with one non-zero observed DS |
 | D2 | 2 | A near branch resolving to another segment is always misdecoded (a 16-bit near branch cannot change CS): unexecuted branches are re-disassembled with their own segment's context (the re-decode must reproduce the mnemonic and length or the original is restored); executed branches stay |
 | D3 | 2 | CS-register context over every initialized block (each span's own display segment): `MOV reg,CS` / `PUSH CS` fold to constants instead of unaffected CS inputs — `WSCompilerRules` |
@@ -185,11 +202,17 @@ Modelled:
   in repeat mode. Writing a reload value also loads the counter.
 - **UART** (B1/B3): transmitting is instant (bytes collected in `serialOut`), nothing is received;
   B3 reads enable/speed and TX-empty while enabled.
-- **Timing**: a frame = `slice` instructions over 159 lines (144 visible). Port 02 = current line;
-  line-match IRQ (level 4) at line = port 03; VBlank IRQ (level 6) at line 144. Display ports are
-  snapshotted per visible line for raster effects. Instruction-count based, not cycles, so frames
-  drift against hardware in instruction-mix-heavy scenes (cycle timing is a B item).
-- **DMA** (40–48), keypad (B5, scripted via `buttons`).
+- **Timing**: by default a frame = `slice` instructions over 159 lines (144 visible). Port 02 = current
+  line; line-match IRQ (level 4) at line = port 03; VBlank IRQ (level 6) at line 144. Display ports are
+  snapshotted per visible line for raster effects. Instruction-count frames drift against hardware in
+  instruction-mix-heavy scenes. With `cycleTiming` set (`WSEmulate` `cyc=1`), instructions cost V30MZ
+  cycles (`WSCpuTiming`: prefetch queue, bus waits) and lines (256 cycles), timers, the channel-3 sweep,
+  the channel-4 noise generator and sound DMA run by cycles.
+- **General DMA** (40–48): word-alignment and 20-bit masks, refusal of SRAM / slow / 8-bit ROM sources
+  (at start and mid-transfer), direction; the CPU stall is charged in cycle-timed mode.
+- **Sound DMA** (4A–52): 20-bit source/length with shadow reloads, hold, repeat, rate and direction;
+  transfers run in cycle-timed mode (one byte per rate slot, with the CPU steal).
+- **Keypad** (B5, scripted via `buttons`).
 - **EEPROMs** (`WSEeprom`, WSdev EEPROM): the internal one (BA–BE; 16 Kbit on colour hardware, taking
   1 Kbit-form commands while colour mode is off; 1 Kbit on mono) and the cartridge one (C4–C8; size from
   the footer save type). Serial commands READ / WRITE / ERASE / WRAL / ERAL / WEN / WDS, separate read
@@ -217,8 +240,9 @@ Modelled:
   CPU load and store to the ram space with the instruction address and value, at no cost when unset. `trace` (last 64
   instructions) is filled when `run()` returns or throws.
 
-Not modelled: sound, sound DMA (4A–52), GDMA register masks/refusals/timing, the RTC alarm output,
-NMI (low battery), cycle timing, open-bus values (a missing SRAM reads 0).
+Not modelled: audible sound output, the RTC alarm output, NMI (low battery), open-bus values (a
+missing SRAM reads 0). Cycle timing is optional and not validated as cycle-exact for every instruction
+mix.
 
 EEPROM validation: ws-test-suite `mono/eeprom/internal`, `cartridge_1kbit` and `cartridge_16kbit` pass every
 row (10/9/9), matching Mesen 2.
@@ -240,14 +264,30 @@ delayed sprite-table copy, LCD icons and LCD colour response (Mesen applies an L
 
 ```
 WSEmulate.java <outdir> [frames=1500] [insns/frame=40000] [stopAt linear hex | -] [shotEvery=100]
-               [saves dir to load | -] [input script file | -]
+               [saves dir to load | -] [input script file | -] [environment | -]
 ```
+
+The environment argument is a comma-separated `key=value` list:
+
+| Key | Meaning |
+|---|---|
+| `hp=0\|1` | headphone adapter connected (port 91 bit 7; default 1) |
+| `eep=XX` | blank cartridge EEPROM fill byte (hex; default FF as delivered) |
+| `owner=NAME[:volume]` | console owner data in the internal EEPROM (default blank) |
+| `cyc=0\|1` | cycle-timed lines, timers and interrupts instead of `insns/frame` instructions per frame (default 0) |
+| `trace=FROM[:N]` | record `trace.tsv` from logical step FROM (1-based; REP iterations count once) for N steps (default 1:20000) |
+| `sig=0\|1` | write `framesig.tsv`: per frame the logical steps so far, the cycle count and the sum of executed linear addresses |
+| `model=mono\|color` | console to emulate (default: the loader's choice from the footer / extension) |
+
+Unknown keys are an error.
 
 Default input: Start on frames f ≥ 100 with f % 40 < 3, A on 20 ≤ f % 40 < 23 (use the same
 script in the reference emulator when comparing). An input script replaces it: one `from to buttons`
 line per span (inclusive frames; buttons hex as `WSMachine.buttons`; `#` comments). Also writes `saves/`
 (the save images after the run) and `eeprom.log` (EEPROM operations and refused requests). Writes `coverage.json` (linear, rom_off, CS, DS/ES sets; `banks` for ROM0/ROM1-window code), `trace.tsv` (first
-20,000 steps), `banks.json` (bank writes, DMA log, error), `ram.bin`, and per `shotEvery` frames
+20,000 steps), `edges.tsv` (observed call / jump / interrupt edges with target CS and count), `irqlog.tsv` (interrupt
+requests inside the trace window: step, level, line, cycle in line, latched), `banks.json` (bank writes,
+DMA log, error), `ram.bin`, optionally `framesig.tsv` (`sig=1`), and per `shotEvery` frames
 `shot_N.png`, `ports_N.bin`, `ram_N.bin`. Use `insns/frame` = Mesen instructions ÷ frames to align
 with a reference run.
 
@@ -288,6 +328,7 @@ the CodeBrowser once the Debugger services are added to it).
 - *WonderSwan Screen* (Window → *WonderSwan Screen*): the current frame via `WSRender`, refreshed whenever emulation stops, plus a Refresh button. It renders the live emulated state; moving through trace history without emulating keeps the last live frame.
 - *WonderSwan Input* (Window → *WonderSwan Input*): press-and-hold controller buttons (X/Y pads, START, A, B) feeding the emulated key port live.
 - *Debugger → Step Frame (VBlank)*: runs to the next VBlank entry (VBlank raised, handler about to run). Breakpoints still stop the run first.
+- *Debugger → Run N Frames...*: asks for a frame count and runs that many frames in one cancellable task. Breakpoints still stop the run first.
 
 Usage: open the program in the Debugger tool, enable the *WonderSwan Debugger* plugin in the
 tool config if needed, select *WonderSwan Concrete P-code Emulator* under Debugger → Configure

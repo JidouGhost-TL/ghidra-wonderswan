@@ -4,8 +4,9 @@ def ghidraInstallDir = System.env.GHIDRA_INSTALL_DIR ?: (project.hasProperty("GH
 apply from: new File(ghidraInstallDir).getCanonicalPath() + "/support/buildExtension.gradle"
 
 // Compile the SLEIGH spec (data/languages/*.slaspec -> *.sla) before packaging, so the
-// extension zip ships a ready .sla (Ghidra does not compile .slaspec files of installed
-// extensions at load time).
+// extension zip ships a ready .sla. Ghidra compiles an installed language at load only when its
+// .sla is missing, or is writable and stale (older than its sources) or from another SLEIGH
+// version; a shipped, current .sla avoids that load-time compile, including in read-only installs.
 def sleighExe = new File(ghidraInstallDir).getCanonicalPath() + "/support/sleigh"
 task compileSleigh(type: Exec) {
 	inputs.files fileTree(dir: 'data/languages', include: ['*.slaspec', '*.sinc'])

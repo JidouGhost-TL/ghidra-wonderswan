@@ -2,12 +2,16 @@
 // Run the current WonderSwan program in WSMachine and write emulation evidence.
 // Args: <out dir> [frames=1500] [slice=40000] [stopAt linear hex, or - for none] [shotEvery=100]
 //       [saves dir to load, or -] [input script file, or -] [environment, or -: hp=0|1 (headphone adapter
-//       connected, default 1), eep=XX (blank cartridge EEPROM fill, default FF as delivered; Mesen 2 uses 00), owner=NAME[:volume] (console
-//       owner data in the internal EEPROM, default blank; Mesen 2 uses WONDERSWAN / WONDERSWANCOLOR:3), cyc=0|1 (cycle-timed
-//       lines, timers and interrupts instead of `slice` instructions per frame)]
+//       connected, default 1), eep=XX (blank cartridge EEPROM fill, default FF as delivered; a reference emulator uses
+//       00), owner=NAME[:volume] (console owner data in the internal EEPROM, default blank; a reference emulator uses
+//       WONDERSWAN / WONDERSWANCOLOR:3), cyc=0|1 (cycle-timed lines, timers and interrupts instead of `slice`
+//       instructions per frame), trace=FROM[:N] (trace window: first logical step, 1-based, and step count, default
+//       1:20000), sig=0|1 (write framesig.tsv), model=mono|color (console model, default from the loader)]
 // Writes coverage.json (executed instruction linear addresses with ROM offset, CS and DS/ES/SS sets), edges.tsv,
-// banks.json (bank writes + DMA log), ram.bin, vram_writers.json, saves/ (internal.eeprom, cart.eeprom,
-// cart.sram as present after the run) and eeprom.log (every EEPROM operation and refused request).
+// irqlog.tsv (interrupt requests inside the trace window), trace.tsv (the trace window), banks.json (bank writes +
+// DMA log), ram.bin, saves/ (internal.eeprom, cart.eeprom, cart.sram, cart.flash, cart.rtc as present after the run),
+// eeprom.log (every EEPROM operation and refused request), framesig.tsv when sig=1, and every shotEvery frames
+// shot_N.png, ports_N.bin and ram_N.bin.
 // Default input: Start on frames f>=100 with f%40<3, A on 20<=f%40<23. An input script replaces it: one
 // "from to buttons" line per span (frames, inclusive; buttons hex: bit1 Start, 2 A, 3 B, 4-7 X, 8-11 Y).
 // @category WonderSwan

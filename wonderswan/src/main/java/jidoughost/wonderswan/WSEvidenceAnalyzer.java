@@ -26,6 +26,8 @@ import ghidra.util.task.TaskMonitor;
  * the decode artefacts that disassembly produces when it follows never-taken paths into data.
  *
  * Rules (every decision is evidence-backed and can be written to a JSON-lines report):
+ *   C0  before any flow, undecoded ROM bytes (linear blocks and executable bank overlays) get a default code
+ *       segment ({@link WSCodeContext}); existing instructions and stored segment observations are kept.
  *   E0b a computed JMP/CALL resolves to the next instruction in its own interrupt context: edges
  *       pre-empted by an interrupt are carried across the handler flow (WSMachine) and recorded at
  *       the post-IRET instruction, never inside the handler.
@@ -37,6 +39,8 @@ import ghidra.util.task.TaskMonitor;
  *       Executed RAM is H1 instead (no image).
  *   H1  executed work RAM is never decoded (load-time bytes are loader zero-fill, not the ran code):
  *       each run is bookmarked ("RAM code, no image yet") and reported, nothing is disassembled there.
+ *   H2  RAM/SRAM code decoded anyway, with no captured image, is an unresolved hypothesis ({@link WSRamCode}):
+ *       kept, bookmarked and tagged "ram-code: unknown, no evidence"; artefact cleanup never clears it.
  *   E2  a call / int / irq edge target is a function entry (RAM and last-overlay-byte targets excluded).
  *   E3  a computed JMP site gets COMPUTED_JUMP references to every observed target, and a JumpTable
  *       override listing them (observed targets only; a static table rule may add more later).

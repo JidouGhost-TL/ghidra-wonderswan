@@ -19,6 +19,8 @@ import ghidra.util.task.TaskMonitor;
 /**
  * Phase 2 of {@link WSEvidenceAnalyzer}: runs after Ghidra's own analyzers and checks their results
  * against the same execution evidence (reused from phase 1, no second emulator run):
+ *   C0  default code segment over undecoded ROM bytes ({@link WSCodeContext}); H2 RAM/SRAM code without an image
+ *       is kept and tagged as an unknown hypothesis ({@link WSRamCode}), never cleared by the rules below;
  *   N1  clear "does not return" where a call's fall-through executed, restore the cut-off code;
  *   E1R re-seed executed addresses that later analysis removed;
  *   J1  CS-relative jump/call tables by rule ({@link WSJumpTables}), checked against observed targets;
