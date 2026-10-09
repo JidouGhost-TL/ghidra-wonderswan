@@ -312,7 +312,7 @@ public final class WSJumpTables {
         new DisassembleCommand(g, null, true).applyTo(p, monitor);
         Instruction now = listing.getInstructionAt(site);
         if (now == null || !now.getFlowType().isComputed() || !now.getMnemonicString().equalsIgnoreCase(wantMn)) {
-            for (Address t : span) listing.clearCodeUnits(t, t, false);
+            for (Address t : span) if (!WSRamCode.isRam(p, t)) listing.clearCodeUnits(t, t, false);
             emit.accept(String.format("{\"rule\":\"J1r\",\"site\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"MISMATCH\"}", site));
             return;
         }
@@ -641,6 +641,7 @@ public final class WSJumpTables {
         String container = null;
         Instruction i = listing.getInstructionAt(t);
         while (i != null) {
+            if (WSRamCode.isRam(p, i.getAddress())) { skipped = "RAM_CODE_KEPT"; break; }
             if (executed(i.getAddress().getOffset())) { skipped = "EXECUTED"; break; }
             if (p.getReferenceManager().getReferencesTo(i.getAddress()).hasNext()) { skipped = "REFERENCED"; break; }
             Address ff = i.getFallFrom();
@@ -1052,6 +1053,7 @@ public final class WSJumpTables {
                 }
                 lockCases = ownSpace(s, lockCases);   // J1q: every lock stays in the site's space
                 String oldName = f.getName();
+                if (WSRamCode.isRam(p, t)) continue;
                 AddressSetView oldBody = new AddressSet(f.getBody());
                 if (!fm.removeFunction(t)) {
                     emit.accept(String.format("{\"rule\":\"J1t\",\"site\":\"%s\",\"entry\":\"%s\",\"outcome\":\"ERROR\",\"error\":\"REMOVE_FAILED\"}",

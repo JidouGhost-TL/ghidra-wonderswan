@@ -45,6 +45,7 @@ public final class WSBranchContext {
             String mn = x.getMnemonicString().toUpperCase();
             if (mn.equals("JMPF") || mn.equals("CALLF") || mn.equals("RETF") || mn.equals("IRET")) continue;
             Address s = x.getAddress();
+            if (WSRamCode.isRam(p, s)) continue;
             if (!(s instanceof SegmentedAddress ss)) continue;
             for (Reference r : x.getReferencesFrom()) {
                 if (!r.getReferenceType().isJump() && !r.getReferenceType().isCall()) continue;

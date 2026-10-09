@@ -298,6 +298,7 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
                     new java.io.ByteArrayInputStream(win), 0x10000, monitor, true);
             }
             b.setPermissions(true, false, true);
+            ctx.setValue(csval, b.getStart(), b.getEnd(), BigInteger.valueOf(seg));
             b.setComment(String.format("ROM bank 0x%04X (file offset 0x%06X) in the %s window: code executed here under this bank (evidence rule B1/B2)",
                 bank, off, seg == WSHardware.SEG_ROM0 ? "ROM0" : "ROM1"));
             b2++;
@@ -343,6 +344,8 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
         }
 
         void seed() throws Exception {
+            int defaults = WSCodeContext.seedRomDefaults(p);
+            emit("{\"rule\":\"C0\",\"rom_context_spans\":%d}", defaults);
             if (ev.e0bKnown)
                 emit("{\"rule\":\"E0b\",\"carried\":%d,\"resumed\":%d,\"max_depth\":%d}", ev.e0bCarried, ev.e0bResumed, ev.e0bMaxDepth);
             seedExecuted("E1");
@@ -755,6 +758,8 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
         }
 
         void classifyArtefacts(java.util.Set<Address> keptTargets) throws Exception {
+            int ramRuns = WSRamCode.classify(p);
+            emit("{\"rule\":\"H2\",\"unknown_ram_runs\":%d,\"outcome\":\"KEPT\"}", ramRuns);
             Listing listing = p.getListing();
             BookmarkManager bm = p.getBookmarkManager();
             List<Address> bad = new ArrayList<>();
@@ -769,6 +774,7 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
                 boolean keptStop = false;
                 Instruction prev = listing.getInstructionBefore(b);
                 while (prev != null && b.equals(prev.getFallThrough()) && !ev.executed(prev.getAddress().getOffset())) {
+                    if (WSRamCode.isRam(p, prev.getAddress())) break;
                     if (keptTargets.contains(prev.getAddress())) { keptStop = true; break; }
                     run.add(0, prev);
                     b = prev.getAddress();

@@ -72,6 +72,11 @@ public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
 
     @Override
     public boolean added(Program program, AddressSetView set, TaskMonitor monitor, MessageLog log) throws CancelledException {
+        try {
+            log.appendMsg(NAME + ": C0 ROM context spans " + WSCodeContext.seedRomDefaults(program)
+                + ", H2 unknown RAM code runs kept " + WSRamCode.classify(program));
+        }
+        catch (Exception e) { log.appendMsg(NAME + ": C0/H2 failed: " + e); Msg.error(this, "C0/H2 failed", e); }
         WSEvidence ev = WSEvidenceAnalyzer.EVIDENCE.get(program);
         if (ev == null) {
             // No execution evidence (emulation failed or disabled): the evidence rules cannot run, but K1/C1 decide
@@ -178,6 +183,7 @@ public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
         List<Function> phantoms = new ArrayList<>();
         for (Function f : program.getFunctionManager().getFunctions(true)) {
             if (f.isExternal() || f.isThunk()) continue;
+            if (WSRamCode.isRam(program, f.getEntryPoint())) continue;
             ghidra.program.model.mem.MemoryBlock b = program.getMemory().getBlock(f.getEntryPoint());
             if (b == null || !b.isInitialized()) phantoms.add(f);
         }

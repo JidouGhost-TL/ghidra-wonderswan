@@ -311,6 +311,7 @@ public class WonderSwanLoader extends AbstractProgramWrapperLoader {
             settings.log().appendMsg("WonderSwan: V30MZ language has no csval context field; near branches will resolve with CS=0");
         } else {
             try {
+                WSCodeContext.seedRomDefaults(program);
                 Address reset = space.getAddress(hdr.resetSegment, hdr.resetOffset);
                 program.getProgramContext().setValue(csval, reset, reset, BigInteger.valueOf(hdr.resetSegment));
             } catch (Exception e) {
