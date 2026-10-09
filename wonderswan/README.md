@@ -45,6 +45,33 @@ Package `jidoughost.wonderswan`. Requires the `v30mz` extension (language `V30MZ
 | `ghidra_scripts/WSViewerSmoke.java` | Headless smoke test: instantiate the viewer plugin and provider in a bare tool |
 | `WSGuiSmoke` (`src/test`) + `gui-test/` | Headed GUI smoke test (`guiTest` task, Xvfb container): plugins, providers, actions, Tiles ROM-offset render, re-registration |
 
+## Link mode
+
+`WSLinkEmulate.java` boots two cartridges in one process with independent RAM, save memory,
+internal EEPROM and inputs. Import console A with the WonderSwan loader, then run this post-script:
+
+```
+WSLinkEmulate.java <ROM B> <output dir> [frames=1500] [shotEvery=100]
+                  [input A|-] [input B|-] [saves A|-] [saves B|-]
+                  [model A=auto|mono|color] [model B=auto|mono|color]
+```
+
+Input files contain `from to buttons` spans (inclusive frame numbers, hexadecimal keypad mask,
+as in `WSEmulate`). Missing inputs hold no buttons. Save directories use `cart.sram`, `cart.eeprom`
+and `internal.eeprom` as applicable; input images are read without modification. `A/` and `B/`
+contain periodic screenshots, `final.png`, final RAM/ports and `saves/`. `serial.tsv` records direction,
+frame, master clock, value, baud rate and delivery/drop result; `summary.txt` records completion/errors.
+
+The cable interleaves cycle-timed CPU instructions on a shared 3.072 MHz clock. The wire advances
+on every shared hardware clock, including DMA stalls. An 8N1 byte takes
+3,200 clocks at 9,600 baud or 800 at 38,400 baud. Each frame interval is 159 × 256 clocks; the consoles
+retain their own display phase. B1/B3 buffers, overrun and the B2/B6 serial interrupt levels follow the
+[UART](https://ws.nesdev.org/wiki/UART) and [interrupt](https://ws.nesdev.org/wiki/Interrupts) hardware
+documentation. `WSSerial.Peer` is the transport interface for future adapter/device models.
+Detached machines retain the existing instant serial output behavior. Linked save-state snapshots
+are unsupported; final cartridge save images are supported. `WSLinkTest.java` exercises a synthetic
+two-console fixture. Link play can, for example, connect a two-player puzzle game or a save-transfer utility.
+
 ## Loader
 
 Detects a cartridge by its 16-byte footer (`EA` far JMP) alone; the load spec is preferred when the
@@ -200,8 +227,8 @@ Modelled:
   every line start, the VBlank timer at line 144; the IRQ (7 / 5) is requested when the counter is
   1 at a tick (also when counting is disabled), then an enabled counter counts down and reloads
   in repeat mode. Writing a reload value also loads the counter.
-- **UART** (B1/B3): transmitting is instant (bytes collected in `serialOut`), nothing is received;
-  B3 reads enable/speed and TX-empty while enabled.
+- **UART** (B1/B3): an attached peer uses timed one-byte buffers and send/receive level interrupts
+  (see Link mode). Detached output is instant (`serialOut`), with no reception and TX-empty while enabled.
 - **Timing**: by default a frame = `slice` instructions over 159 lines (144 visible). Port 02 = current
   line; line-match IRQ (level 4) at line = port 03; VBlank IRQ (level 6) at line 144. Display ports are
   snapshotted per visible line for raster effects. Instruction-count frames drift against hardware in

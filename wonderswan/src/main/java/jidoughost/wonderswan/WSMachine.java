@@ -31,8 +31,8 @@ import ghidra.program.model.pcode.Varnode;
  * edge and level sources per WSdev Interrupts), the CPU side of interrupts (IF, one-instruction
  * shadow after STI/POPF/IRET that set IF and after MOV/POP SS, HLT halted state, TF single-step
  * trap, divide-error trap via the language's swi(0)), line counter (02) with line-match and
- * VBlank IRQs, HBlank/VBlank timers (A2-AB), the UART send-ready level IRQ (B1/B3; bytes sent
- * instantly, nothing received), scripted keypad (B5), the internal (BA-BE) and cartridge (C4-C8)
+ * VBlank IRQs, HBlank/VBlank timers (A2-AB), UART (B1/B3; timed with an attached peer,
+ * legacy instant output when detached), scripted keypad (B5), the internal (BA-BE) and cartridge (C4-C8)
  * serial EEPROMs ({@link WSEeprom}), cartridge SRAM in the 1000:0000 window (bank port C1,
  * mirrored to its size; direct machine accesses such as IRQ pushes and GDMA go through it too),
  * with load/save of all three images,
@@ -197,8 +197,30 @@ public class WSMachine {
     private int irqStatus;
     /** Timer counters (ports A8/A9 and AA/AB). */
     private int hTimer, vTimer;
-    /** Bytes written to the UART transmit port B1 (sent instantly; there is no peer). */
+    /** Detached: every B1 write. Attached: accepted transmit bytes, recorded when queued. */
     public final java.io.ByteArrayOutputStream serialOut = new java.io.ByteArrayOutputStream();
+    private WSSerial serial;
+    /** Shared wire clock hook, including clocks consumed by long DMA stalls. */
+    Runnable serialClock;
+    private long linkPreviousPc = -1;
+
+    /** Attach a timed UART peer before running. A device can implement the same peer contract as a cable. */
+    public void attachSerial(WSSerial.Peer peer) {
+        if (serial != null || instructions != 0 || cycles != 0)
+            throw new IllegalStateException("attach serial before running the machine");
+        serial = new WSSerial(peer);
+        serial.writeControl(ports[0xB3]);
+        cycleTiming = true;
+    }
+
+    public WSSerial serial() { return serial; }
+
+    void pollSerial() {
+        if (serial != null) {
+            serial.advanceTo(cycles);
+            irqStatus |= serial.interruptLevels() & ports[0xB2];
+        }
+    }
 
     // ---- Accuracy: cycle timing and DMA (option + state; see run/runCycle) --------------------
     // Kept in one block so save-state and mapper work elsewhere merges cleanly: the visible DMA
@@ -549,7 +571,14 @@ public class WSMachine {
     /** Write an I/O port from outside the emulation (bank switches remap, as the hardware does). */
     public void setPort(int port, int size, int value) { portOut(port, size, value); }
 
+    /** Read an I/O port, including read side effects such as consuming the UART receive buffer. */
+    public int getPort(int port, int size) { return portIn(port, size); }
+
     int portIn(int port, int size) {
+        // Linked word INs must consume B1 and read live B3 status in the appropriate byte lane.
+        // Keep the detached path's historical word read behavior for existing evidence runs.
+        if (serial != null && size == 2 && port >= 0xB0 && port <= 0xB3)
+            return portIn(port, 1) | portIn(port + 1, 1) << 8;
         int v;
         // Cartridge peripherals (absent ones keep the last-value behaviour in the switch below).
         if (rtc != null && port == 0xCA) {
@@ -602,8 +631,12 @@ public class WSMachine {
                 for (int l = 7; l >= 0; l--) if ((act >> l & 1) != 0) { hi = l; break; }
                 return (ports[0xB0] & 0xF8) | hi;
             }
-            case 0xB1: return 0;                         // UART receive buffer (nothing is received)
+            case 0xB1:
+                if (serial == null) return 0;
+                pollSerial();
+                return serial.readData();
             case 0xB3:                                    // UART status: enable, speed, TX empty
+                if (serial != null) { pollSerial(); return serial.readStatus(); }
                 return (ports[0xB3] & 0xC0) | ((ports[0xB3] & 0x80) != 0 ? 0x04 : 0);
             case 0xB4: return activeIrqs();
             case 0xB6: return 0;
@@ -639,7 +672,9 @@ public class WSMachine {
             if (p == 0xB4) continue;                              // read-only status
             if (p == 0xB6) { irqStatus &= ~b; continue; }         // acknowledge
             if (p == 0x43 || p == 0x4D || p == 0x51 || p == 0x53) continue;   // DMA gaps ignore writes
-            if (p == 0xB1) serialOut.write(b);                    // UART transmit (instant)
+            if (serial != null && (p == 0xB1 || p == 0xB2 || p == 0xB3)) pollSerial();
+            if (p == 0xB1 && (serial == null || serial.writeData(b))) serialOut.write(b);
+            if (p == 0xB3 && serial != null) serial.writeControl(b);
             // Accuracy: DMA word-alignment and 20-bit masks (ws-test-suite alignment_access/sound_dma).
             if (p == 0x40 || p == 0x44 || p == 0x46) b &= 0xFE;
             else if (p == 0x42 || p == 0x4C || p == 0x50) b &= 0x0F;
@@ -878,6 +913,7 @@ public class WSMachine {
     }
 
     public void saveState(java.io.DataOutputStream o) throws java.io.IOException {
+        if (serial != null) throw new IllegalStateException("linked snapshots require both consoles and cable state");
         prefetchRelease();   // rule P2 is not part of the state: a snapshot shows the current mapping
         o.writeInt(STATE_MAGIC);
         o.writeInt(STATE_VERSION);
@@ -950,6 +986,7 @@ public class WSMachine {
     }
 
     public void restoreState(java.io.DataInputStream o) throws java.io.IOException {
+        if (serial != null) throw new IllegalStateException("cannot restore a single-console snapshot while linked");
         if (o.readInt() != STATE_MAGIC) throw new IllegalArgumentException("not a machine snapshot");
         int version = o.readInt();
         if (version < 1 || version > STATE_VERSION) throw new IllegalArgumentException("unsupported snapshot version");
@@ -1139,6 +1176,7 @@ public class WSMachine {
      * at cycle 224 still runs before the HBlank-timer interrupt can be taken (matches the reference's order).
      */
     private void tickLine() {
+        if (serialClock != null) serialClock.run();
         apuCycle = (apuCycle + 1) & 0x7F;
         if (apuCycle == 116) sdmaSlot();
         int c = cycleInLine;
@@ -1328,10 +1366,11 @@ public class WSMachine {
         return true;
     }
 
-    /** Interrupt status (B4) including the level-triggered sources (UART send ready, level 0: the
-     *  transmit buffer is always empty, so it is requested whenever the UART and level 0 are enabled). */
+    /** Interrupt status (B4) including enabled UART levels (send ready 0, receive ready 3).
+     *  Detached compatibility mode always has an empty transmit buffer. */
     public int activeIrqs() {
-        if ((ports[0xB3] & 0x80) != 0 && (ports[0xB2] & 1) != 0) irqStatus |= 1;
+        if (serial != null) pollSerial();
+        else if ((ports[0xB3] & 0x80) != 0 && (ports[0xB2] & 1) != 0) irqStatus |= 1;
         return irqStatus;
     }
 
@@ -1515,6 +1554,23 @@ public class WSMachine {
      * over, as modelled by the reference emulator) and a frame ends at the start of line 145, as on the reference.
      */
     private void runCycleFrames(int frames, java.util.function.IntConsumer onFrame) {
+        initialiseCycleTiming();
+        long prevPc = -1;
+        deferIoWrites = true;
+        try {
+        for (int f = 0; f < frames; f++) {
+            if (onFrame != null) onFrame.accept(f);
+            long frameStart = cycles;
+            vblankStarted = false;
+            while (!vblankStarted) {
+                prevPc = stepCycleInstruction(prevPc);
+                if (cycles - frameStart > 4L * CYCLES_PER_FRAME) break;   // display off: end the frame anyway
+            }
+        }
+        } finally { flushDeferredIo(); deferIoWrites = false; }
+    }
+
+    private void initialiseCycleTiming() {
         if (timing == null) {
             timing = new WSCpuTiming(new WSCpuTiming.Bus() {
                 public void cycle() { cycles++; tickSweep(); tickNoise(); tickLine(); }
@@ -1527,47 +1583,49 @@ public class WSMachine {
             }
             timing.flush(linearPC());
         }
-        long prevPc = -1;
+    }
+
+    /** One cycle-timed CPU instruction (or one halted clock) for the shared link scheduler. */
+    void stepLinkInstruction() {
+        if (serial == null || !cycleTiming) throw new IllegalStateException("link requires a timed UART");
+        initialiseCycleTiming();
         deferIoWrites = true;
         try {
-        for (int f = 0; f < frames; f++) {
-            if (onFrame != null) onFrame.accept(f);
-            long frameStart = cycles;
-            vblankStarted = false;
-            while (!vblankStarted) {
-                if (!boundary()) { timing.halted(); continue; }   // halted: cycles burn until an IRQ
-                if (csMayHaveChanged) { syncCsval(); csMayHaveChanged = false; }
-                if (beforeStep != null) beforeStep.accept(this);
-                long pcBefore = linearPC();
-                sweepWas = sweepCounting();
-                sdmaWas = sdmaEnabled;
-                boolean repFirst = pcBefore != prevPc;
-                try {
-                    thread.stepInstruction();
-                    finishRepExit(pcBefore);
-                } catch (RuntimeException e) {
-                    flushDeferredIo();
-                    if (onFault == null || !onFault.test(this, e)) throw e;
-                    suppressIrq = suppressTrap = false;
-                    prevPc = -1;
-                    timing.flush(linearPC());
-                    continue;
-                }
-                instructions++;
-                long pcAfter = linearPC();
-                boolean taken = pcAfter != pcBefore + curLen;
-                boolean repMore = pcAfter == pcBefore;
-                tickOverride = true;
-                try { timing.instruction(curBytes, taken, pcAfter, curAccesses, repFirst, repMore, curInterrupted, curEntryAccesses); }
-                finally { tickOverride = false; }
-                flushDeferredIo();
-                afterStep();                                     // single-step trap (charged as an interrupt)
-                prevPc = pcBefore;
-                if (stopped) throw new IllegalStateException(String.format("stopAt %05x reached", stopAt));
-                if (cycles - frameStart > 4L * CYCLES_PER_FRAME) break;   // display off: end the frame anyway
-            }
-        }
+            linkPreviousPc = stepCycleInstruction(linkPreviousPc);
         } finally { flushDeferredIo(); deferIoWrites = false; }
+    }
+
+    private long stepCycleInstruction(long prevPc) {
+        if (!boundary()) { timing.halted(); return prevPc; }   // halted: cycles burn until an IRQ
+        if (csMayHaveChanged) { syncCsval(); csMayHaveChanged = false; }
+        if (beforeStep != null) beforeStep.accept(this);
+        long pcBefore = linearPC();
+        sweepWas = sweepCounting();
+        sdmaWas = sdmaEnabled;
+        boolean repFirst = pcBefore != prevPc;
+        try {
+            thread.stepInstruction();
+            finishRepExit(pcBefore);
+        } catch (RuntimeException e) {
+            flushDeferredIo();
+            if (onFault == null || !onFault.test(this, e)) throw e;
+            suppressIrq = suppressTrap = false;
+            prevPc = -1;
+            timing.flush(linearPC());
+            return prevPc;
+        }
+        instructions++;
+        long pcAfter = linearPC();
+        boolean taken = pcAfter != pcBefore + curLen;
+        boolean repMore = pcAfter == pcBefore;
+        tickOverride = true;
+        try { timing.instruction(curBytes, taken, pcAfter, curAccesses, repFirst, repMore, curInterrupted, curEntryAccesses); }
+        finally { tickOverride = false; }
+        flushDeferredIo();
+        afterStep();                                     // single-step trap (charged as an interrupt)
+        prevPc = pcBefore;
+        if (stopped) throw new IllegalStateException(String.format("stopAt %05x reached", stopAt));
+        return prevPc;
     }
 
     // ------------------------------------------------------------------ debugger hooks
