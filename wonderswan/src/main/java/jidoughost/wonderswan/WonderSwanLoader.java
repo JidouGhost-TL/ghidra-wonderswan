@@ -43,7 +43,9 @@ import ghidra.util.exception.CancelledException;
  *              is reachable via Go-To-Address, labels and references. Bank overlays for executed
  *              window code (rule B2, ROM0_BANK_XXXX / ROM1_BANK_XXXX at 2000:0000 / 3000:0000) are
  *              executable views at the window address; these are data views (see {@link #isDataOverlay}).
- * The whole ROM is kept as FileBytes so analyzers can add ROM banks as overlays later.
+ * Each physical bank also has dormant ROM0_BANK_XXXX and ROM1_BANK_XXXX window views.
+ * Evidence or a constant bank selection activates a view; no CPU window mapping is changed.
+ * The whole ROM is kept as FileBytes for analysis of old projects and original-byte reads.
  */
 public class WonderSwanLoader extends AbstractProgramWrapperLoader {
 
@@ -201,6 +203,7 @@ public class WonderSwanLoader extends AbstractProgramWrapperLoader {
             }
 
             if (mapBanks) mapDataOverlays(mem, space, fb, rom, romLen, padded, settings);
+            settings.log().appendMsg("WonderSwan: bank-qualified window views added " + WSRomWindows.mapAll(program, settings.monitor()));
         }
         catch (Exception e) {
             throw new IOException("WonderSwan memory map: " + e.getMessage(), e);

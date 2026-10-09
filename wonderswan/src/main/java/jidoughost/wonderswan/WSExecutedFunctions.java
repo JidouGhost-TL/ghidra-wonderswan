@@ -18,8 +18,8 @@ import ghidra.util.task.TaskMonitor;
  * call into it and no existing function flows to it (the body fixup would have taken it). Such code is grouped into
  * connected pieces by flow (fall-through and branches between executed, function-less instructions); every piece
  * entry, an instruction that something calls or that no other instruction of the piece flows to, becomes a function.
- * Executed code is proven, so this never creates a function in data. Only the default address space is considered:
- * bank-window overlays need per-bank evidence. Work RAM is skipped (rule H1: no image at analysis time).
+ * Executed code is proven, so this never creates a function in data. Bank-window overlays require
+ * physical ROM evidence or an observed execution bank. Work RAM is skipped (rule H1: no image at analysis time).
  */
 public class WSExecutedFunctions {
     private final Program p;
@@ -39,11 +39,11 @@ public class WSExecutedFunctions {
         for (Instruction i : listing.getInstructions(p.getMemory().getLoadedAndInitializedAddressSet(), true)) {
             monitor.checkCancelled();
             Address a = i.getAddress();
-            if (a.getAddressSpace().isOverlaySpace()) continue;
+
             // H1: executed RAM has no image (loader zero-fill); the H1 run bookmark covers it, never a function.
             ghidra.program.model.mem.MemoryBlock b = p.getMemory().getBlock(a);
             if (b != null && !b.isOverlay() && b.getName().equals("RAM")) { ramSkipped++; continue; }
-            if (!ev.executed(a.getOffset())) continue;
+            if (!WSRomEvidence.executed(p, ev, a)) continue;
             if (fm.getFunctionContaining(a) == null) out.add(a);
         }
         outside = out.size();

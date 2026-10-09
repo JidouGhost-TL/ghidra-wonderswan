@@ -222,6 +222,25 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
         }
     }
 
+    /** Run the repair rules after imported evidence has been followed by ordinary analysis. */
+    public static void repairEvidence(Program program, WSEvidence ev, String report, TaskMonitor monitor) throws Exception {
+        try (Seeder s = new Seeder(program, ev, report == null ? "" : report, true, monitor, new MessageLog())) {
+            s.seedExecuted("E1R");
+            s.resolveWindowFlows();
+            WSJumpTables tables = new WSJumpTables(program, ev, line -> s.emit("%s", line));
+            tables.apply(monitor);
+            tables.restoreClearedSites(monitor);
+            tables.finish();
+            WSDecodeRepair.align(program, ev, line -> s.emit("%s", line), monitor);
+            s.classifyArtefacts(tables.keptTargets);
+            WSExecutedFunctions functions = new WSExecutedFunctions(program, ev, line -> s.emit("%s", line), monitor);
+            functions.apply();
+            WSRomEvidence.classifyUnmappedWindows(program, ev, line -> s.emit("%s", line));
+            s.emit("{\"rule\":\"import-repair\",\"summary\":\"%s; %s; %s\"}", tables.summary(), functions.summary(),
+                WSDecodeRepair.boundaries(program, line -> s.emit("%s", line), monitor));
+        }
+    }
+
     /** Applies the rules to one program. */
     static final class Seeder implements AutoCloseable {
         final Program p;
@@ -273,36 +292,13 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
 
         /** B2: overlay block of one ROM bank over a window, created on first use. */
         MemoryBlock overlay(int seg, int bank) throws Exception {
-            String name = String.format("ROM%d_BANK_%04X", seg == WSHardware.SEG_ROM0 ? 0 : 1, bank);
-            Memory mem = p.getMemory();
-            MemoryBlock b = mem.getBlock(name);
-            if (b != null) return b;
-            if (mem.getAllFileBytes().isEmpty()) return null;
-            ghidra.program.database.mem.FileBytes fb = mem.getAllFileBytes().get(0);
-            long effLen = WSHardware.effectiveSize(fb.getSize());
-            long off = WSHardware.bankToRom(bank, effLen);
-            long len = Math.min(0x10000, fb.getSize() - off);
-            if (effLen == fb.getSize()) {
-                b = mem.createInitializedBlock(name, space.getAddress(seg, 0), fb, off, len, true);
-            } else {
-                // Non-power-of-two image: materialise the bank (file at the end, start padding).
-                byte[] file = new byte[(int) fb.getSize()];
-                fb.getOriginalBytes(0, file);
-                byte[] win = new byte[0x10000];
-                long pad = effLen - file.length;
-                for (int i = 0; i < win.length; i++) {
-                    long f = off + i - pad;
-                    win[i] = f < 0 ? (byte) WSHardware.PAD_BYTE : file[(int) f];
-                }
-                b = mem.createInitializedBlock(name, space.getAddress(seg, 0),
-                    new java.io.ByteArrayInputStream(win), 0x10000, monitor, true);
+            String name = WSRomWindows.name(seg, bank);
+            boolean existed = p.getMemory().getBlock(name) != null;
+            MemoryBlock b = WSRomWindows.view(p, seg, bank, true, monitor);
+            if (b != null && !existed) {
+                b2++;
+                emit("{\"rule\":\"B2\",\"overlay\":\"%s\",\"window\":\"%04x\",\"bank\":\"%04x\"}", name, seg, bank);
             }
-            b.setPermissions(true, false, true);
-            ctx.setValue(csval, b.getStart(), b.getEnd(), BigInteger.valueOf(seg));
-            b.setComment(String.format("ROM bank 0x%04X (file offset 0x%06X) in the %s window: code executed here under this bank (evidence rule B1/B2)",
-                bank, off, seg == WSHardware.SEG_ROM0 ? "ROM0" : "ROM1"));
-            b2++;
-            emit("{\"rule\":\"B2\",\"overlay\":\"%s\",\"window\":\"%04x\",\"bank\":\"%04x\",\"rom_offset\":\"%06x\"}", name, seg, bank, off);
             return b;
         }
 
@@ -344,6 +340,8 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
         }
 
         void seed() throws Exception {
+            WSRomWindows.mapAll(p, monitor);
+            WSRomEvidence.prepare(p, ev, line -> emit("%s", line), monitor);
             int defaults = WSCodeContext.seedRomDefaults(p);
             emit("{\"rule\":\"C0\",\"rom_context_spans\":%d}", defaults);
             if (ev.e0bKnown)
@@ -351,6 +349,7 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
             seedExecuted("E1");
             seedEdges();
             resolveWindowFlows();
+            WSRomEvidence.seedWindows(p, ev, line -> emit("%s", line), monitor);
             if (ev.mesenStats != null) emitMesen();
         }
 
@@ -445,20 +444,21 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
                 monitor.checkCancelled();
                 for (Address f : i.getFlows()) {
                     MemoryBlock b = mem.getBlock(f);
-                    if (b != null && !b.isInitialized() && !b.isOverlay() && f.getOffset() >= 0x20000 && f.getOffset() < 0x40000) { sitesToFix.add(i); break; }
+                    if (b != null && !b.isOverlay() && !f.getAddressSpace().isOverlaySpace() && f.getOffset() >= 0x20000 && f.getOffset() < 0x40000) { sitesToFix.add(i); break; }
                 }
             }
             for (Instruction i : sitesToFix) {
                 for (Address f : i.getFlows()) {
                     MemoryBlock b = mem.getBlock(f);
-                    if (b == null || b.isInitialized() || b.isOverlay()) continue;
+                    if (b == null || b.isOverlay() || f.getAddressSpace().isOverlaySpace() || f.getOffset() < 0x20000 || f.getOffset() >= 0x40000) continue;
                     long lin = f.getOffset();
                     // Terminal outcomes never change (the evidence is fixed), so a site resolved by an
                     // earlier pass is done; without this the repair pass re-emits every line (phase 1 ran first).
                     // CONTEXT_CONFLICT is not terminal: later passes may clear the bad decode and resolve it.
                     String doneKey = i.getAddress() + "|" + lin;
                     if (ev.b3resolved.contains(doneKey)) continue;
-                    Set<Integer> banks = ev.windowBanks.get(lin);
+                    Integer selected = WSRomEvidence.staticBank(p, i, lin);
+                    Set<Integer> banks = selected == null ? ev.windowBanks.get(lin) : Set.of(selected);
                     if (banks == null || banks.isEmpty()) {
                         b3unobserved++;
                         ev.b3resolved.add(doneKey);
@@ -471,7 +471,7 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
                         emit("{\"rule\":\"B3\",\"site\":\"%s\",\"target\":\"%05x\",\"outcome\":\"MULTI_BANK\",\"banks\":\"%s\"}", i.getAddress(), lin, banks);
                         continue;
                     }
-                    Address o = addrs(lin, (int) (lin >> 4) & 0xF000).get(0);
+                    Address o = overlay(lin < 0x30000 ? 0x2000 : 0x3000, banks.iterator().next()).getStart().add(lin & 0xffff);
                     boolean call = i.getFlowType().isCall();
                     if (listing.getInstructionAt(o) == null) {
                         try {
@@ -488,6 +488,7 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
                         }
                         new DisassembleCommand(o, null, true).applyTo(p, monitor);
                     }
+                    WSRomEvidence.relocateWindowStub(p, f, o, ev, line -> emit("%s", line), monitor);
                     ev.b3resolved.add(doneKey);
                     if (call) {
                         Reference r = p.getReferenceManager().addMemoryReference(i.getAddress(), o,
@@ -513,6 +514,7 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
 
         /** E1 (also used by phase 2 as E1R to restore executed code removed by later analysis). */
         void seedExecuted(String rule) throws Exception {
+            WSDecodeRepair.align(p, ev, line -> emit("%s", line), monitor);
             Listing listing = p.getListing();
             AddressSet seeds = new AddressSet();
             Set<Long> ram = new TreeSet<>();
@@ -773,7 +775,7 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
                 List<Instruction> run = new ArrayList<>();
                 boolean keptStop = false;
                 Instruction prev = listing.getInstructionBefore(b);
-                while (prev != null && b.equals(prev.getFallThrough()) && !ev.executed(prev.getAddress().getOffset())) {
+                while (prev != null && b.equals(prev.getFallThrough()) && !WSRomEvidence.executed(p, ev, prev.getAddress())) {
                     if (WSRamCode.isRam(p, prev.getAddress())) break;
                     if (keptTargets.contains(prev.getAddress())) { keptStop = true; break; }
                     run.add(0, prev);

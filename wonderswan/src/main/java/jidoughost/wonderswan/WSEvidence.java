@@ -34,6 +34,8 @@ public final class WSEvidence {
 
     /** Executed linear address -> CS at first execution. */
     public final Map<Long, Integer> cs = new TreeMap<>();
+    /** Physical ROM byte flags; code bytes are not implicitly instruction starts or CPU placements. */
+    public byte[] romFlags = new byte[0];
     /** Executed linear address -> DS values seen (first 64 visits). */
     public final Map<Long, Set<Integer>> ds = new HashMap<>();
     /** Executed linear address -> SS values seen (first 64 visits; rule D0 gives SS the same treatment as DS). */
@@ -225,6 +227,7 @@ public final class WSEvidence {
         long cdlCode = 0, cdlData = 0, cdlJumpTargets = 0, cdlSubEntries = 0, cdlSeededNew = 0,
             cdlAmbiguousMirror = 0, cdlWindowOnly = 0, cdlNotSeeded = 0;
         if (cdl != null) {
+            e.romFlags = cdl.flags.clone();
             cdlCode = cdl.codeBytes();
             cdlData = cdl.dataBytes();
             cdlJumpTargets = cdl.jumpTargets();
@@ -273,6 +276,8 @@ public final class WSEvidence {
      */
     public static WSEvidence merge(WSEvidence primary, WSEvidence secondary) {
         WSEvidence e = new WSEvidence();
+        e.romFlags = java.util.Arrays.copyOf(primary.romFlags, Math.max(primary.romFlags.length, secondary.romFlags.length));
+        for (int k = 0; k < secondary.romFlags.length; k++) e.romFlags[k] |= secondary.romFlags[k];
         e.cs.putAll(secondary.cs);
         e.cs.putAll(primary.cs);
         for (Map.Entry<Long, Set<Integer>> x : secondary.ds.entrySet())

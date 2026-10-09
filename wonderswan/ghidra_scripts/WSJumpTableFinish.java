@@ -16,7 +16,10 @@ import jidoughost.wonderswan.WSJumpTables;
  * Then rule J1t demotes over-glued case functions (a recovered JMP site's kept target whose body holds
  * another kept target of the same site): RET-terminated spans are kept as functions, JMP-terminated
  * spans are demoted to case-blocks of the switch parent (which absorbs them through the re-locked
- * switch flows). Must run in its own -noanalysis process like the merge script. Idempotent.
+ * switch flows). A2 preserves executed components beyond bad boundaries as separate functions;
+ * A3 splits exterior interior entries, makes direct tail transfers explicit and bounds weak
+ * unbounded tables to executed targets for the decompiler. Must run in its own -noanalysis
+ * process like the merge script. Idempotent.
  *
  * Args: [evidence.jsonl path or "-"] -- the phase-2 evidence report, read for J1l QUARANTINED lines,
  * J1 RECOVERED/UNRESOLVED lines and E3 observed targets (the J1t demote reads a recovered site's kept
@@ -34,6 +37,8 @@ public class WSJumpTableFinish extends GhidraScript {
         println("WSJumpTableFinish: " + summary);
         summary = WSJumpTables.demoteGluedCases(currentProgram, evidence, lines::add, monitor);
         println("WSJumpTableFinish: " + summary);
+        println(jidoughost.wonderswan.WSDecodeRepair.boundaries(currentProgram, lines::add, monitor));
+        println(jidoughost.wonderswan.WSDecodeRepair.decompilerBoundaries(currentProgram, evidence, lines::add, monitor));
         if (!ev.equals("-") && !lines.isEmpty())
             Files.write(Paths.get(ev), (String.join("\n", lines) + "\n").getBytes(), StandardOpenOption.APPEND);
     }
