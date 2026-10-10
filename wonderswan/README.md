@@ -72,6 +72,34 @@ Detached machines retain the existing instant serial output behavior. Linked sav
 are unsupported; final cartridge save images are supported. `WSLinkTest.java` exercises a synthetic
 two-console fixture. Link play can, for example, connect a two-player puzzle game or a save-transfer utility.
 
+### Serial endpoint
+
+`WSSerialEndpointRun.java` runs the current cartridge as one console whose serial port (the EXT connector's UART) is a
+raw byte stream over TCP. Anything that speaks raw serial bytes can be the cable partner: another console in a
+separate process or on another machine, a relay, or a bridge to a serial device or another program.
+
+```
+WSSerialEndpointRun.java <endpoint> <output dir> [frames=1500] [shotEvery=100] [input|-] [saves|-]
+                         [model=auto|mono|color] [pacing=pull|wire] [timing=realtime|fast]
+```
+
+The endpoint is `tcp:<host>:<port>` (connect, retried for 60 s) or `listen:[<host>:]<port>` (one partner, 60 s);
+frames start once connected. The stream carries raw 8N1 data bytes and no speed, so both ends must select the same
+one. A byte leaves at the end of its byte time; received bytes arrive no sooner than one byte time apart. `pull`
+pacing also holds a received byte while the previous one is unread (no overrun from bursts on the network); `wire`
+delivers at line rate, so an unread byte causes overrun. Bytes arriving while the port is disabled are dropped.
+`realtime` paces frames to wall-clock time (about 75.5 per second) for partners that run in real time; `fast` runs
+unthrottled. Output as for one console of `WSLinkEmulate`, plus `serial.tsv` with `TX`/`RX` rows. Unlike the
+in-process cable, runs are not deterministic: arrival depends on the partner.
+
+Examples:
+
+- Two consoles in separate processes: run one with `listen:4300`, the other with `tcp:<host>:4300`.
+- A USB serial adapter on a real console's EXT port, bridged with a generic tool, e.g.
+  `socat TCP-LISTEN:4300,reuseaddr /dev/ttyACM0,raw,echo=0,b9600` and `tcp:127.0.0.1:4300` here (untested on
+  hardware so far).
+- A program that talks serial bytes on stdin/stdout, e.g. `socat TCP-LISTEN:4300,reuseaddr EXEC:<program>`.
+
 ## Loader
 
 Detects a cartridge by its 16-byte footer (`EA` far JMP) alone; the load spec is preferred when the

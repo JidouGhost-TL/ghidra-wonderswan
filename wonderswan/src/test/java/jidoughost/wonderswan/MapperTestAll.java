@@ -15,6 +15,7 @@ public final class MapperTestAll {
         WSComputedEdgesTest.run();
         WSNoiseTest.run();
         WSSerialTest.run();
+        WSSerialEndpointTest.run();
         System.out.println("MapperTestAll: PASS (" + Check.count + " checks)");
     }
 }
