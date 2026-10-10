@@ -59,7 +59,7 @@ WSLinkEmulate.java <ROM B> <output dir> [frames=1500] [shotEvery=100]
 Input files contain `from to buttons` spans (inclusive frame numbers, hexadecimal keypad mask,
 as in `WSEmulate`). Missing inputs hold no buttons. Save directories use `cart.sram`, `cart.eeprom`
 and `internal.eeprom` as applicable; input images are read without modification. `A/` and `B/`
-contain periodic screenshots, `final.png`, final RAM/ports and `saves/`. `serial.tsv` records direction,
+contain periodic screenshots, `final.png`, final RAM/ports, `saves/` and `coverage.tsv` (executed ROM file byte ranges `rom_start rom_end first_frame`, hex offsets, decimal first shared frame). `serial.tsv` records direction,
 frame, master clock, value, baud rate and delivery/drop result; `summary.txt` records completion/errors.
 
 The cable interleaves cycle-timed CPU instructions on a shared 3.072 MHz clock. The wire advances
@@ -89,7 +89,8 @@ one. A byte leaves at the end of its byte time; received bytes arrive no sooner 
 pacing also holds a received byte while the previous one is unread (no overrun from bursts on the network); `wire`
 delivers at line rate, so an unread byte causes overrun. Bytes arriving while the port is disabled are dropped.
 `realtime` paces frames to wall-clock time (about 75.5 per second) for partners that run in real time; `fast` runs
-unthrottled. Output as for one console of `WSLinkEmulate`, plus `serial.tsv` with `TX`/`RX` rows. Unlike the
+unthrottled. Output: periodic `shot_NNNNN.png`, `final.png`,
+`ram.bin`, `saves/`, `serial.tsv` (`TX`/`RX` rows: direction, frame, master clock, value, baud, result) and `summary.txt`. Unlike the
 in-process cable, runs are not deterministic: arrival depends on the partner.
 
 Examples:
@@ -191,6 +192,12 @@ still needs it.
 | J1t | 2 | Post-analysis script `WSJumpTableFinish` (after the J1m lock): a function at a recovered JMP site's kept target whose body contains another kept target of the same site and partitions exactly into terminal spans is demoted per span (stock case names stripped throughout): RET-terminated spans are real functions and kept, JMP-terminated spans are case-blocks of the switch parent and dropped (no function; the parent absorbs them); the site is re-locked to its current computed-targets-to-code so the decompiler renders the proven cases instead of re-deriving stock's over-approximation; anything else stays as it is |
 | M1 | 2 | A function reached only by plain jumps from inside one other function, with no nested entry and every exit landing in the two, is merged into it (compare-chain cases rejoin their chain); tail-call overrides on the referring jumps are cleared (else the fixup won't follow them), call-typed references retyped, a non-default name kept as a label; anything the fixup doesn't pull is restored; real calls, computed branches, recursion and interrupt entries veto |
 | T1 | 2 | A function with no return whose last instruction is a call to a returning function and whose fall-through is exactly another function's entry is merged with it (one routine split in two); thunks and interrupt entries veto |
+| E1A | 1-2 | Executed alignment outranks speculative decode: where a guessed instruction overlaps an executed instruction start, the guess is cleared and guessed edges into the offcut removed; where both alignments executed, or the losing decode is protected (user/imported), the conflict is reported (`AMBIGUOUS_OR_PROTECTED_ALIGNMENT`) and nothing is changed |
+| B2R | 1-2 | Physical ROM evidence stays distinct from CPU instruction starts: every bank gets a non-executable view in both windows; a window bank proven by constant bank writes in an uninterrupted predecessor chain places code in that bank's view; an automatic function in a window view with no known bank (no instruction image) keeps its provenance and navigation candidates and is classified (`UNMAPPED_WINDOW_PLACEHOLDER`) instead of being trusted |
+| Z1 | 2 | Long runs of one byte value (64+ bytes of `00` or `FF`, 256+ of any other value) that never executed are fill, marked as data (bookmark category `WSFillRun`) and cleared of speculative decode; executed bytes reopen fill as code (`EXECUTION_REOPENS_FILL`) and explicit user code is protected (`PROTECTED_CODE`) |
+| A2 | 2 + finish | Function bodies keep decoded graph components and never join through undecodable bytes; speculative growth is bounded after 256 consecutive bytes without execution evidence; independently executed components are split into their own functions (`EXECUTED_COMPONENT_SPLIT`); user bodies stay. Runs in phase 2 and again in `WSJumpTableFinish` |
+| A3 | finish | Decompiler boundaries (`WSJumpTableFinish`, after merges and J1 locks): independently executed exterior entries become their own functions, direct jumps between the resulting functions are marked as tail transfers, and unresolved weak tables are locked to executed targets. No ROM bytes or user overrides change |
+| J1v | finish | Switch overrides whose site or function no longer matches the current listing are removed (`STALE_OVERRIDE_REMOVED`) before the final locks |
 
 Rules M1 and T1 live in the `WSMergeRoutines` script, not in the repair analyzer, and the script
 runs in its own `-noanalysis` process after the analysis process exits: merges performed inside
