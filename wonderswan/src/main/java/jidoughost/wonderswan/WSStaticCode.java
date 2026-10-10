@@ -36,8 +36,8 @@ import ghidra.util.task.TaskMonitor;
  * and far tables are reserved and defined as pointers. Recognized dispatches
  * are resolved transfers; their targets use the same strict walk. All table
  * bytes veto later starts in every file-backed alias. A bank the evidence
- * never executed has no window
- * view; when its data bytes hold a far call to a known entry, executable
+ * never executed has only dormant window
+ * views; when its data bytes hold a far call to a known entry, executable
  * window views of that bank are mapped first, then seeded like any other view.
  */
 public final class WSStaticCode {
@@ -195,7 +195,7 @@ public final class WSStaticCode {
 
     private void createStaticBankView(int seg, int bank, long size) throws Exception {
         String name = staticBankViewName(seg, bank);
-        if (memory.getBlock(name) != null) return;
+        if (memory.getBlock(name) != null) { memory.getBlock(name).setExecute(true); return; }
         if (memory.getAllFileBytes().isEmpty()) return;
         ghidra.program.database.mem.FileBytes fb = memory.getAllFileBytes().get(0);
         SegmentedAddressSpace space = (SegmentedAddressSpace) program.getAddressFactory().getDefaultAddressSpace();

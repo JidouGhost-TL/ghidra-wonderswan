@@ -25,7 +25,7 @@ import ghidra.util.task.TaskMonitor;
  *          (an upper bound: stop rules still end the table), or CMP reg,N + JA/JAE (Borland form) -> N+1 entries.
  * J1a: a table needs a constant address part (base immediate or displacement), else UNRESOLVED.
  * J1b: an unbounded index (no mask / CMP) is accepted only when the table ends on a strong stop (EXECUTED_CODE,
- *   TABLE_BOUNDARY, FUNCTION_ENTRY, TABLE_BASE, OWN_TARGET); other stops (data, cap) leave the site UNRESOLVED.
+ *   TABLE_BOUNDARY, FUNCTION_ENTRY, DIRECT_CALL_ENTRY, TABLE_BASE, OWN_TARGET); other stops (data, cap) leave the site UNRESOLVED.
  * J1c: a byte-width index (MOV rL,x + XOR rH,rH / MOV rH,0, or CBW for AX) bounds the table at
  *   256 << (shift-1) entries (CBW: 128 forward entries); the table end must still be proven by a strong stop
  *   (EXECUTED_CODE / TABLE_BOUNDARY) or by reaching that bound.
@@ -754,6 +754,7 @@ public final class WSJumpTables {
      *  Every lock is filtered to the site's address space (rule J1q: a foreign-bank override target sends the
      *  decompiler where nothing was decoded). Idempotent. Returns a summary. */
     public static String lockSwitches(Program p, List<String> evidence, Consumer<String> emit, TaskMonitor monitor) throws Exception {
+        pruneStaleOverrides(p, emit, monitor);
         AddressFactory af = p.getAddressFactory();
         Set<Address> recovered = new HashSet<>();
         Set<Address> recoveredJump = new LinkedHashSet<>();
@@ -789,7 +790,7 @@ public final class WSJumpTables {
             Address site = e.getKey();
             if (recovered.contains(site)) continue;
             Instruction ins = listing.getInstructionAt(site);
-            if (ins == null || !ins.getFlowType().isComputed()) {
+            if (ins == null || !ins.getFlowType().isComputed() || !ins.getFlowType().isJump()) {
                 skipped++;
                 emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"NO_SITE\"}", site));
                 continue;
@@ -810,6 +811,7 @@ public final class WSJumpTables {
             }
             obs = ownSpace(site, obs);
             if (obs.isEmpty()) {
+                opaqueJump(p, ins, emit);
                 opaque++;
                 emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"OPAQUE\",\"refs_deleted\":%d}", site, n));
                 continue;
@@ -836,7 +838,7 @@ public final class WSJumpTables {
             Set<Address> obs = e3obs.get(site);
             if (obs == null || obs.isEmpty()) continue;
             Instruction ins = listing.getInstructionAt(site);
-            if (ins == null || !ins.getFlowType().isComputed()) {
+            if (ins == null || !ins.getFlowType().isComputed() || !ins.getFlowType().isJump()) {
                 eskipped++;
                 emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"NO_SITE\"}", site));
                 continue;
@@ -852,6 +854,7 @@ public final class WSJumpTables {
             List<Address> withCode = new ArrayList<>();
             for (Address t : ownSpace(site, obs)) if (listing.getInstructionAt(t) != null) withCode.add(t);
             if (withCode.isEmpty()) {
+                opaqueJump(p, ins, emit);
                 eopaque++;
                 emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"OPAQUE\",\"refs_deleted\":%d}", site, n));
                 continue;
@@ -881,7 +884,7 @@ public final class WSJumpTables {
         for (Address site : recoveredJump) {
             monitor.checkCancelled();
             Instruction ins = listing.getInstructionAt(site);
-            if (ins == null || !ins.getFlowType().isComputed()) {
+            if (ins == null || !ins.getFlowType().isComputed() || !ins.getFlowType().isJump()) {
                 rskipped++;
                 emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"NO_SITE\"}", site));
                 continue;
@@ -916,6 +919,74 @@ public final class WSJumpTables {
         }
         return String.format("J1m jump-table lock: quarantined sites %d, re-derived refs deleted %d, switches locked %d, opaque %d, skipped %d (unresolved+E3 locked %d, opaque %d, skipped %d, recovered locked %d, skipped %d)",
             quar.size(), cleaned, locked + elocked + rlocked, opaque + eopaque, skipped + eskipped + rskipped, elocked, eopaque, eskipped, rlocked, rskipped);
+    }
+
+    /** Function splits and opaque transfers can invalidate a previously stored switch.
+     * Native recovery still reads disconnected namespaces outside the owner's body,
+     * which can crash the decompiler. A split prefix may still reach a switch by
+     * fallthrough, so keep its finite view. Remove invalid labels only in automatic
+     * functions; listing references, instruction bytes and valid overrides stay intact. */
+    public static String pruneStaleOverrides(Program p, Consumer<String> emit, TaskMonitor monitor) throws Exception {
+        SymbolTable symbols = p.getSymbolTable();
+        List<Symbol> switches = new ArrayList<>();
+        for (Symbol s : symbols.getAllSymbols(true))
+            if (s.getName().equals("switch") && s.getParentNamespace().getName().startsWith("jmp_")) switches.add(s);
+        int removed = 0;
+        for (Symbol s : switches) {
+            monitor.checkCancelled();
+            Namespace ns = s.getParentNamespace();
+            Namespace owner = ns.getParentNamespace().getParentNamespace();
+            if (!(owner instanceof Function f) || f.getSymbol().getSource() == SourceType.USER_DEFINED
+                || f.getSignatureSource() == SourceType.USER_DEFINED || f.getSignatureSource() == SourceType.IMPORTED) continue;
+            Instruction ins = p.getListing().getInstructionAt(s.getAddress());
+            String why = ins == null ? "NO_INSTRUCTION"
+                : !ins.getFlowType().isJump() || !ins.getFlowType().isComputed() ? "NOT_COMPUTED_JUMP"
+                : !f.getBody().contains(s.getAddress()) && !directlyReachable(p, f, s.getAddress()) ? "DISCONNECTED_SITE" : null;
+            if (why == null) continue;
+            List<Symbol> labels = new ArrayList<>();
+            boolean protectedNamespace = false;
+            for (Symbol q : symbols.getSymbols(ns)) {
+                if (q.getSymbolType() != SymbolType.LABEL) protectedNamespace = true;
+                labels.add(q);
+            }
+            if (protectedNamespace) continue;
+            Address site = s.getAddress();
+            for (Symbol q : labels) q.delete();
+            removed++;
+            emit.accept(String.format("{\"rule\":\"J1v\",\"site\":\"%s\",\"function\":\"%s\",\"outcome\":\"STALE_OVERRIDE_REMOVED\",\"why\":\"%s\"}", site, f.getEntryPoint(), why));
+        }
+        return "J1v stale switch overrides removed " + removed;
+    }
+
+    private static boolean directlyReachable(Program p, Function f, Address target) {
+        ArrayDeque<Address> queue = new ArrayDeque<>();
+        Set<Address> seen = new HashSet<>();
+        queue.add(f.getEntryPoint());
+        while (!queue.isEmpty()) {
+            Address a = queue.removeFirst();
+            if (a.equals(target)) return true;
+            if (!seen.add(a)) continue;
+            Instruction i = p.getListing().getInstructionAt(a);
+            if (i == null) continue;
+            Address ft = i.getFallThrough();
+            if (ft != null) queue.add(ft);
+            if (i.getFlowOverride() == FlowOverride.NONE && i.getFlowType().isJump()
+                && !i.getFlowType().isComputed()) for (Address t : i.getFlows()) queue.add(t);
+        }
+        return false;
+    }
+
+    /** An empty table override cannot be serialized. Keep a rejected indirect jump
+     * opaque in the native decompiler too, which otherwise recovers the same guesses
+     * again independently of listing references and stored function bodies. */
+    private static void opaqueJump(Program p, Instruction ins, Consumer<String> emit) {
+        Function f = p.getFunctionManager().getFunctionContaining(ins.getAddress());
+        if (!ins.getFlowType().isJump() || ins.getFlowOverride() != FlowOverride.NONE
+            || f != null && (f.getSymbol().getSource() == SourceType.USER_DEFINED
+                || f.getSignatureSource() == SourceType.USER_DEFINED
+                || f.getSignatureSource() == SourceType.IMPORTED)) return;
+        ins.setFlowOverride(FlowOverride.CALL_RETURN);
+        emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"OPAQUE_TAIL_TRANSFER\"}", ins.getAddress()));
     }
 
     /** J1q: the targets that may go into a jump-table override at a site: only the site's own
@@ -1182,13 +1253,13 @@ public final class WSJumpTables {
 
     AddressSpace siteSpace;
 
-    /** Code segment of an instruction: seg:off addresses carry it; bank-overlay addresses are linear, so the
-     *  csval context (the CS the evidence observed there) gives it, else the window segment. */
+    /** Display addresses may use a canonical bank segment even when code runs with a
+     * different CS. Use the instruction's stored CPU context for CS-relative tables. */
     int csOf(Address a) {
-        if (a instanceof SegmentedAddress sa) return sa.getSegment();
         ghidra.program.model.lang.Register csval = p.getProgramContext().getRegister("csval");
         java.math.BigInteger v = csval == null ? null : p.getProgramContext().getValue(csval, a, false);
-        return v != null ? v.intValue() : (int) (a.getOffset() >> 4) & 0xF000;
+        if (v != null) return v.intValue();
+        return a instanceof SegmentedAddress sa ? sa.getSegment() : (int) (a.getOffset() >> 4) & 0xF000;
     }
 
     Rec recover(Instruction site) {
@@ -1282,7 +1353,7 @@ public final class WSJumpTables {
             r.stop = why;
             break;
         }
-        boolean strong = r.stop.equals("EXECUTED_CODE") || r.stop.equals("TABLE_BOUNDARY") || r.stop.equals("FUNCTION_ENTRY")
+        boolean strong = r.stop.equals("EXECUTED_CODE") || r.stop.equals("TABLE_BOUNDARY") || r.stop.equals("FUNCTION_ENTRY") || r.stop.equals("DIRECT_CALL_ENTRY")
             || r.stop.equals("TABLE_BASE") || r.stop.equals("OWN_TARGET");
         // J1b: without an index bound only a strong end (next slot executed / next recovered table) proves
         // the extent; running into data or the cap does not (observed targets stay via rule E3).
@@ -1359,9 +1430,22 @@ public final class WSJumpTables {
         if (!mem.contains(ea) || !mem.getBlock(ea).isInitialized()) return "OUT_OF_ROM";
         if (executed(ea.getOffset()) || executed(ea.getOffset() + 1)) return "EXECUTED_CODE";
         if (p.getFunctionManager().getFunctionAt(ea) != null || p.getFunctionManager().getFunctionAt(ea.add(1)) != null) return "FUNCTION_ENTRY";
+        // A merge may remove a callee's function object without removing its code
+        // or direct call. Its bytes still cannot be read as further table slots.
+        if (directCallEntry(ea) || directCallEntry(ea.add(1))) return "DIRECT_CALL_ENTRY";
         if (!ea.equals(tableStart) && tableBases.contains(ea)) return "TABLE_BASE";
         if (r.targets.contains(ea) || r.targets.contains(ea.add(1))) return "OWN_TARGET";   // J1j
         return null;
+    }
+
+    boolean directCallEntry(Address a) {
+        if (listing.getInstructionAt(a) == null) return false;
+        for (Reference ref : p.getReferenceManager().getReferencesTo(a)) {
+            if (!ref.getReferenceType().isCall() || ref.getReferenceType().isComputed()) continue;
+            Instruction call = listing.getInstructionAt(ref.getFromAddress());
+            if (call != null && call.getFlowType().isCall() && !call.getFlowType().isComputed()) return true;
+        }
+        return false;
     }
 
     /** J1f: every constant CS-relative table base in the program (jump or data table, resolved or not): a

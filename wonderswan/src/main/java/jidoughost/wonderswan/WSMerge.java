@@ -62,6 +62,7 @@ public final class WSMerge {
             int n = mergeOutlined() + mergeFallThrough();
             if (n == 0) break;
         }
+        emit.accept("{\"rule\":\"A2\",\"summary\":\"" + WSDecodeRepair.boundaries(p, emit, monitor) + "\"}");
     }
 
     // ---- M1 ------------------------------------------------------------------------------------

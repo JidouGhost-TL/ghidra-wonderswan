@@ -28,6 +28,7 @@ public class WSImportTrace extends GhidraScript {
         String report = a.length > 2 ? a[2] : "";
         String sum = WSEvidenceAnalyzer.applyEvidence(currentProgram, ev, report, monitor);
         analyzeChanges(currentProgram);
+        WSEvidenceAnalyzer.repairEvidence(currentProgram, ev, report, monitor);
         WSEvidence.MesenStats m = ev.mesenStats;
         println(String.format("WSImportTrace: %s; now functions=%d instructions=%d",
             sum, currentProgram.getFunctionManager().getFunctionCount(), currentProgram.getListing().getNumInstructions()));
