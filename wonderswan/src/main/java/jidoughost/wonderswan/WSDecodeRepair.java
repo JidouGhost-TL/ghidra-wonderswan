@@ -254,7 +254,7 @@ public final class WSDecodeRepair {
             emit.accept(String.format("{\"rule\":\"A3\",\"entry\":\"%s\",\"parent\":\"%s\",\"outcome\":\"EXTERIOR_ENTRY_SPLIT\"}", entry, old.getEntryPoint()));
         }
         for (Instruction i : listing.getInstructions(true)) {
-            if (!plainJump(i) || i.getFlowOverride() != FlowOverride.NONE || !proven(p, i.getAddress())) continue;
+            if (!plainJump(i) || i.getFlowOverride() != FlowOverride.NONE) continue;
             Function from = fm.getFunctionContaining(i.getAddress());
             Function into = fm.getFunctionAt(i.getFlows()[0]);
             if (from == null || into == null || from.equals(into) || !proven(p, into.getEntryPoint())
@@ -270,6 +270,7 @@ public final class WSDecodeRepair {
         // existing finite J1 cases, then give the new owners their weak-table execution locks.
         WSJumpTables.lockSwitches(p, evidence, emit, monitor);
         lockWeakTables(p, weak, "AFTER_SPLIT", locked, opaque, emit, monitor);
+        WSJumpTables.pruneStaleOverrides(p, emit, monitor);
         return String.format("A3 exterior entries split %d, tail transfers %d, weak tables locked %d, opaque %d", split, tails, locked.size(), opaque.size());
     }
 
@@ -332,8 +333,8 @@ public final class WSDecodeRepair {
     }
 
     private static boolean plainJump(Instruction i) {
-        return i.getMnemonicString().startsWith("JMP") && !i.getFlowType().isComputed()
-            && !i.getFlowType().isConditional() && i.getFlows().length == 1;
+        return i.getFlowType().isJump() && !i.getFlowType().isComputed()
+            && i.getFlows().length == 1;
     }
 
     private static Function createFunction(Program p, Address entry, AddressSetView body) throws Exception {

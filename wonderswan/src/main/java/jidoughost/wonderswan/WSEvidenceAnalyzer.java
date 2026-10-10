@@ -180,6 +180,7 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
         EVIDENCE.put(program, ev);
         REPORT.put(program, report == null ? "" : report);
         try (Seeder s = new Seeder(program, ev, report, false, monitor, log)) {
+            WSFillRuns.restoreExecuted(program, ev, line -> s.emit("%s", line));
             s.seed();
             if (seeds != null && !seeds.isBlank()) s.seedFile(Paths.get(seeds));
             log.appendMsg(NAME + " (phase 1): " + s.summary()
@@ -215,6 +216,7 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
      */
     public static String applyEvidence(Program program, WSEvidence ev, String report, TaskMonitor monitor) throws Exception {
         try (Seeder s = new Seeder(program, ev, report == null ? "" : report, false, monitor, new MessageLog())) {
+            WSFillRuns.restoreExecuted(program, ev, line -> s.emit("%s", line));
             s.seed();
             String sum = s.summary();
             if (ev.mesenStats != null) sum += "; " + s.mesenSummary();
@@ -236,6 +238,7 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
             WSExecutedFunctions functions = new WSExecutedFunctions(program, ev, line -> s.emit("%s", line), monitor);
             functions.apply();
             WSRomEvidence.classifyUnmappedWindows(program, ev, line -> s.emit("%s", line));
+            WSFillRuns.apply(program, ev, line -> s.emit("%s", line), monitor);
             s.emit("{\"rule\":\"import-repair\",\"summary\":\"%s; %s; %s\"}", tables.summary(), functions.summary(),
                 WSDecodeRepair.boundaries(program, line -> s.emit("%s", line), monitor));
         }

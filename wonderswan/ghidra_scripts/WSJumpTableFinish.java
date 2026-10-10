@@ -33,6 +33,7 @@ public class WSJumpTableFinish extends GhidraScript {
         if (!ev.equals("-") && Files.exists(Paths.get(ev))) evidence = Files.readAllLines(Paths.get(ev));
         else println("WSJumpTableFinish: WARNING: no evidence report, nothing to lock");
         List<String> lines = new ArrayList<>();
+        println(jidoughost.wonderswan.WSFillRuns.apply(currentProgram, null, lines::add, monitor));
         String summary = WSJumpTables.lockSwitches(currentProgram, evidence, lines::add, monitor);
         println("WSJumpTableFinish: " + summary);
         summary = WSJumpTables.demoteGluedCases(currentProgram, evidence, lines::add, monitor);

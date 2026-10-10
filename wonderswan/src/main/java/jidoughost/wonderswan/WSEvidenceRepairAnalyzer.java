@@ -133,6 +133,7 @@ public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
             rule("D3", s, program, log, failed, () -> parts.add(applyCsDefault(program, s)));
             WSJumpTables jj = j;
             rule("A1", s, program, log, failed, () -> s.classifyArtefacts(jj != null ? jj.keptTargets : java.util.Set.of()));
+            rule("Z1", s, program, log, failed, () -> parts.add(WSFillRuns.apply(program, ev, line -> s.emit("%s", line), monitor)));
             rule("A2", s, program, log, failed, () -> parts.add(WSDecodeRepair.boundaries(program, line -> s.emit("%s", line), monitor)));
             if (convention) rule("C1", s, program, log, failed, () -> parts.add(applyConvention(program, line -> s.emit("%s", line))));
             java.util.Set<ghidra.program.model.address.Address> ivt =

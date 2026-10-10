@@ -144,8 +144,13 @@ public final class WSRomEvidence {
             else if (op == 0xb8 && bytes.length == 3) { al = bytes[1] & 255; ah = bytes[2] & 255; }
             else if (op == 0xba && bytes.length == 3) dx = (bytes[1] & 255) | ((bytes[2] & 255) << 8);
             else if ((op == 0xe6 || op == 0xe7 || op == 0xee || op == 0xef)) {
-                Integer out = op == 0xe6 || op == 0xe7 ? bytes[1] & 255 : dx;
-                if (out != null) {
+                Integer out = op == 0xe6 || op == 0xe7 ? Integer.valueOf(bytes[1] & 255) : dx;
+                if (out == null) {
+                    // An unknown port can change either bank register; later known writes
+                    // may establish a new proof, but the old bank is no longer justified.
+                    low = null;
+                    high = WSRom.size(p) > 0x1000000 ? null : 0;
+                } else {
                     out &= 255;
                     if (out == port || out == wide) low = al;
                     if (out == wide && (op == 0xe7 || op == 0xef)) high = ah;
