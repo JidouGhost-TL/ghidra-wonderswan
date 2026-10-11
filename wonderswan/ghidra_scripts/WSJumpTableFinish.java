@@ -34,12 +34,14 @@ public class WSJumpTableFinish extends GhidraScript {
         else println("WSJumpTableFinish: WARNING: no evidence report, nothing to lock");
         List<String> lines = new ArrayList<>();
         println(jidoughost.wonderswan.WSFillRuns.apply(currentProgram, null, lines::add, monitor));
+        println(jidoughost.wonderswan.WSBankTransfers.apply(currentProgram, lines::add, monitor));
         String summary = WSJumpTables.lockSwitches(currentProgram, evidence, lines::add, monitor);
         println("WSJumpTableFinish: " + summary);
         summary = WSJumpTables.demoteGluedCases(currentProgram, evidence, lines::add, monitor);
         println("WSJumpTableFinish: " + summary);
         println(jidoughost.wonderswan.WSDecodeRepair.boundaries(currentProgram, lines::add, monitor));
         println(jidoughost.wonderswan.WSDecodeRepair.decompilerBoundaries(currentProgram, evidence, lines::add, monitor));
+        println(jidoughost.wonderswan.WSReturns.apply(currentProgram, lines::add, monitor));
         if (!ev.equals("-") && !lines.isEmpty())
             Files.write(Paths.get(ev), (String.join("\n", lines) + "\n").getBytes(), StandardOpenOption.APPEND);
     }

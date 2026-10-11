@@ -28,7 +28,8 @@ import ghidra.util.task.TaskMonitor;
  * jumps' tail-call flow overrides are cleared and their call-typed references retyped (else neither
  * the body fixup nor the decompiler follows them), then C's body is fixed up over T. Anything the
  * fixup does not pull is restored as a function. Computed jumps inside T, recursion, and interrupt
- * entries veto the merge.
+ * entries veto the merge. Recorded rule decisions at a referring jump or inside T veto too:
+ * merging must not discard their flow or switch overrides.
  *
  * T1 (fall-through): a function A with no return instruction whose last instruction is a CALL to a
  * returning function and whose fall-through is exactly the entry of another function B returns
@@ -71,7 +72,7 @@ public final class WSMerge {
         Map<Function, List<Function>> merges = new LinkedHashMap<>();
         for (Function t : fm.getFunctions(true)) {
             monitor.checkCancelled();
-            if (t.isExternal() || t.isThunk()) continue;
+            if (t.isExternal() || t.isThunk() || exteriorEntry(t) || containsRuleOverride(t)) continue;
             Function c = soleFlowReferrer(t);
             if (c == null || !exitsInside(t, c)) continue;
             merges.computeIfAbsent(c, k -> new ArrayList<>()).add(t);
@@ -80,7 +81,8 @@ public final class WSMerge {
         for (Map.Entry<Function, List<Function>> e : merges.entrySet()) {
             Set<Address> demoted = new HashSet<>();
             for (Function t : e.getValue()) {
-                if (fm.getFunctionAt(t.getEntryPoint()) == null) continue;   // already merged this round
+                if (fm.getFunctionAt(t.getEntryPoint()) == null || containsRuleOverride(t)
+                        || ruleOverrideReferrer(t)) continue;   // already merged or protected this round
                 demote(t);
                 demoted.add(t.getEntryPoint());
                 emit.accept(String.format("{\"rule\":\"M1\",\"into\":\"%s\",\"merged\":\"%s\",\"outcome\":\"MERGED\"}",
@@ -113,9 +115,12 @@ public final class WSMerge {
         for (Reference r : p.getReferenceManager().getReferencesTo(t.getEntryPoint())) {
             if (!r.getReferenceType().isFlow()) continue;
             Instruction from = listing.getInstructionAt(r.getFromAddress());
-            if (from == null || !isJump(from) || from.getFlowType().isComputed()) return null;
+            if (from == null || !isJump(from) || from.getFlowType().isComputed() || ruleOverride(from)) return null;
             Function cf = fm.getFunctionContaining(r.getFromAddress());
             if (cf == null || cf.equals(t)) return null;
+            // A bank tail cannot be pulled into a caller in another address space.
+            // Demoting it would discard the proved override and recreate its function.
+            if (!cf.getEntryPoint().getAddressSpace().equals(t.getEntryPoint().getAddressSpace())) return null;
             if (found == null) found = cf;
             else if (!found.equals(cf)) return null;
         }
@@ -126,6 +131,53 @@ public final class WSMerge {
         for (Function u : fm.getFunctions(t.getBody(), true))
             if (!u.getEntryPoint().equals(t.getEntryPoint())) return null;   // an entry nested in t
         return found;
+    }
+
+    /** A3 already separated this independently executed exterior entry. */
+    boolean exteriorEntry(Function f) {
+        for (Bookmark b : p.getBookmarkManager().getBookmarks(f.getEntryPoint()))
+            if (b.getCategory().equals("WSDecompilerBoundary") && b.getComment() != null
+                    && b.getComment().startsWith("Executed entry reached by another function; split from ")) return true;
+        return false;
+    }
+
+    /** Persisted observations and bookmarks distinguish rule decisions from stock tail guesses. */
+    boolean ruleOverride(Instruction ins) {
+        var observed = p.getUsrPropertyManager().getStringPropertyMap(WSObservedSwitches.PROPERTY);
+        if (observed != null) {
+            String targets = observed.getString(ins.getAddress());
+            if (targets != null && !targets.isEmpty()) return true;
+        }
+        // Stored switch decisions have no instruction flow override. Demoting their
+        // owner removes the function namespace and loses the recorded target list.
+        if (ins.getFlowType().isComputed())
+            for (Symbol symbol : p.getSymbolTable().getSymbols(ins.getAddress()))
+                if (symbol.getName().equals("switch") && symbol.getParentNamespace().getName().startsWith("jmp_")
+                        && ghidra.program.model.pcode.JumpTable.readOverride(symbol.getParentNamespace(), p.getSymbolTable()) != null)
+                    return true;
+        var fill = p.getUsrPropertyManager().getIntPropertyMap(WSFillRuns.EDGES);
+        if (fill != null && fill.hasProperty(ins.getAddress())
+                && (ins.getFlowOverride() != FlowOverride.NONE || ins.isFallThroughOverridden())) return true;
+        if (ins.getFlowOverride() == FlowOverride.NONE) return false;
+        for (Bookmark b : p.getBookmarkManager().getBookmarks(ins.getAddress()))
+            if (b.getCategory().equals(WSBankTransfers.CATEGORY)
+                    || b.getCategory().equals("WSDecompilerBoundary")) return true;
+        return false;
+    }
+
+    boolean containsRuleOverride(Function f) {
+        for (Instruction ins : listing.getInstructions(f.getBody(), true))
+            if (ruleOverride(ins)) return true;
+        return false;
+    }
+
+    boolean ruleOverrideReferrer(Function f) {
+        for (Reference ref : p.getReferenceManager().getReferencesTo(f.getEntryPoint())) {
+            if (!ref.getReferenceType().isFlow()) continue;
+            Instruction ins = listing.getInstructionAt(ref.getFromAddress());
+            if (ins != null && ruleOverride(ins)) return true;
+        }
+        return false;
     }
 
     /** A jump-family mnemonic (JMP/Jcc/JCXZ/LOOP): no call, interrupt or return starts this way. */
@@ -140,7 +192,7 @@ public final class WSMerge {
      */
     void clearJumpOverrides(Function c, Set<Address> demoted) {
         for (Instruction ins : listing.getInstructions(c.getBody(), true)) {
-            if (!isJump(ins) || ins.getFlowOverride() == FlowOverride.NONE) continue;
+            if (!isJump(ins) || ins.getFlowOverride() == FlowOverride.NONE || ruleOverride(ins)) continue;
             for (Address f : ins.getFlows())
                 if (demoted.contains(f)) {
                     ins.setFlowOverride(FlowOverride.NONE);
@@ -158,7 +210,7 @@ public final class WSMerge {
      */
     void retypeLocalCalls(Function c, Set<Address> demoted) {
         for (Instruction ins : listing.getInstructions(c.getBody(), true)) {
-            if (!isJump(ins)) continue;
+            if (!isJump(ins) || ruleOverride(ins)) continue;
             for (Reference r : p.getReferenceManager().getReferencesFrom(ins.getAddress())) {
                 if (!r.getReferenceType().isCall() || r.getReferenceType().isComputed()) continue;
                 if (r.getSource() == SourceType.USER_DEFINED || r.getSource() == SourceType.IMPORTED) continue;
@@ -218,7 +270,8 @@ public final class WSMerge {
             Address ft = last.getFallThrough();
             if (ft == null) continue;
             Function b = fm.getFunctionAt(ft);
-            if (b == null || b.isThunk() || b.isExternal() || b.equals(a)) continue;
+            if (b == null || b.isThunk() || b.isExternal() || b.equals(a) || exteriorEntry(b)
+                    || containsRuleOverride(b) || ruleOverrideReferrer(b)) continue;
             if (a.getBody().contains(b.getEntryPoint()) || b.getBody().contains(a.getEntryPoint())) continue;
             if (interruptEntries.contains(b.getEntryPoint())) continue;
             boolean nested = false;
@@ -231,6 +284,7 @@ public final class WSMerge {
         int n = 0;
         for (Function[] m : merges) {
             if (fm.getFunctionAt(m[0].getEntryPoint()) == null || fm.getFunctionAt(m[1].getEntryPoint()) == null) continue;
+            if (containsRuleOverride(m[1]) || ruleOverrideReferrer(m[1])) continue;
             demote(m[1]);
             Set<Address> demoted = new HashSet<>(List.of(m[1].getEntryPoint()));
             retypeLocalCalls(m[0], demoted);

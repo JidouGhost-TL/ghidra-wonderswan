@@ -761,7 +761,9 @@ public final class WSJumpTables {
         Set<Address> unresolved = new LinkedHashSet<>();
         Map<Address, Set<Address>> quar = new LinkedHashMap<>();
         Map<Address, Set<Address>> e3obs = new LinkedHashMap<>();
-        for (String l : evidence) {
+        List<String> observedEvidence = new ArrayList<>(evidence);
+        observedEvidence.addAll(WSObservedSwitches.evidence(p));
+        for (String l : observedEvidence) {
             if (l.contains("\"rule\":\"J1\"") && l.contains("\"outcome\":\"RECOVERED\"")) {
                 Address s = addrField(l, "\"site\":\"", af);
                 if (s != null) {
@@ -778,7 +780,10 @@ public final class WSJumpTables {
             } else if (l.contains("\"rule\":\"E3\"") && l.contains("\"targets\":[")) {
                 Address s = addrField(l, "\"site\":\"", af);
                 Set<Address> obs = addrList(l, "\"targets\":[", af);
-                if (s != null && obs != null) e3obs.put(s, obs);
+                if (s != null && obs != null) {
+                    e3obs.computeIfAbsent(s, k -> new TreeSet<>()).addAll(obs);
+                    WSObservedSwitches.remember(p, s, obs);
+                }
             }
         }
         ReferenceManager rm = p.getReferenceManager();
@@ -832,7 +837,8 @@ public final class WSJumpTables {
             }
         }
         int elocked = 0, eopaque = 0, eskipped = 0;
-        for (Address site : unresolved) {
+        // J2: an observed site needs no preceding static UNRESOLVED report.
+        for (Address site : e3obs.keySet()) {
             monitor.checkCancelled();
             if (recovered.contains(site) || quar.containsKey(site)) continue;
             Set<Address> obs = e3obs.get(site);
@@ -843,6 +849,9 @@ public final class WSJumpTables {
                 emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"NO_SITE\"}", site));
                 continue;
             }
+            boolean protectedFlow = Arrays.stream(rm.getReferencesFrom(site)).anyMatch(r -> r.getReferenceType().isComputed()
+                && (r.getSource() == SourceType.USER_DEFINED || r.getSource() == SourceType.IMPORTED));
+            if (protectedFlow) { eskipped++; continue; }
             int n = 0;
             for (Reference r : rm.getReferencesFrom(site)) {
                 if (!r.getReferenceType().isComputed() || obs.contains(r.getToAddress())) continue;
@@ -866,9 +875,23 @@ public final class WSJumpTables {
                 continue;
             }
             try {
+                for (Address target : withCode)
+                    ins.addMnemonicReference(target, RefType.COMPUTED_JUMP, SourceType.ANALYSIS);
                 new JumpTable(site, new ArrayList<>(withCode), true, 0).writeOverride(f);
+                // Retain detached executed components for A2 to split after locking.
+                // A destructive fixup here would discard their only body membership.
+                if (f.getSymbol().getSource() != SourceType.USER_DEFINED
+                        && f.getSignatureSource() != SourceType.USER_DEFINED
+                        && f.getSignatureSource() != SourceType.IMPORTED) {
+                    AddressSet reachable = new AddressSet(CreateFunctionCmd.getFunctionBody(p, f.getEntryPoint(), monitor));
+                    for (Function other : fm.getFunctions(true))
+                        if (!other.equals(f)) reachable.delete(other.getBody());
+                    AddressSet expanded = new AddressSet(f.getBody());
+                    expanded.add(reachable);
+                    if (!expanded.equals(f.getBody())) f.setBody(expanded);
+                }
                 elocked++;
-                emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"LOCKED\",\"refs_deleted\":%d,\"cases\":%d,\"src\":\"unresolved\"}", site, n, withCode.size()));
+                emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"LOCKED\",\"refs_deleted\":%d,\"cases\":%d,\"src\":\"observed\"}", site, n, withCode.size()));
             } catch (InvalidInputException x) {
                 eskipped++;
                 emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"%s\"}", site, x.getMessage().replace("\"", "'")));
@@ -986,6 +1009,8 @@ public final class WSJumpTables {
                 || f.getSignatureSource() == SourceType.USER_DEFINED
                 || f.getSignatureSource() == SourceType.IMPORTED)) return;
         ins.setFlowOverride(FlowOverride.CALL_RETURN);
+        p.getBookmarkManager().setBookmark(ins.getAddress(), BookmarkType.ANALYSIS, "WSDecompilerBoundary",
+            "Rejected indirect jump retained as opaque tail transfer (J1m)");
         emit.accept(String.format("{\"rule\":\"J1m\",\"site\":\"%s\",\"outcome\":\"OPAQUE_TAIL_TRANSFER\"}", ins.getAddress()));
     }
 

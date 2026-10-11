@@ -6,6 +6,7 @@ import java.util.*;
 import java.util.function.Consumer;
 import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.cmd.function.CreateFunctionCmd;
+import ghidra.app.cmd.function.CreateThunkFunctionCmd;
 import ghidra.app.util.*;
 import ghidra.program.model.address.*;
 import ghidra.program.model.lang.RegisterValue;
@@ -271,6 +272,24 @@ public final class WSDecodeRepair {
         WSJumpTables.lockSwitches(p, evidence, emit, monitor);
         lockWeakTables(p, weak, "AFTER_SPLIT", locked, opaque, emit, monitor);
         WSJumpTables.pruneStaleOverrides(p, emit, monitor);
+        // Ordinary analysis recognizes thunks after the final tail flows change.
+        // Complete that same metadata now so re-import does not change it later.
+        for (Function f : fm.getFunctions(true)) {
+            monitor.checkCancelled();
+            if (f.isExternal() || f.isThunk() || f.getSymbol().getSource() == SourceType.USER_DEFINED
+                    || f.getSignatureSource() == SourceType.USER_DEFINED
+                    || f.getSignatureSource() == SourceType.IMPORTED) continue;
+            boolean tail = false;
+            for (Instruction i : listing.getInstructions(f.getBody(), true))
+                if (i.getFlowOverride() == FlowOverride.CALL_RETURN) { tail = true; break; }
+            if (!tail) continue;
+            Address target = CreateThunkFunctionCmd.getThunkedAddr(p, f.getEntryPoint(), true);
+            Function into = target == null || target == Address.NO_ADDRESS ? null : fm.getFunctionAt(target);
+            if (into == null || into.equals(f) || into.isThunk() && into.getThunkedFunction(true).equals(f)) continue;
+            f.setThunkedFunction(into);
+            emit.accept(String.format("{\"rule\":\"A3\",\"entry\":\"%s\",\"target\":\"%s\",\"outcome\":\"THUNK_METADATA\"}",
+                f.getEntryPoint(), into.getEntryPoint()));
+        }
         return String.format("A3 exterior entries split %d, tail transfers %d, weak tables locked %d, opaque %d", split, tails, locked.size(), opaque.size());
     }
 

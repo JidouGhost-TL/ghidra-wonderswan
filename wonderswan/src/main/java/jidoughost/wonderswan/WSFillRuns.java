@@ -120,6 +120,9 @@ public final class WSFillRuns {
             if (i.getFallThrough() != null) reached.add(i.getFallThrough());
             for (Address flow : i.getFlows()) reached.add(flow);
         }
+        // An automatic entry is a code hypothesis even if erased bytes never decoded.
+        // Include it in the existing fill test; execution and explicit code still win.
+        for (Function f : p.getFunctionManager().getFunctions(true)) reached.add(f.getEntryPoint());
         int runs = 0, preserved = 0, cleared = 0, removed = 0, split = 0, edges = 0;
         for (MemoryBlock block : p.getMemory().getBlocks()) {
             monitor.checkCancelled();

@@ -243,8 +243,17 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
             functions.apply();
             WSRomEvidence.classifyUnmappedWindows(program, ev, line -> s.emit("%s", line));
             WSFillRuns.apply(program, ev, line -> s.emit("%s", line), monitor);
+            // Fencing a body can expose played code to E5. Settle those existing
+            // repairs before save, rather than creating its functions on re-import.
+            String boundaries;
+            int previousFunctions;
+            do {
+                previousFunctions = program.getFunctionManager().getFunctionCount();
+                boundaries = WSDecodeRepair.boundaries(program, line -> s.emit("%s", line), monitor);
+                functions.apply();
+            } while (program.getFunctionManager().getFunctionCount() != previousFunctions);
             s.emit("{\"rule\":\"import-repair\",\"summary\":\"%s; %s; %s\"}", tables.summary(), functions.summary(),
-                WSDecodeRepair.boundaries(program, line -> s.emit("%s", line), monitor));
+                boundaries);
         }
     }
 
@@ -687,6 +696,7 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
             for (Map.Entry<Address, LinkedHashSet<Address>> j : jumps.entrySet()) {
                 Instruction site = listing.getInstructionAt(j.getKey());
                 if (site == null) continue;
+                WSObservedSwitches.remember(p, site.getAddress(), j.getValue());
                 for (Address t : j.getValue()) site.addMnemonicReference(t, RefType.COMPUTED_JUMP, SourceType.ANALYSIS);
                 Function f = p.getFunctionManager().getFunctionContaining(site.getAddress());
                 if (f != null) {

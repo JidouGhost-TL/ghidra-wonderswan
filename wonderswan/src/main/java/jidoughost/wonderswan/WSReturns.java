@@ -3,7 +3,6 @@ package jidoughost.wonderswan;
 
 import java.util.*;
 import java.util.function.Consumer;
-
 import ghidra.program.model.address.Address;
 import ghidra.program.model.data.*;
 import ghidra.program.model.lang.Register;
@@ -11,189 +10,275 @@ import ghidra.program.model.listing.*;
 import ghidra.program.model.symbol.*;
 import ghidra.util.task.TaskMonitor;
 
-/**
- * Rule R1: register return values inferred from evidence, set as function signatures.
- *
- * Hand-written register code returns values in AX, BX, CX, ... (often several at once), but the
- * default convention only models AX and new functions carry no return at all, so the decompiler
- * drops the defining code (a getter decompiles to an empty body) and callers show {@code extraout_}
- * values or lose whole dispatch blocks. A register R (AX, BX, CX, DX, SI, DI) is a return of a
- * function F when both hold:
- * <ul>
- * <li>callers consume it: at least 3 direct call sites read R (or a half of it) before writing it
- * within 6 instructions after the call (single PUSH counts as a read; PUSHA/PUSHF bulk saves do
- * not; the scan stops at the next CALL/INT/RET/JMP).</li>
- * <li>the callee provides it: walking back from a RET of F (fall-through chain, at most 400
- * instructions) reaches a write of R before any POP R. A CALL/INT counts as a write of the
- * call-clobbered AX/BX/CX (a wrapper passes its callee's value through); a restore (POP R) first
- * means R is preserved, not returned.</li>
- * </ul>
- * The return is a byte when every consuming read and every write of R in F is 8-bit, else a word;
- * several registers become one multi-register storage (the decompiler slices the pieces back out).
- * The function is switched to custom variable storage first, else the return would be reallocated
- * from the convention's output model. Functions with a user/imported signature and thunks are left alone.
+/** R1b: caller reads before redefinition and callee value sources reaching every return.
+ * Byte halves are independent; status flags are real one-byte custom storage. A return
+ * needs two consuming callers (one for a routine with a single decoded caller).
+ * Callers that ignore a result are neutral. Every return path must define the value;
+ * entry-value, saved/restored and unresolved paths veto an output, including callers
+ * expecting their own pre-call value. Register inputs come from use before definition.
+ * Explicit signatures and compiler conventions other than the register convention win.
  */
-final class WSReturns {
-    static final List<String> REGS = List.of("AX", "BX", "CX", "DX", "SI", "DI");
-    static final Set<String> CLOBBERED = Set.of("AX", "BX", "CX");
-    static final int MIN_SITES = 3, WINDOW = 6, BACK_WALK = 400;
-
+public final class WSReturns {
+    static final List<String> UNITS = List.of("AL", "AH", "BL", "BH", "CL", "CH", "DL", "DH",
+        "SI", "DI", "BP", "ES", "CF", "ZF", "SF", "OF", "PF", "AF");
+    static final int WINDOW = 12, MAX_BODY = 4096, MAX_PATH = 400, MAX_WALK = MAX_BODY * 32;
     final Program p;
     final Listing listing;
     final Consumer<String> emit;
     final TaskMonitor monitor;
-    int functions, multiReg, skippedSig;
+    final Map<String, Register> units = new LinkedHashMap<>();
+    final Map<Function, Graph> graphs = new HashMap<>();
+    final Map<String, Integer> supplyCache = new HashMap<>();
+    int functions, unchanged, skippedSig;
     final Map<String, Integer> regCounts = new TreeMap<>();
 
     WSReturns(Program p, Consumer<String> emit, TaskMonitor monitor) {
-        this.p = p; this.emit = emit; this.monitor = monitor;
-        listing = p.getListing();
+        this.p = p; this.emit = emit; this.monitor = monitor; listing = p.getListing();
+        for (String n : UNITS) { Register r = p.getRegister(n); if (r != null) units.put(n, r); }
     }
-
+    public static String apply(Program p, Consumer<String> emit, TaskMonitor monitor) throws Exception {
+        WSReturns r = new WSReturns(p, emit, monitor); r.apply(); return r.summary();
+    }
     String summary() {
-        return String.format("R1 register returns: functions with inferred returns %d (multi-register %d), skipped with user/imported signature %d %s",
-            functions, multiReg, skippedSig, regCounts);
+        return String.format("R1b signatures changed %d, unchanged %d, explicit/compiler signatures skipped %d %s",
+            functions, unchanged, skippedSig, regCounts);
     }
-
+    Set<String> mask(Object[] objects) {
+        Set<String> s = new LinkedHashSet<>();
+        for (Object o : objects) if (o instanceof Register r)
+            for (var u : units.entrySet()) if (r.equals(u.getValue()) || r.contains(u.getValue())) s.add(u.getKey());
+        return s;
+    }
+    Set<String> reads(Instruction i) {
+        String m = i.getMnemonicString().toUpperCase();
+        if (m.equals("PUSHA") || m.equals("PUSHF") || m.equals("PUSH") || m.startsWith("RET") || m.equals("IRET")) return Set.of();
+        if ((m.equals("XOR") || m.equals("SUB")) && i.getNumOperands() == 2
+                && i.getDefaultOperandRepresentation(0).equalsIgnoreCase(i.getDefaultOperandRepresentation(1))) return Set.of();
+        return mask(i.getInputObjects());
+    }
+    Set<String> writes(Instruction i) {
+        Set<String> result = mask(i.getResultObjects());
+        String m = i.getMnemonicString().toUpperCase();
+        // A variable-count shift can leave flags untouched when the count is zero.
+        // Result objects describe possible writes, rather than writes on every path.
+        if (Set.of("SHL", "SHR", "SAR", "SAL", "ROL", "ROR", "RCL", "RCR").contains(m)) {
+            var count = i.getNumOperands() > 1 ? i.getScalar(1) : null;
+            if (count == null || (count.getUnsignedValue() & 31) == 0)
+                result.removeIf(u -> u.endsWith("F"));
+        }
+        return result;
+    }
+    boolean explicit(Function f) {
+        if (f.getSignatureSource() == SourceType.USER_DEFINED || f.getSignatureSource() == SourceType.IMPORTED) return true;
+        for (Parameter v : f.getParameters()) if (v.getSource() == SourceType.USER_DEFINED || v.getSource() == SourceType.IMPORTED) return true;
+        String cc = f.getCallingConventionName();
+        return cc != null && !cc.equals("unknown") && !cc.equals("default") && !cc.equals("__wsasm");
+    }
     void apply() throws Exception {
+        // A later callee can acquire inputs needed by an earlier caller. Settle the
+        // monotone parameter additions now, rather than on the next trace import.
+        int previous;
+        do { previous = functions; applyPass(); } while (functions != previous);
+    }
+    void applyPass() throws Exception {
         for (Function f : p.getFunctionManager().getFunctions(true)) {
             monitor.checkCancelled();
             if (f.isExternal() || f.isThunk()) continue;
-            SourceType src = f.getSignatureSource();
-            if (src == SourceType.USER_DEFINED || src == SourceType.IMPORTED) { skippedSig++; continue; }
-            Map<String, Set<Address>> consumers = new HashMap<>();
-            Map<String, Boolean> fullRead = new HashMap<>();
-            for (Reference r : p.getReferenceManager().getReferencesTo(f.getEntryPoint())) {
-                if (!r.getReferenceType().isCall()) continue;
-                Instruction call = listing.getInstructionAt(r.getFromAddress());
-                if (call == null) continue;
-                consumeAfter(call, consumers, fullRead);
+            if (explicit(f)) { skippedSig++; continue; }
+            Graph g = graph(f); if (g == null || g.returns.isEmpty()) continue;
+            List<Instruction> calls = new ArrayList<>();
+            for (Reference ref : p.getReferenceManager().getReferencesTo(f.getEntryPoint())) {
+                if (!ref.getReferenceType().isCall()) continue;
+                Instruction call = listing.getInstructionAt(ref.getFromAddress());
+                if (call != null && call.getFlowType().isCall() && !call.getFlowType().isComputed()
+                        && calls.stream().noneMatch(c -> c.getAddress().equals(call.getAddress()))) calls.add(call);
             }
-            List<String> returns = new ArrayList<>();
-            for (String reg : REGS) {
-                Set<Address> sites = consumers.getOrDefault(reg, Set.of());
-                if (sites.size() < MIN_SITES) continue;
-                if (!providedByCallee(f, reg)) continue;
-                returns.add(reg);
+            if (calls.isEmpty()) continue;
+            Map<String, List<String>> consumers = new LinkedHashMap<>();
+            for (Instruction call : calls) consumeAfter(call, consumers);
+            Set<String> outs = new LinkedHashSet<>();
+            for (String u : UNITS) {
+                int n = consumers.getOrDefault(u, List.of()).size();
+                if (n < (calls.size() == 1 ? 1 : 2)) continue;
+                int source = sources(f, u, new HashSet<>());
+                if (source == 1) outs.add(u);
+                else emit.accept(String.format("{\"rule\":\"R1b\",\"function\":\"%s\",\"unit\":\"%s\",\"outcome\":\"VETO_SOURCE\",\"sources\":%d,\"consuming_callers\":%d,\"neutral_callers\":%d,\"reads\":\"%s\"}",
+                    f.getEntryPoint(), u, source, n, calls.size() - n, consumers.get(u)));
             }
-            if (returns.isEmpty()) continue;
-            setReturn(f, returns, consumers, fullRead);
+            if (outs.isEmpty()) continue;
+            Set<String> ins = inputs(g);
+            setSignature(f, coalesce(outs), coalesce(ins), consumers, calls.size());
         }
     }
-
-    /** Registers read-before-written in the WINDOW instructions after a call. */
-    void consumeAfter(Instruction call, Map<String, Set<Address>> consumers, Map<String, Boolean> fullRead) {
+    void consumeAfter(Instruction call, Map<String, List<String>> consumers) {
+        Set<String> seen = new HashSet<>(), killed = new HashSet<>();
         Address a = call.getFallThrough();
-        Set<String> read = new HashSet<>(), written = new HashSet<>();
-        Set<String> full = new HashSet<>();
         for (int n = 0; n < WINDOW && a != null; n++) {
-            Instruction ins = listing.getInstructionAt(a);
-            if (ins == null) break;
-            String mn = ins.getMnemonicString().toUpperCase();
-            if (!mn.equals("PUSHA") && !mn.equals("PUSHF")) {
-                for (Object o : ins.getInputObjects()) reg16(o, full, read, written, false);
-                for (Object o : ins.getResultObjects()) reg16(o, full, read, written, true);
+            Instruction i = listing.getInstructionAt(a); if (i == null) break;
+            Set<String> read = reads(i);
+            // A single PUSH is a real caller consumption; bulk saves are excluded.
+            if (i.getMnemonicString().equalsIgnoreCase("PUSH")) read = mask(i.getInputObjects());
+            for (String u : read) if (!killed.contains(u) && seen.add(u))
+                consumers.computeIfAbsent(u, k -> new ArrayList<>()).add(call.getAddress() + "->" + i.getAddress());
+            killed.addAll(writes(i));
+            if (i.getFlowType().isCall() || i.getFlowType().isJump() || i.getFlowType().isTerminal()
+                    || i.getMnemonicString().toUpperCase().startsWith("INT")) break;
+            a = i.getFallThrough();
+        }
+    }
+    final class Graph {
+        final Function f;
+        final Map<Address, Instruction> code = new LinkedHashMap<>();
+        final Map<Address, Set<Address>> pred = new HashMap<>();
+        final List<Instruction> returns = new ArrayList<>();
+        final Map<String, Map<Address, Integer>> sources = new HashMap<>();
+        Graph(Function f) {
+            this.f = f;
+            for (Instruction i : listing.getInstructions(f.getBody(), true)) {
+                code.put(i.getAddress(), i);
+                if (i.getMnemonicString().toUpperCase().startsWith("RET")) returns.add(i);
+                if (code.size() > MAX_BODY) break;
             }
-            if (mn.startsWith("CALL") || mn.startsWith("INT") || mn.startsWith("RET") || mn.equals("IRET")
-                    || mn.equals("JMP") || mn.equals("JMPF")) break;
-            a = ins.getFallThrough();
-        }
-        for (String r : read) {
-            consumers.computeIfAbsent(r, k -> new HashSet<>()).add(call.getAddress());
-            if (full.contains(r)) fullRead.put(r, true);
-        }
-    }
-
-    /** Maps a register operand to its 16-bit parent (REGS only); records a read unless already written. */
-    void reg16(Object o, Set<String> full, Set<String> read, Set<String> written, boolean write) {
-        if (!(o instanceof Register r)) return;
-        Register base = r.getBaseRegister() == null ? r : r.getBaseRegister();
-        String n = base.getName().toUpperCase();
-        if (n.length() == 3 && n.startsWith("E")) n = n.substring(1);
-        if (!REGS.contains(n)) return;
-        if (r.getName().equalsIgnoreCase(n) && r.getBitLength() == 16) full.add(n);
-        else if (base.getBitLength() == 16 && r.getBitLength() == 16) full.add(n);
-        if (write) written.add(n);
-        else if (!written.contains(n)) read.add(n);
-    }
-
-    /** True when a write of reg reaches some RET of f before any POP reg (CALL/INT provide AX/BX/CX). */
-    boolean providedByCallee(Function f, String reg) {
-        Register r16 = p.getRegister(reg);
-        for (Instruction ret : listing.getInstructions(f.getBody(), true)) {
-            String mn = ret.getMnemonicString().toUpperCase();
-            if (!mn.startsWith("RET") && !mn.equals("IRET")) continue;
-            Address a = ret.getFallFrom();
-            for (int n = 0; n < BACK_WALK && a != null; n++) {
-                Instruction ins = listing.getInstructionAt(a);
-                if (ins == null) break;
-                String im = ins.getMnemonicString().toUpperCase();
-                if ((im.startsWith("CALL") || im.startsWith("INT")) && CLOBBERED.contains(reg)) return true;
-                boolean pop = im.equals("POP") && writesReg(ins, reg, r16);
-                if (pop) break;   // restored before any write on this path: preserved, not returned
-                if (writesReg(ins, reg, r16)) return true;
-                if (ins.getAddress().equals(f.getEntryPoint())) break;
-                a = ins.getFallFrom();
+            for (Instruction i : code.values()) {
+                if (i.getFallThrough() != null && code.containsKey(i.getFallThrough()))
+                    pred.computeIfAbsent(i.getFallThrough(), k -> new LinkedHashSet<>()).add(i.getAddress());
+                if (i.getFlowType().isJump()) for (Address a : i.getFlows()) if (code.containsKey(a))
+                    pred.computeIfAbsent(a, k -> new LinkedHashSet<>()).add(i.getAddress());
             }
         }
-        return false;
     }
-
-    static boolean writesReg(Instruction ins, String reg, Register r16) {
-        for (Object o : ins.getResultObjects())
-            if (o instanceof Register w) {
-                Register base = w.getBaseRegister() == null ? w : w.getBaseRegister();
-                String n = base.getName().toUpperCase();
-                if (n.length() == 3 && n.startsWith("E")) n = n.substring(1);
-                if (n.equals(reg)) return true;
-                if (r16 != null && (w.contains(r16) || r16.contains(w))) return true;
+    Graph graph(Function f) {
+        Graph g = graphs.computeIfAbsent(f, Graph::new);
+        return g.code.size() > MAX_BODY ? null : g;
+    }
+    Function directCallee(Instruction i) {
+        if (!i.getFlowType().isCall() || i.getFlowType().isComputed() || i.getFlows().length != 1) return null;
+        return p.getFunctionManager().getFunctionAt(i.getFlows()[0]);
+    }
+    // Definition, entry value, restore, or unresolved source; mixed paths retain input storage.
+    boolean supplied(Function f, String unit, Set<String> visiting) {
+        int source = sources(f, unit, visiting);
+        return source == 1;
+    }
+    int sources(Function f, String unit, Set<String> visiting) {
+        String key = f.getEntryPoint() + "/" + unit;
+        Integer cached = supplyCache.get(key); if (cached != null) return cached;
+        if (visiting.size() >= 8 || !visiting.add(key)) return 8;
+        Graph g = graph(f); int source = 0;
+        if (g == null || g.returns.isEmpty()) source = 8;
+        else {
+            int[] remaining = { MAX_WALK };
+            for (Instruction ret : g.returns) {
+                source |= before(g, ret.getAddress(), unit, new HashSet<>(), visiting, remaining);
+                if ((source & 12) != 0) break;
             }
-        return false;
+        }
+        visiting.remove(key);
+        if ((source & 8) == 0) supplyCache.put(key, source);
+        return source;
     }
-
-    void setReturn(Function f, List<String> returns, Map<String, Set<Address>> consumers, Map<String, Boolean> fullRead) throws Exception {
-        List<Register> regs = new ArrayList<>();
-        List<String> sizes = new ArrayList<>();
-        int bytes = 0;
-        for (String reg : returns) {
-            // SI/DI have no 8-bit halves: byte returns exist only for AX/BX/CX/DX
-            boolean full = fullRead.getOrDefault(reg, false) || fullWrite(f, reg) || reg.equals("SI") || reg.equals("DI");
-            Register r = p.getRegister(full ? reg : reg.charAt(0) + "L");
-            if (r == null) r = p.getRegister(reg);
-            int n = r.getBitLength() / 8;
-            bytes += n;
-            sizes.add(reg + ":" + n);
-            regs.add(r);
+    int before(Graph g, Address a, String unit, Set<Address> path, Set<String> visiting, int[] remaining) {
+        if (--remaining[0] < 0 || path.size() >= MAX_PATH || !path.add(a)) return 8;
+        Map<Address, Integer> memo = g.sources.computeIfAbsent(unit, k -> new HashMap<>());
+        Integer known = memo.get(a);
+        if (known != null) { path.remove(a); return known; }
+        Set<Address> pred = g.pred.getOrDefault(a, Set.of());
+        if (pred.isEmpty()) { path.remove(a); return 2; }
+        int source = 0;
+        for (Address b : pred) {
+            Instruction i = g.code.get(b); String mn = i.getMnemonicString().toUpperCase();
+            if (i.getFlowType().isCall()) {
+                Function callee = directCallee(i);
+                int callSource = callee == null ? 8 : sources(callee, unit, visiting);
+                source |= callSource & 13;
+                if ((callSource & 2) != 0) source |= before(g, b, unit, path, visiting, remaining);
+            } else if (mn.startsWith("INT") || mn.equals("IRET")) source |= 8;
+            else if (writes(i).contains(unit))
+                source |= mn.equals("POP") || mn.equals("POPA") || mn.equals("POPF") ? 4 : 1;
+            else source |= before(g, b, unit, path, visiting, remaining);
+            if ((source & 12) != 0) break;
         }
-        // the storage size must equal the type size; odd totals use an array type
-        DataType type = bytes == 1 ? new ByteDataType() : bytes == 2 ? new WordDataType()
-            : bytes == 4 ? new DWordDataType() : bytes == 8 ? new QWordDataType()
-            : bytes % 2 == 0 ? new ArrayDataType(new WordDataType(), bytes / 2, 2) : new ArrayDataType(new ByteDataType(), bytes, 1);
-        try {
-            // custom storage first: without it setReturn reallocates the return from the
-            // convention's output model (AX), silently discarding any other register
-            f.setCustomVariableStorage(true);
-            f.setReturn(type, new VariableStorage(p, regs.toArray(new Register[0])), SourceType.ANALYSIS);
-        } catch (Exception e) {
-            emit.accept(String.format("{\"rule\":\"R1\",\"function\":\"%s\",\"outcome\":\"STORAGE_REJECTED\",\"returns\":\"%s\",\"error\":\"%s\"}",
-                f.getEntryPoint(), sizes, String.valueOf(e).replace('"', '\'')));
-            return;
+        // Only completed acyclic proofs are independent of the current path/call stack.
+        if ((source & 8) == 0) memo.put(a, source);
+        path.remove(a); return source;
+    }
+    Set<String> inputs(Graph g) {
+        Map<Address, Set<String>> defined = new HashMap<>();
+        ArrayDeque<Address> work = new ArrayDeque<>();
+        Address entry = g.f.getEntryPoint(); defined.put(entry, new HashSet<>()); work.add(entry);
+        Set<String> inputs = new LinkedHashSet<>();
+        int steps = 0;
+        while (!work.isEmpty() && steps++ < MAX_BODY * 32) {
+            Address a = work.remove(); Instruction i = g.code.get(a); if (i == null) continue;
+            Set<String> have = new HashSet<>(defined.get(a));
+            for (String u : reads(i)) if (!have.contains(u)) inputs.add(u);
+            have.addAll(writes(i));
+            if (i.getFlowType().isCall()) {
+                Function callee = directCallee(i);
+                if (callee != null) {
+                    for (Parameter param : callee.getParameters()) for (var vn : param.getVariableStorage().getVarnodes()) {
+                        Register r = p.getRegister(vn.getAddress(), vn.getSize());
+                        if (r != null) for (String u : mask(new Object[]{r})) if (!have.contains(u)) inputs.add(u);
+                    }
+                    for (String u : UNITS) if (supplied(callee, u, new HashSet<>())) have.add(u);
+                }
+            }
+            List<Address> next = new ArrayList<>();
+            if (i.getFallThrough() != null) next.add(i.getFallThrough());
+            if (i.getFlowType().isJump()) next.addAll(Arrays.asList(i.getFlows()));
+            for (Address b : next) {
+                if (!g.code.containsKey(b) || b.equals(entry)) continue;
+                Set<String> old = defined.get(b), merged = new HashSet<>(have);
+                if (old != null) merged.retainAll(old);
+                if (old == null || !old.equals(merged)) { defined.put(b, merged); work.add(b); }
+            }
         }
+        return inputs;
+    }
+    List<Register> coalesce(Set<String> set) {
+        List<Register> regs = new ArrayList<>(); Set<String> done = new HashSet<>();
+        for (String u : UNITS) {
+            if (!set.contains(u) || done.contains(u)) continue;
+            if (u.length() == 2 && u.endsWith("L") && set.contains(u.charAt(0) + "H")) {
+                regs.add(p.getRegister(u.charAt(0) + "X")); done.add(u.charAt(0) + "H");
+            } else regs.add(units.get(u));
+        }
+        return regs;
+    }
+    DataType type(Register r) { return r.getBitLength() <= 8 ? (r.getName().endsWith("F") ? BooleanDataType.dataType : ByteDataType.dataType) : WordDataType.dataType; }
+    void setSignature(Function f, List<Register> outputs, List<Register> inputs,
+            Map<String, List<String>> consumers, int callers) throws Exception {
+        int bytes = outputs.stream().mapToInt(r -> Math.max(1, r.getBitLength() / 8)).sum();
+        DataType result;
+        if (outputs.size() == 1) result = type(outputs.get(0));
+        else {
+            String shape = String.join("_", outputs.stream().map(Register::getName).toList());
+            StructureDataType st = new StructureDataType(new CategoryPath("/WonderSwan/Registers"), "result_" + shape, 0);
+            for (Register r : outputs) st.add(type(r), "out_" + r.getName(), null);
+            result = st;
+        }
+        VariableStorage storage = new VariableStorage(p, outputs.toArray(new Register[0]));
+        if (storage.size() != bytes || result.getLength() != bytes) throw new IllegalStateException("R1b result size mismatch");
+        List<Variable> params = new ArrayList<>(Arrays.asList(f.getParameters()));
+        for (Register r : inputs) {
+            VariableStorage s = new VariableStorage(p, r);
+            if (params.stream().anyMatch(v -> v.getVariableStorage().intersects(s))) continue;
+            params.add(new ParameterImpl("in_" + r.getName(), type(r), s, p, SourceType.ANALYSIS));
+        }
+        boolean same = f.hasCustomVariableStorage() && storage.equals(f.getReturn().getVariableStorage())
+            && result.isEquivalent(f.getReturnType()) && params.size() == f.getParameterCount();
+        if (same) { unchanged++; return; }
+        ReturnParameterImpl ret = new ReturnParameterImpl(result, storage, p);
+        f.updateFunction(f.getCallingConventionName(), ret, params, Function.FunctionUpdateType.CUSTOM_STORAGE, true,
+            SourceType.ANALYSIS);
         functions++;
-        if (returns.size() > 1) multiReg++;
-        for (String reg : returns) regCounts.merge(reg, 1, Integer::sum);
-        StringBuilder sites = new StringBuilder();
-        for (String reg : returns) sites.append(sites.length() > 0 ? ";" : "").append(reg).append("=").append(consumers.get(reg).size());
-        emit.accept(String.format("{\"rule\":\"R1\",\"function\":\"%s\",\"outcome\":\"SET\",\"returns\":\"%s\",\"call_sites\":\"%s\"}",
-            f.getEntryPoint(), sizes, sites));
-    }
-
-    boolean fullWrite(Function f, String reg) {
-        Register r16 = p.getRegister(reg);
-        for (Instruction ins : listing.getInstructions(f.getBody(), true))
-            for (Object o : ins.getResultObjects())
-                if (o instanceof Register w && w.getBitLength() == 16
-                        && (w.getName().equalsIgnoreCase(reg) || r16 != null && (w.contains(r16) || r16.contains(w)))) return true;
-        return false;
+        for (Register r : outputs) regCounts.merge(r.getName(), 1, Integer::sum);
+        List<String> votes = new ArrayList<>(), neutral = new ArrayList<>();
+        for (String u : UNITS) if (outputs.stream().anyMatch(r -> r.equals(units.get(u)) || r.contains(units.get(u)))) {
+            int n = consumers.getOrDefault(u, List.of()).size();
+            votes.add("\"" + u + "\":" + n); neutral.add("\"" + u + "\":" + (callers - n));
+        }
+        emit.accept(String.format("{\"rule\":\"R1b\",\"function\":\"%s\",\"outcome\":\"SET\",\"returns\":\"%s\",\"inputs\":\"%s\",\"callers\":%d,\"consuming_callers\":{%s},\"neutral_callers\":{%s},\"reads\":\"%s\"}",
+            f.getEntryPoint(), storage, inputs, callers, String.join(",", votes), String.join(",", neutral), consumers));
     }
 }
