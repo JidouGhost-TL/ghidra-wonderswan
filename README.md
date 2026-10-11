@@ -84,7 +84,9 @@ distributed, so they are not part of this repository.
   mode: 0 unexplained differences; undefined-encoding lengths verified against hardware-tested sources.
 - **Semantics:** WSCpuTest 48/48 groups (flags included, many exhaustive) and the ws-test-suite CPU
   tests (80186 quirks, prefixes, interrupt timing) pass on `WSMachine`.
-- **Emulator:** coverage agreement with Mesen 2 of 99.4–99.96 % on commercial titles over 1500 frames.
+- **Emulator:** short, scripted comparisons with Mesen 2 measure overlap in executed addresses over
+  1500 frames. The overlap varies by cartridge; it does not establish identical code paths or
+  full-game compatibility. See the wiki's [method and results](https://github.com/JidouGhost-TL/ghidra-wonderswan/wiki/Emulation).
 - **Saves:** cartridge and internal EEPROM (full serial protocol) and SRAM are emulated; the ws-test-suite EEPROM
   test ROMs (internal, 1 Kbit, 16 Kbit) pass. Save images load and save as files (see `wonderswan/README.md`).
 

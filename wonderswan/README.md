@@ -330,6 +330,11 @@ WSEmulate.java <outdir> [frames=1500] [insns/frame=40000] [stopAt linear hex | -
                [saves dir to load | -] [input script file | -] [environment | -]
 ```
 
+This script defaults to 40000 instructions per frame; the execution-evidence analyzer defaults to
+15000. These are separate instruction budgets, not hardware clock rates. Set the same budget
+explicitly when comparing runs. With `cyc=1`, cycle timing determines frames and the instruction
+budget is ignored.
+
 The environment argument is a comma-separated `key=value` list:
 
 | Key | Meaning |
