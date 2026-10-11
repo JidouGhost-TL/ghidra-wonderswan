@@ -233,6 +233,7 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
         try (Seeder s = new Seeder(program, ev, report == null ? "" : report, true, monitor, new MessageLog())) {
             s.seedExecuted("E1R");
             s.resolveWindowFlows();
+            WSInlineTables.apply(program, line -> s.emit("%s", line), monitor);
             WSJumpTables tables = new WSJumpTables(program, ev, line -> s.emit("%s", line));
             tables.apply(monitor);
             tables.restoreClearedSites(monitor);

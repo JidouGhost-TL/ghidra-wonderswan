@@ -156,13 +156,15 @@ public final class WSDecodeRepair {
                 if (seen.getOrDefault(a, Integer.MAX_VALUE) <= unplayed) continue;
                 seen.put(a, unplayed);
                 Instruction i = p.getListing().getInstructionAt(a);
-                if (i == null || i.getMnemonicString().contains("UNDEF")) continue;
+                if (i == null || i.getMnemonicString().contains("UNDEF")
+                    || !f.getBody().contains(i.getMinAddress(), i.getMaxAddress())) continue;
                 unplayed = proven(p, a) ? 0 : unplayed + i.getLength();
                 if (f.getBody().getNumAddresses() >= 32768 && unplayed > 256) { cap = true; continue; }
                 body.add(i.getMinAddress(), i.getMaxAddress());
                 Address ft = i.getFallThrough();
                 if (ft != null) queue.add(Map.entry(ft, unplayed));
                 if (!i.getFlowType().isCall()) for (Address flow : i.getFlows()) queue.add(Map.entry(flow, unplayed));
+                for (Address flow : WSInlineTables.targets(p, i)) queue.add(Map.entry(flow, unplayed));
             }
             if (body.isEmpty() || !body.contains(f.getEntryPoint()) || body.equals(f.getBody())) continue;
             long before = f.getBody().getNumAddresses();
@@ -202,8 +204,13 @@ public final class WSDecodeRepair {
             Function owner = p.getFunctionManager().getFunctionContaining(a);
             Function initial = p.getFunctionManager().getFunctionContaining(entry);
             if (owner != null && !owner.equals(initial)) continue;
+            // An independently entered component may loop to the original entry.
+            // Keep that entry in its own function; the back edge becomes a tail
+            // transfer after the split, rather than duplicating its switch graph.
+            if (initial != null && !entry.equals(initial.getEntryPoint()) && a.equals(initial.getEntryPoint())) continue;
             Instruction i = p.getListing().getInstructionAt(a);
-            if (i == null || i.getMnemonicString().contains("UNDEF")) continue;
+            if (i == null || i.getMnemonicString().contains("UNDEF")
+                || !allowed.contains(i.getMinAddress(), i.getMaxAddress())) continue;
             body.add(i.getMinAddress(), i.getMaxAddress());
             if (i.getFallThrough() != null) pending.add(i.getFallThrough());
             if (!i.getFlowType().isCall()) Collections.addAll(pending, i.getFlows());
@@ -243,7 +250,7 @@ public final class WSDecodeRepair {
             Function old = fm.getFunctionContaining(entry);
             if (old == null || old.getEntryPoint().equals(entry)) continue;
             AddressSet body = component(p, entry, old.getBody(), monitor);
-            // An internal loop back to the original entry is not a separable exterior entry.
+            // The original entry remains owned by its prefix even when this component loops back.
             if (body.isEmpty() || body.contains(old.getEntryPoint())) continue;
             AddressSet kept = new AddressSet(old.getBody());
             kept.delete(body);
@@ -297,7 +304,7 @@ public final class WSDecodeRepair {
         Set<Address> weak = new TreeSet<>();
         for (String line : evidence) {
             if (!line.contains("\"rule\":\"J1\"") || !line.contains("\"outcome\":\"UNRESOLVED\"")
-                || !line.contains("UNBOUNDED_WEAK_STOP:")) continue;
+                || !(line.contains("UNBOUNDED_WEAK_STOP:") || line.contains("BYTE_INDEX_WEAK_STOP:"))) continue;
             String marker = "\"site\":\"";
             int at = line.indexOf(marker);
             if (at < 0) continue;
@@ -325,7 +332,9 @@ public final class WSDecodeRepair {
             Instruction i = listing.getInstructionAt(site);
             Function f = p.getFunctionManager().getFunctionContaining(site);
             if (i == null || !i.getFlowType().isJump() || !i.getFlowType().isComputed()
-                || f == null || !hasProof(p, f) || f.getSymbol().getSource() == SourceType.USER_DEFINED) continue;
+                || f == null || WSRamCode.isRam(p, f.getEntryPoint())
+                || f.getSymbol().getSource() == SourceType.USER_DEFINED
+                || f.getSignatureSource() == SourceType.USER_DEFINED || f.getSignatureSource() == SourceType.IMPORTED) continue;
             ArrayList<Address> cases = new ArrayList<>();
             for (Address t : i.getFlows()) {
                 if (site.getAddressSpace().equals(t.getAddressSpace()) && proven(p, t)
@@ -343,6 +352,7 @@ public final class WSDecodeRepair {
                 emit.accept(String.format("{\"rule\":\"A3\",\"site\":\"%s\",\"function\":\"%s\",\"outcome\":\"OPAQUE_WEAK_TABLE\"}", site, f.getEntryPoint()));
                 continue;
             }
+            if (!hasProof(p, f)) continue;
             new JumpTable(site, cases, true, 0).writeOverride(f);
             locked.add(site);
             p.getBookmarkManager().setBookmark(site, BookmarkType.ANALYSIS, "WSDecompilerBoundary",

@@ -107,7 +107,7 @@ public final class WSJumpTables {
 
     static final class Rec {
         String shape = "?", idx, scaledBy = null, bound = "none", stop = "BOUND";
-        Address site;
+        Address site, returnEnd;
         boolean baseFound, byteBound;
         int slots, empty;                       // slots scanned (incl. empty 0000 slots), empty slots
         List<Integer> slotOf = new ArrayList<>(); // slot index of each target
@@ -491,7 +491,18 @@ public final class WSJumpTables {
             r.targets.add(seg(cs, (int) ((o - ((long) cs << 4)) & 0xFFFF)));
             observedMissing++;
         }
-        boolean isCall = ins.getMnemonicString().equalsIgnoreCase("CALL");
+        boolean pushedCall = r.returnEnd != null && r.stop.equals("PUSH_RETURN_ENTRY");
+        boolean isCall = ins.getMnemonicString().equalsIgnoreCase("CALL") || pushedCall;
+        if (pushedCall) {
+            ins.setFlowOverride(FlowOverride.CALL);
+            p.getBookmarkManager().setBookmark(ins.getAddress(), BookmarkType.ANALYSIS, "WSDecompilerBoundary",
+                "J1x pushed near return represented as computed call; continuation=" + r.returnEnd);
+            if (listing.getInstructionContaining(r.returnEnd) == null && listing.getDefinedDataContaining(r.returnEnd) == null) {
+                copyContext(ins.getAddress(), r.returnEnd, cs);
+                new DisassembleCommand(r.returnEnd, null, true).applyTo(p, monitor);
+            }
+            ins.setFallThrough(r.returnEnd);
+        }
         List<Address> kept = new ArrayList<>();
         for (Address t : r.targets) {
             if (listing.getInstructionAt(t) == null) {
@@ -555,6 +566,23 @@ public final class WSJumpTables {
                 CreateFunctionCmd.fixupFunctionBody(p, f, monitor);
             }
         }
+        if (pushedCall && f != null) {
+            CreateFunctionCmd.fixupFunctionBody(p, f, monitor);
+            listing.getInstructionAt(ins.getAddress()).setFallThrough(r.returnEnd);
+            emit.accept(String.format("{\"rule\":\"J1x\",\"site\":\"%s\",\"continuation\":\"%s\",\"outcome\":\"PUSHED_NEAR_CALL\"}", ins.getAddress(), r.returnEnd));
+        }
+        int dataSlots = 0;
+        if (r.maskOffsets == null) {
+            if (r.slots > 0 && WSInlineTables.words(p, seg(cs, r.table), r.slots)) dataSlots = r.slots;
+        } else {
+            int scanned = 0;
+            for (int offset : r.maskOffsets) {
+                if (scanned++ >= r.slots) break;
+                if (WSInlineTables.words(p, seg(cs, (r.table + offset) & 0xffff), 1)) dataSlots++;
+            }
+        }
+        if (dataSlots > 0)
+            emit.accept(String.format("{\"rule\":\"J1w\",\"site\":\"%s\",\"outcome\":\"TABLE_WORDS\",\"slots\":%d}", ins.getAddress(), dataSlots));
         recovered++;
         if (!r.baseAdds.isEmpty()) computedBases++;
         emit.accept(String.format("{\"rule\":\"J1\",\"site\":\"%s\",\"insn\":\"%s\",\"outcome\":\"RECOVERED\",\"shape\":\"%s\",\"index\":\"%s\",\"scaled_by\":\"%s\",\"table\":\"%04x\",\"bound\":\"%s\",\"stop\":\"%s\",\"entries\":%d,\"superseded_refs\":%d,\"slots\":%d,\"empty_slots\":%d,\"observed\":%d,\"base_via\":\"%s\",\"observed_missing_added\":%s}",
@@ -1347,6 +1375,7 @@ public final class WSJumpTables {
         r.maskOffsets = maskValues(back, ix, r);
         r.table = (r.base + r.disp) & 0xFFFF;
         tableStart = seg(cs, r.table);
+        r.returnEnd = pushedContinuation(site, cs);
         // J1a: the table address needs a constant (base immediate or displacement); a bare [BX] whose BX
         // comes from elsewhere is an unknown table, not one at CS:0000.
         if (!r.baseFound && r.disp == 0) { r.shape += "/NO_BASE" + (r.j1iMiss == null ? "" : "/J1i_" + r.j1iMiss); return r; }
@@ -1379,7 +1408,7 @@ public final class WSJumpTables {
             break;
         }
         boolean strong = r.stop.equals("EXECUTED_CODE") || r.stop.equals("TABLE_BOUNDARY") || r.stop.equals("FUNCTION_ENTRY") || r.stop.equals("DIRECT_CALL_ENTRY")
-            || r.stop.equals("TABLE_BASE") || r.stop.equals("OWN_TARGET");
+            || r.stop.equals("TABLE_BASE") || r.stop.equals("OWN_TARGET") || r.stop.equals("PUSH_RETURN_ENTRY");
         // J1b: without an index bound only a strong end (next slot executed / next recovered table) proves
         // the extent; running into data or the cap does not (observed targets stay via rule E3).
         if (!bounded && !strong) {
@@ -1451,8 +1480,56 @@ public final class WSJumpTables {
         r.bound = (cbw ? "byte index (CBW, forward half)" : "byte index") + " << " + shift + " -> " + r.cap + " entries";
     }
 
+    /** The immediate must still be the top stack word on every path to dispatch.
+     * Stack changes, stores that could alias the stack, and incoming flow veto it. */
+    Address pushedContinuation(Instruction site, int cs) {
+        if (!site.getMnemonicString().equals("JMP")) return null;
+        Instruction after = site;
+        for (Instruction q : predecessors(site, 16)) {
+            for (Reference ref : p.getReferenceManager().getReferencesTo(after.getAddress()))
+                if (ref.getReferenceType().isFlow()) return null;
+            String mnemonic = q.getMnemonicString();
+            if (mnemonic.equals("PUSH")) {
+                if (q.getScalar(0) == null) return null;
+                Address continuation = seg(cs, (int)q.getScalar(0).getUnsignedValue() & 0xffff);
+                if (!continuation.getAddressSpace().equals(tableStart.getAddressSpace())) return null;
+                long distance = continuation.subtract(tableStart);
+                return distance > 0 && distance <= 512 && (distance & 1) == 0 && returnStub(continuation)
+                    ? continuation : null;
+            }
+            String t = q.toString().toUpperCase().replace(" ", "");
+            if (q.getFlowType().isCall() || mnemonic.startsWith("INT")
+                || writesReg(q, t, "SP", p.getRegister("SP"))
+                || writesReg(q, t, "SS", p.getRegister("SS"))) return null;
+            for (var op : q.getPcode())
+                if (op.getOpcode() == ghidra.program.model.pcode.PcodeOp.STORE) return null;
+            after = q;
+        }
+        return null;
+    }
+
+    /** A saved near return IP immediately following the words is a code boundary
+     * when it restores saved registers and returns. It cannot be another slot. */
+    boolean returnStub(Address entry) {
+        try {
+            Address a = entry;
+            var decoder = new ghidra.app.util.PseudoDisassembler(p);
+            int pops = 0;
+            for (int n = 0; n < 9; n++) {
+                var i = decoder.disassemble(a);
+                if (i == null) return false;
+                String mnemonic = i.getMnemonicString();
+                if ((mnemonic.equals("RET") || mnemonic.equals("RETF")) && i.getNumOperands() == 0) return pops > 0;
+                if (!mnemonic.equals("POP") || i.getRegister(0) == null || i.getRegister(0).getBitLength() != 16) return false;
+                pops++; a = i.getMaxAddress().next();
+            }
+        } catch (Exception e) { return false; }
+        return false;
+    }
+
     String slotStop(Address ea, Rec r) {
         if (!mem.contains(ea) || !mem.getBlock(ea).isInitialized()) return "OUT_OF_ROM";
+        if (ea.equals(r.returnEnd)) return "PUSH_RETURN_ENTRY";
         if (executed(ea.getOffset()) || executed(ea.getOffset() + 1)) return "EXECUTED_CODE";
         if (p.getFunctionManager().getFunctionAt(ea) != null || p.getFunctionManager().getFunctionAt(ea.add(1)) != null) return "FUNCTION_ENTRY";
         // A merge may remove a callee's function object without removing its code

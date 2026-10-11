@@ -39,6 +39,7 @@ public class WSJumpTableFinish extends GhidraScript {
         println("WSJumpTableFinish: " + summary);
         summary = WSJumpTables.demoteGluedCases(currentProgram, evidence, lines::add, monitor);
         println("WSJumpTableFinish: " + summary);
+        println(jidoughost.wonderswan.WSInlineTables.apply(currentProgram, lines::add, monitor));
         println(jidoughost.wonderswan.WSDecodeRepair.boundaries(currentProgram, lines::add, monitor));
         println(jidoughost.wonderswan.WSDecodeRepair.decompilerBoundaries(currentProgram, evidence, lines::add, monitor));
         println(jidoughost.wonderswan.WSReturns.apply(currentProgram, lines::add, monitor));

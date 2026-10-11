@@ -112,6 +112,9 @@ public final class WSFillRuns {
     }
 
     public static String apply(Program p, WSEvidence ev, Consumer<String> emit, TaskMonitor monitor) throws Exception {
+        // A RAM snapshot can contain zero/FF bytes without recording what ran there.
+        // H2 keeps those inherited hypotheses, including entries with no decode.
+        WSRamCode.classify(p);
         Listing listing = p.getListing();
         AddressSet fill = new AddressSet(), reached = new AddressSet();
         AddressSet proof = protectedCode(p);
@@ -127,7 +130,8 @@ public final class WSFillRuns {
         for (MemoryBlock block : p.getMemory().getBlocks()) {
             monitor.checkCancelled();
             if (!block.isInitialized() || !block.isExecute() || WonderSwanLoader.isDataOverlay(block)
-                || WSRamCode.hasImage(p, block.getStart()) || block.getSize() > Integer.MAX_VALUE) continue;
+                || WSRamCode.isRam(p, block.getStart()) || WSRamCode.hasImage(p, block.getStart())
+                || block.getSize() > Integer.MAX_VALUE) continue;
             byte[] bytes = new byte[(int)block.getSize()];
             p.getMemory().getBytes(block.getStart(), bytes);
             for (int start = 0; start < bytes.length;) {

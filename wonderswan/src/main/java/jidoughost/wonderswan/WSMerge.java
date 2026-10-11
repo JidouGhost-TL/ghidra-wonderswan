@@ -58,6 +58,7 @@ public final class WSMerge {
     }
 
     public void apply() throws Exception {
+        WSRamCode.classify(p);
         for (int round = 0; round < 32; round++) {
             monitor.checkCancelled();
             int n = mergeOutlined() + mergeFallThrough();
@@ -72,7 +73,8 @@ public final class WSMerge {
         Map<Function, List<Function>> merges = new LinkedHashMap<>();
         for (Function t : fm.getFunctions(true)) {
             monitor.checkCancelled();
-            if (t.isExternal() || t.isThunk() || exteriorEntry(t) || containsRuleOverride(t)) continue;
+            if (t.isExternal() || t.isThunk() || WSRamCode.isRam(p, t.getEntryPoint())
+                    || exteriorEntry(t) || containsRuleOverride(t)) continue;
             Function c = soleFlowReferrer(t);
             if (c == null || !exitsInside(t, c)) continue;
             merges.computeIfAbsent(c, k -> new ArrayList<>()).add(t);
@@ -143,6 +145,7 @@ public final class WSMerge {
 
     /** Persisted observations and bookmarks distinguish rule decisions from stock tail guesses. */
     boolean ruleOverride(Instruction ins) {
+        if (WSInlineTables.modeled(p, ins.getAddress()) || WSInlineTables.continuation(p, ins.getAddress())) return true;
         var observed = p.getUsrPropertyManager().getStringPropertyMap(WSObservedSwitches.PROPERTY);
         if (observed != null) {
             String targets = observed.getString(ins.getAddress());
@@ -270,7 +273,8 @@ public final class WSMerge {
             Address ft = last.getFallThrough();
             if (ft == null) continue;
             Function b = fm.getFunctionAt(ft);
-            if (b == null || b.isThunk() || b.isExternal() || b.equals(a) || exteriorEntry(b)
+            if (b == null || b.isThunk() || b.isExternal() || b.equals(a)
+                    || WSRamCode.isRam(p, b.getEntryPoint()) || exteriorEntry(b)
                     || containsRuleOverride(b) || ruleOverrideReferrer(b)) continue;
             if (a.getBody().contains(b.getEntryPoint()) || b.getBody().contains(a.getEntryPoint())) continue;
             if (interruptEntries.contains(b.getEntryPoint())) continue;
