@@ -2,11 +2,13 @@
 // Boot current cartridge as A and a second cartridge as B, linked in one process.
 // Args: <ROM B> <out dir> [frames=1500] [shotEvery=100] [input A|-] [input B|-]
 //       [saves A|-] [saves B|-] [model A=auto|mono|color] [model B=auto|mono|color]
+//       [B power-on offset in master clocks=default]
 // Input: "from to buttons" (inclusive shared frame numbers, hexadecimal WSMachine button mask).
 // Missing input means no buttons. Saves are read-only inputs in WSMachine's save-image naming scheme.
 // Output: A/ and B/ screenshots, final.png, ram.bin, ports.bin, saves/, coverage.tsv; serial.tsv and summary.txt.
 // Coverage: ROM file byte ranges [rom_start, rom_end), hexadecimal offsets, decimal first shared frame.
 // Shared frames are 159 * 256 clocks; each console retains its own post-boot display phase.
+// Console B is switched on after A (WSLink.DEFAULT_POWER_ON_OFFSET unless given; 0 = same instant).
 // @category WonderSwan
 import ghidra.app.script.GhidraScript;
 import ghidra.app.util.importer.ProgramLoader;
@@ -44,6 +46,8 @@ public class WSLinkEmulate extends GhidraScript {
             b.beforeStep = coverageB::beforeStep;
             if (!arg(args, 6, "-").equals("-")) a.loadSaves(Path.of(args[6]));
             if (!arg(args, 7, "-").equals("-")) b.loadSaves(Path.of(args[7]));
+            String offsetArg = arg(args, 10, "default");
+            long offset = offsetArg.equals("default") ? WSLink.DEFAULT_POWER_ON_OFFSET : Long.parseLong(offsetArg);
             long start = System.currentTimeMillis();
             int[] completed = { 0 };
             long[] bytes = { 0, 0, 0 };
@@ -54,7 +58,7 @@ public class WSLinkEmulate extends GhidraScript {
                     log.printf("%s\t%d\t%d\t%02X\t%d\t%s%n", e.direction(), e.frame(), e.clock(), e.value(), e.baud(), e.result());
                     bytes[e.direction().equals("A>B") ? 0 : 1]++;
                     if (!e.result().equals("RECEIVED")) bytes[2]++;
-                });
+                }, offset);
                 try {
                     link.run(frames, f -> {
                         coverageA.frame = coverageB.frame = f;
@@ -80,9 +84,9 @@ public class WSLinkEmulate extends GhidraScript {
                 finish(a, out.resolve("A"));
                 finish(b, out.resolve("B"));
             }
-            String summary = String.format("frames=%d/%d clocks=%d/%d instructions=%d/%d bytes=%d/%d dropped=%d ms=%d error=%s%n",
+            String summary = String.format("frames=%d/%d clocks=%d/%d instructions=%d/%d bytes=%d/%d dropped=%d ms=%d error=%s offsetB=%d%n",
                 completed[0], frames, a.cycles, b.cycles, a.instructions, b.instructions, bytes[0], bytes[1], bytes[2],
-                System.currentTimeMillis() - start, failure);
+                System.currentTimeMillis() - start, failure, offset);
             Files.writeString(out.resolve("summary.txt"), summary);
             println("WSLinkEmulate: " + summary);
             if (failure != null) throw failure;

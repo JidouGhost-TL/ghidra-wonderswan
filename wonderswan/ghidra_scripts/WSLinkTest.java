@@ -10,6 +10,26 @@ import java.util.*;
 public class WSLinkTest extends GhidraScript {
     private int checks;
 
+    /** Same program as WSLinkPowerOnTest (kept in sync): frame-locked beacon handshake; result byte at 1200 (1 = responder, 2 = initiator). */
+    static final byte[] HANDSHAKE = bytes(
+        0xB0, 0xC0, 0xE6, 0xB3,                         // UART on, 38,400 baud
+        0xE4, 0x02, 0x3C, 0x90, 0x75, 0xFA,             // wait for line 144
+        0xE4, 0x02, 0x3C, 0x90, 0x74, 0xFA,             // wait until line 144 ends
+        0xE4, 0xB3, 0xA8, 0x01, 0x74, 0x28,             // nothing received -> send
+        0xE4, 0xB1, 0x3C, 0xCE, 0x75, 0x18,             // received byte other than CE -> check B7
+        0xF6, 0x06, 0x00, 0x11, 0x01, 0x74, 0x07,       // CE and no own CE outstanding -> respond
+        0xC6, 0x06, 0x00, 0x11, 0x00, 0xEB, 0xDA,       // collision: forget own CE, send nothing this frame
+        0xB0, 0xB7, 0xE6, 0xB1, 0xC6, 0x06, 0x00, 0x12, 0x01, 0xF4,   // respond B7, result 1, halt
+        0x3C, 0xB7, 0x75, 0xCC, 0xC6, 0x06, 0x00, 0x12, 0x02, 0xF4,   // B7: result 2, halt
+        0xE4, 0xB3, 0xA8, 0x04, 0x74, 0xC0,             // send: wait for TX empty
+        0xB0, 0xCE, 0xE6, 0xB1, 0xC6, 0x06, 0x00, 0x11, 0x01, 0xEB, 0xB5);   // CE, own CE outstanding
+
+    static byte[] bytes(int... values) {
+        byte[] b = new byte[values.length];
+        for (int i = 0; i < b.length; i++) b[i] = (byte) values[i];
+        return b;
+    }
+
     private void eq(long want, long got, String message) {
         checks++;
         if (want != got) throw new AssertionError(message + ": expected " + want + ", got " + got);
@@ -22,12 +42,23 @@ public class WSLinkTest extends GhidraScript {
         return m;
     }
 
+    private WSMachine handshakeMachine() {
+        WSMachine m = machine();
+        m.halted = false;
+        m.setReg(m.lang.getRegister("CS"), 0);
+        m.setReg(m.lang.getRegister("DS"), 0);
+        m.syncCsval();
+        m.write(0x1000, HANDSHAKE);
+        m.thread.overrideCounter(m.addr(0x1000));
+        return m;
+    }
+
     @Override public void run() throws Exception {
         List<String> results = new ArrayList<>();
         for (int control : new int[] { 0x80, 0xC0 }) {
             WSMachine a = machine(), b = machine();
             List<WSLink.ByteEvent> bytes = new ArrayList<>();
-            WSLink link = new WSLink(a, b, bytes::add);
+            WSLink link = new WSLink(a, b, bytes::add, 0);   // lockstep: wire timing only
             a.setPort(0xB3, 1, control);
             b.setPort(0xB3, 1, control);
             a.setPort(0xB1, 1, 0x5A);
@@ -76,7 +107,7 @@ public class WSLinkTest extends GhidraScript {
                 (byte)0xE4, (byte)0xB1, (byte)0xA2, 0, 0x12, (byte)0xF4 });
             m.thread.overrideCounter(m.addr(0x1000));
         }
-        WSLink codeLink = new WSLink(a, b, null);
+        WSLink codeLink = new WSLink(a, b, null, 0);
         codeLink.runUntil(2000);
         eq(0x96, a.read(0x1200, 1)[0] & 0xFF, "CPU A IN received B OUT");
         eq(0x69, b.read(0x1200, 1)[0] & 0xFF, "CPU B IN received A OUT");
@@ -96,7 +127,7 @@ public class WSLinkTest extends GhidraScript {
         b.write(0x8C, new byte[] { 0, 0x12, 0, 0 });
         b.write(0x1200, new byte[] { (byte)0xE4, (byte)0xB1, (byte)0xA2, 0, 0x13,
             (byte)0xB0, 8, (byte)0xE6, (byte)0xB6, (byte)0xF4 });
-        WSLink interruptLink = new WSLink(a, b, null);
+        WSLink interruptLink = new WSLink(a, b, null, 0);
         a.setPort(0xB3, 1, 0xC0); b.setPort(0xB3, 1, 0xC0);
         b.setPort(0xB0, 1, 0x20); b.setPort(0xB2, 1, 8);
         a.setPort(0xB1, 1, 0xD7);
@@ -121,7 +152,7 @@ public class WSLinkTest extends GhidraScript {
             m.setPort(0x46, 2, 0x800);
         }
         List<Long> observedClocks = new ArrayList<>();
-        WSLink dmaLink = new WSLink(dmaA, dmaB, e -> observedClocks.add(Math.min(dmaA.cycles, dmaB.cycles)));
+        WSLink dmaLink = new WSLink(dmaA, dmaB, e -> observedClocks.add(Math.min(dmaA.cycles, dmaB.cycles)), 0);
         dmaA.setPort(0xB3, 1, 0xC0); dmaB.setPort(0xB3, 1, 0xC0);
         dmaA.setPort(0xB1, 1, 0xAB);
         dmaLink.runUntil(900);
@@ -134,7 +165,7 @@ public class WSLinkTest extends GhidraScript {
 
         // UART bytes are also visible in word-sized IN/OUT accesses to adjacent ports.
         a = machine(); b = machine();
-        WSLink wordLink = new WSLink(a, b, null);
+        WSLink wordLink = new WSLink(a, b, null, 0);
         a.setPort(0xB3, 1, 0xC0);
         b.setPort(0xB0, 1, 0x20);
         b.setPort(0xB2, 2, 0xC008);          // IRQ mask in AL, UART control in AH
@@ -148,6 +179,47 @@ public class WSLinkTest extends GhidraScript {
         b.setPort(0xB2, 1, 0x49);
         eq(0x495A, b.getPort(0xB1, 2), "unaligned data word IN includes B2 in AH");
         results.add("PASS word IN/OUT UART byte lanes, buffer consumption and live status");
+
+
+        // Power-on offset: B starts later on the shared clock; its bytes are timestamped on that clock.
+        a = machine(); b = machine();
+        List<WSLink.ByteEvent> offsetBytes = new ArrayList<>();
+        WSLink offsetLink = new WSLink(a, b, offsetBytes::add, 5000);
+        eq(5000, offsetLink.powerOnOffset(), "explicit power-on offset");
+        a.setPort(0xB3, 1, 0xC0); b.setPort(0xB3, 1, 0xC0);
+        a.setPort(0xB1, 1, 0x11);
+        b.setPort(0xB1, 1, 0x22);
+        offsetLink.runUntil(5799);
+        eq(1, offsetBytes.size(), "only A's byte before B's stop bit");
+        eq(800, offsetBytes.get(0).clock(), "A byte at A clock 800");
+        eq(799, b.cycles, "B switched on at shared clock 5000, ran 799 own clocks");
+        offsetLink.runUntil(5800);
+        eq(2, offsetBytes.size(), "B byte delivered");
+        eq(5800, offsetBytes.get(1).clock(), "B byte at shared clock offset + 800");
+        eq(800, b.cycles, "B ran 800 own clocks");
+        eq(0x22, a.getPort(0xB1, 1), "A received B byte");
+        results.add("PASS power-on offset: B byte sent at its clock 0 arrives at shared clock 5800");
+
+        eq(WSLink.DEFAULT_POWER_ON_OFFSET, new WSLink(machine(), machine(), null).powerOnOffset(), "default offset");
+        if (WSLink.DEFAULT_POWER_ON_OFFSET <= 0) throw new AssertionError("default power-on offset must be non-zero");
+        boolean rejected = false;
+        try { new WSLink(machine(), machine(), null, -1); } catch (IllegalArgumentException e) { rejected = true; }
+        eq(1, rejected ? 1 : 0, "negative offset rejected");
+
+        // The same frame-locked handshake (see WSLinkPowerOnTest): lockstep collides forever, an offset resolves.
+        for (long offset : new long[] { 0, WSLink.DEFAULT_POWER_ON_OFFSET }) {
+            WSMachine ha = handshakeMachine(), hb = handshakeMachine();
+            WSLink handshake = new WSLink(ha, hb, null, offset);
+            handshake.run(20, null);
+            int ra = ha.read(0x1200, 1)[0] & 0xFF, rb = hb.read(0x1200, 1)[0] & 0xFF;
+            if (offset == 0) {
+                eq(0, ra | rb, "lockstep start: symmetric collision never resolves");
+            } else {
+                eq(3, ra + rb, "offset start: one responder (1) and one initiator (2)");
+                eq(1, ra == rb ? 0 : 1, "roles differ");
+            }
+            results.add("PASS handshake offset=" + offset + ": A result " + ra + ", B result " + rb);
+        }
 
         // Detached compatibility: every write is instant, even disabled; never receives.
         WSMachine detached = machine();

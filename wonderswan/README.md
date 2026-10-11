@@ -54,6 +54,7 @@ internal EEPROM and inputs. Import console A with the WonderSwan loader, then ru
 WSLinkEmulate.java <ROM B> <output dir> [frames=1500] [shotEvery=100]
                   [input A|-] [input B|-] [saves A|-] [saves B|-]
                   [model A=auto|mono|color] [model B=auto|mono|color]
+                  [B power-on offset in master clocks=default]
 ```
 
 Input files contain `from to buttons` spans (inclusive frame numbers, hexadecimal keypad mask,
@@ -65,7 +66,16 @@ frame, master clock, value, baud rate and delivery/drop result; `summary.txt` re
 The cable interleaves cycle-timed CPU instructions on a shared 3.072 MHz clock. The wire advances
 on every shared hardware clock, including DMA stalls. An 8N1 byte takes
 3,200 clocks at 9,600 baud or 800 at 38,400 baud. Each frame interval is 159 × 256 clocks; the consoles
-retain their own display phase. B1/B3 buffers, overrun and the B2/B6 serial interrupt levels follow the
+retain their own display phase. Console B is switched on a fixed number of master clocks after A (default
+`WSLink.DEFAULT_POWER_ON_OFFSET`, 10,000 clocks, about a quarter of a frame): two people never switch on at the
+same instant, so real consoles never share a display phase. Without an offset both programs run in exact
+lockstep, and software that resolves simultaneous frame-driven transmissions by waiting for the partner's
+next frame (for example a handshake beacon collision) stays stuck forever. On hardware the phase difference
+is arbitrary; the default is one fixed, mid-frame value, so runs remain deterministic. Software can still depend on
+the phase (a byte sent before the partner's next poll), so a different offset can change a run's outcome; an
+offset of 0 restores the lockstep start.
+Input scripts that press the same button on both consoles in the same frame can behave differently with an
+offset, as they would on hardware. B1/B3 buffers, overrun and the B2/B6 serial interrupt levels follow the
 [UART](https://ws.nesdev.org/wiki/UART) and [interrupt](https://ws.nesdev.org/wiki/Interrupts) hardware
 documentation. `WSSerial.Peer` is the transport interface for future adapter/device models.
 Detached machines retain the existing instant serial output behavior. Linked save-state snapshots
