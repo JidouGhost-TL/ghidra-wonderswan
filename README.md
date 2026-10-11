@@ -82,7 +82,8 @@ distributed, so they are not part of this repository.
 - **Decoding:** a differential harness (`v30mz/ghidra_scripts/V30MZDecodeDiff.java`) compares every
   opcode/ModRM form, and all code executed by a set of commercial titles, against Ghidra's x86 real
   mode: 0 unexplained differences; undefined-encoding lengths verified against hardware-tested sources.
-- **Semantics:** WSCpuTest 48/48 groups (flags included, many exhaustive) and the ws-test-suite CPU
+- **Semantics:** WSCpuTest "Test All" passes (42 groups in our regression run, 0 failures; flags included, many
+  exhaustive) and the ws-test-suite CPU
   tests (80186 quirks, prefixes, interrupt timing) pass on `WSMachine`.
 - **Emulator:** short, scripted comparisons with Mesen 2 measure overlap in executed addresses over
   1500 frames. The overlap varies by cartridge; it does not establish identical code paths or
