@@ -25,7 +25,7 @@ import ghidra.util.task.TaskMonitor;
  *   E1R re-seed executed addresses that later analysis removed;
  *   J1  CS-relative jump/call tables by rule ({@link WSJumpTables}), checked against observed targets;
  *   D1  DS/SS context at function entries; A1 preserve and tag unresolved decode hypotheses;
- *   P1  functions whose entry has no bytes are phantoms: removed and reported with their creating references;
+ *   P1  preserve functions without a current memory image and record the unresolved hypothesis;
  *   D0  title DS/SS defaults from execution evidence ({@link WSCompilerRules}), before D1;
  *   C1  every function whose signature no user or importer set gets the title's convention: __lsic86 when
  *       rule K1 identifies LSI C-86 code, else the compiler spec's default (Ghidra's analyzers otherwise
@@ -180,29 +180,85 @@ public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
         }
     }
 
-    /** P1: a function whose entry has no bytes (an uninitialised block such as an empty bank window, or no
-     *  memory at all) cannot be code we know; it was created from a reference into nothing (e.g. an
-     *  unexecuted CALLF decode into an empty bank window). Removed, reported with the creating references, and each
-     *  referencing site bookmarked; the references themselves are kept (they are what the bytes say). */
+    private static String quote(String text) {
+        if (text == null) return "null";
+        StringBuilder out = new StringBuilder("\"");
+        for (char c : text.toCharArray()) {
+            if (c == '"' || c == '\\') out.append('\\').append(c);
+            else if (c < 0x20) out.append(String.format("\\u%04x", (int)c));
+            else out.append(c);
+        }
+        return out.append('"').toString();
+    }
+
+    private static String address(ghidra.program.model.address.Address at) {
+        return at == null ? "null" : "{\"space\":" + quote(at.getAddressSpace().getName())
+            + ",\"address\":" + quote(at.toString()) + "}";
+    }
+
+    /** P1: an absent image leaves the existing function unresolved, with all original state intact. */
     static String removePhantoms(Program program, WSEvidenceAnalyzer.Seeder s) throws Exception {
-        List<Function> phantoms = new ArrayList<>();
-        for (Function f : program.getFunctionManager().getFunctions(true)) {
-            if (f.isExternal() || f.isThunk()) continue;
-            if (WSRamCode.isRam(program, f.getEntryPoint())) continue;
-            ghidra.program.model.mem.MemoryBlock b = program.getMemory().getBlock(f.getEntryPoint());
-            if (b == null || !b.isInitialized()) phantoms.add(f);
-        }
-        for (Function f : phantoms) {
-            StringBuilder refs = new StringBuilder();
-            for (ghidra.program.model.symbol.Reference r : program.getReferenceManager().getReferencesTo(f.getEntryPoint())) {
-                refs.append(refs.length() > 0 ? "," : "").append('"').append(r.getFromAddress()).append('"');
-                program.getBookmarkManager().setBookmark(r.getFromAddress(), ghidra.program.model.listing.BookmarkType.WARNING, "WSEvidence",
-                    "P1 PHANTOM_TARGET: " + f.getEntryPoint() + " has no bytes; function removed");
+        int preserved = 0;
+        // The function iterator omits entries outside mapped memory; their symbols still exist.
+        var symbols = program.getSymbolTable().getAllSymbols(true);
+        while (symbols.hasNext()) {
+            var symbol = symbols.next();
+            if (symbol.getSymbolType() != ghidra.program.model.symbol.SymbolType.FUNCTION
+                || !(symbol.getObject() instanceof Function f)) continue;
+            s.monitor.checkCancelled();
+            if (f.isExternal() || f.isThunk() || WSRamCode.isRam(program, f.getEntryPoint())) continue;
+            var entry = f.getEntryPoint();
+            var block = program.getMemory().getBlock(entry);
+            if (block != null && block.isInitialized()) continue;
+            List<String> refs = new ArrayList<>();
+            var destinations = program.getReferenceManager().getReferenceDestinationIterator(f.getBody(), true);
+            while (destinations.hasNext()) {
+                for (var ref : program.getReferenceManager().getReferencesTo(destinations.next())) {
+                    var from = ref.getFromAddress();
+                    var instruction = program.getListing().getInstructionContaining(from);
+                    List<String> context = new ArrayList<>();
+                    for (String name : new String[]{"csval", "CS", "DS", "SS"}) {
+                        var reg = program.getRegister(name);
+                        if (reg != null) context.add(quote(name) + ":" + quote(String.valueOf(
+                            program.getProgramContext().getRegisterValue(reg, from))));
+                    }
+                    refs.add("{\"from\":" + address(from) + ",\"to\":" + address(ref.getToAddress())
+                        + ",\"type\":" + quote(ref.getReferenceType().toString())
+                        + ",\"source\":" + quote(ref.getSource().toString())
+                        + ",\"operand\":" + ref.getOperandIndex() + ",\"primary\":" + ref.isPrimary()
+                        + ",\"instruction_start\":" + address(instruction == null ? null : instruction.getAddress())
+                        + ",\"instruction\":" + quote(instruction == null ? null : instruction.toString())
+                        + ",\"instruction_bytes\":" + quote(instruction == null ? null : HexFormat.of().formatHex(instruction.getBytes()))
+                        + ",\"context\":{" + String.join(",", context) + "}}");
+                }
             }
-            s.emit("{\"rule\":\"P1\",\"function\":\"%s\",\"outcome\":\"PHANTOM_REMOVED\",\"refs_from\":[%s]}", f.getEntryPoint(), refs);
-            program.getFunctionManager().removeFunction(f.getEntryPoint());
+            Collections.sort(refs);
+            String detail = "{\"rule\":\"P1\",\"outcome\":\"UNKNOWN_UNIMAGED_FUNCTION_PRESERVED\","
+                + "\"reason\":\"MISSING_CURRENT_IMAGE_IS_NOT_EXCLUSIVE_INVALIDITY_EVIDENCE\",\"entry\":" + address(entry)
+                + ",\"symbol_id\":" + f.getSymbol().getID() + ",\"name\":" + quote(f.getName(true))
+                + ",\"symbol_source\":" + quote(f.getSymbol().getSource().toString())
+                + ",\"signature_source\":" + quote(f.getSignatureSource().toString())
+                + ",\"signature\":" + quote(f.getPrototypeString(true, true)) + ",\"body\":" + quote(f.getBody().toString())
+                + ",\"block\":" + quote(block == null ? null : block.getName())
+                + ",\"block_start\":" + address(block == null ? null : block.getStart())
+                + ",\"overlay\":" + (block == null ? "null" : block.isOverlay())
+                + ",\"image_state\":" + quote(block == null ? "ABSENT_BLOCK" : "UNINITIALIZED")
+                + ",\"target_bytes_sha256\":null,\"evidence_source\":" + quote(s.ev.provenance)
+                + ",\"observed_cs\":" + s.ev.cs.get(entry.getOffset())
+                + ",\"incoming_references\":[" + String.join(",", refs) + "]}";
+            String hash = HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+                .digest(detail.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+            var bm = program.getBookmarkManager();
+            for (int suffix = 0; ; suffix++) {
+                String category = "WSP1Hypothesis:" + hash + (suffix == 0 ? "" : ":" + suffix);
+                var old = bm.getBookmark(entry, BookmarkType.ANALYSIS, category);
+                if (old == null) { bm.setBookmark(entry, BookmarkType.ANALYSIS, category, detail); break; }
+                if (detail.equals(old.getComment())) break;
+            }
+            s.emit("%s", detail);
+            preserved++;
         }
-        return "P1 phantom functions removed " + phantoms.size();
+        return "P1 unimaged function hypotheses preserved " + preserved;
     }
 
     /** D0 ({@link WSCompilerRules}): the resolved DS/SS defaults are always applied, because the
