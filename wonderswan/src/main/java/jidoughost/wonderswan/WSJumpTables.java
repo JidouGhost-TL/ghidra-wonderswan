@@ -33,16 +33,10 @@ import ghidra.util.task.TaskMonitor;
  *   earlier pass) is a strong stop like EXECUTED_CODE: a table cannot run into a function.
  * J1f: TABLE_BASE (a slot is the base of another CS table used anywhere in the program) is a strong stop.
  * J1g: computed references another analysis left on a recovered site that are not in the proven table are removed.
- * J1h: code decoded only from a superseded reference (unexecuted, no remaining reference, not reached by
- *   fall-through from kept code) is cleared, bytes kept and bookmarked; proven targets are re-flowed. A run that
- *   fails the guard is kept and reported (SKIPPED). Lying inside a function entered outside the run is not a veto:
- *   with no reference and no fall-through the bytes are unreachable from that function too, and clearing them
- *   frees a fall-through tail for the routine-start rule (the carve is reported with the former container).
- *   An automatic function wholly inside the cleared run is removed with its decode; RAM hypotheses and
- *   user/imported functions are retained.
- * J1u: a flow the cleared decode had blocked (an ERROR conflict bookmark whose conflicting instruction was cleared and
- *   whose source instruction is still decoded) is re-flowed from the bookmark's address, so live fall-through or branch
- *   code that lost to the superseded decode is disassembled again instead of only losing its error bookmark.
+ * J1h (H2): superseding or quarantining a computed reference never invalidates its decoded code.
+ *   Preserve instructions and functions, and tag each retained hypothesis with its source and reason.
+ *   Missing execution, incoming references or fall-through cannot prove code invalid. Conflicting
+ *   interpretations remain unresolved; ERROR bookmarks remain while their conflicting code exists.
  * J1i: a base held in a second register: ADD idx,reg2 where reg2's last write before the ADD (same fall-through
  *   chain) is MOV reg2,imm or LEA reg2,[imm] adds that constant to the table address and leaves idx as the index
  *   (e.g. LEA AX,[tbl]; SHL BX,1; ADD BX,AX; JMP/CALL CS:[BX]). The constant must reach the ADD on every path: no
@@ -59,9 +53,9 @@ import ghidra.util.task.TaskMonitor;
  * J1l: an unresolved site whose guessed
  *   (non-observed, non-user) computed references point at an offcut, an ERROR bookmark or undecodable bytes
  *   is quarantined: the guessed references are deleted (observed targets are evidence and stay), code decoded
- *   only from them is cleared with the J1h guard, and the site is re-attempted every pass (the junk often
- *   polluted the backward slice). A site still unresolved at the end keeps its guesses deleted (nothing
- *   re-decodes the cleared junk without a reference); the deleted addresses stay in the evidence for rule J1m.
+ *   from them is preserved and tagged by J1h, and the site is re-attempted every pass (the guesses may
+ *   have polluted the backward slice). A site still unresolved at the end keeps its guesses deleted;
+ *   the retained decode remains a hypothesis. Deleted reference addresses stay in the evidence for J1m.
  * J1m (post-analysis script WSJumpTableFinish, after the merges): at a quarantined site, re-delete any guessed
  *   reference a later analysis re-derived (by the QUARANTINED address list) and lock the switch to its observed
  *   targets (a stored jump-table override); with no observed target the site stays an opaque indirect branch.
@@ -79,16 +73,15 @@ import ghidra.util.task.TaskMonitor;
  *   the recovery override, after which the decompiler's own unbounded table read follows garbage cross-space.
  * J1q: every jump-table override is filtered to the site's address space: a foreign-bank override target sends
  *   the decompiler where nothing was decoded. References keep every bank (they are evidence and harmless).
- * J1r: a quarantined site whose own instruction is gone (a guessed offcut polluted the backward slice, then the
- *   quarantine's orphan clear removed the dispatch setup with it) gets one restoration attempt before the final
+ * J1r: a quarantined site whose own instruction was removed by an earlier analysis gets one
+ *   restoration attempt before the final
  *   verdict: the cleared run is re-decoded from the fall-through of the nearest preceding kept instruction in the
  *   same function (trial decode, undefined bytes only, bounded; it must reach the site with the same computed
  *   JMP/CALL mnemonic and contain no other computed branch), committed, and the site re-attempted. A recovered
  *   site applies normally; a still-unresolved one keeps its restored decode and stays quarantined (opaque).
- *   Anything else (no kept fall-through anchor, no clean rejoin, wrong shape) stays cleared, as today.
- * J1s: a table target skipped as an offcut (TARGET_OFFCUT) is retried on later passes: once the conflicting
- *   decode is gone and the target disassembles, it is committed like a kept target (disassembled, referenced,
- *   functioned for CALL sites). The table, bound and stops already proved it; only the conflict blocked it.
+ *   Anything else (no kept fall-through anchor, no clean rejoin, wrong shape) stays unresolved.
+ * J1s: an offcut or protected target keeps the entire site unresolved; no reduced target set is
+ *   published. Later analysis can retry the complete table if independent evidence resolves the conflict.
  * J1t (post-analysis script WSJumpTableFinish, after the J1m lock): a function at a recovered JMP site's kept
  *   target whose body contains another kept target of the same site is an over-glued case block (stock analysis
  *   joined sibling cases into one body, which then decompiles with the parent switch's mis-recovered cases):
@@ -154,17 +147,11 @@ public final class WSJumpTables {
     final Map<Address, String> quarMn = new LinkedHashMap<>();
 
     record QuarRef(Address to, RefType type) { }
-    /** J1s: offcut-skipped targets awaiting retry (site -> targets whose conflict may clear). */
-    record Offcut(Address target, int cs, boolean isCall) { }
-    final Map<Address, List<Offcut>> offcutPending = new LinkedHashMap<>();
-
     void apply(TaskMonitor monitor) throws Exception {
         for (int pass = 0; pass < 16; pass++) {
             int before = done.size() + quarantined.size();
             applyPass(monitor);
             passes++;
-            int retried = retryOffcuts(monitor);
-            if (retried > 0) continue;   // retried code can hold new table sites: collect them next pass
             if (done.size() + quarantined.size() == before) break;
         }
         dropOverlayEndRefs();
@@ -195,7 +182,7 @@ public final class WSJumpTables {
     }
 
     /** End of phase 2: quarantined sites that never recovered keep their guessed references deleted
-     *  (nothing re-decodes the cleared junk without a reference, so the conflict stays resolved; the deleted
+     *  (retained code remains a hypothesis and existing conflicts remain; the deleted
      *  addresses stay in the QUARANTINED line for the post-analysis lock, rule J1m, which also re-deletes any
      *  reference a later analysis re-derived there). */
     void finish() {
@@ -214,7 +201,7 @@ public final class WSJumpTables {
      * J1r: one restoration attempt per quarantined site whose own instruction is gone. Runs after the
      * J1/F1-F4/G1-U1 rounds, before J1l-finish finalizes the still-quarantined sites: a restored site
      * that recovers applies normally (and leaves quarantine); one that does not keeps its restored
-     * decode and stays quarantined. Anything failing a check below stays cleared, as today.
+     * decode and stays quarantined. Anything failing a check below stays unresolved.
      */
     void restoreClearedSites(TaskMonitor monitor) throws Exception {
         ghidra.program.model.lang.Register csval = p.getProgramContext().getRegister("csval");
@@ -314,7 +301,7 @@ public final class WSJumpTables {
         new DisassembleCommand(g, null, true).applyTo(p, monitor);
         Instruction now = listing.getInstructionAt(site);
         if (now == null || !now.getFlowType().isComputed() || !now.getMnemonicString().equalsIgnoreCase(wantMn)) {
-            for (Address t : span) if (!WSRamCode.isRam(p, t)) listing.clearCodeUnits(t, t, false);
+            for (Address t : span) preserveHypothesis(site, t, "RESTORATION_MISMATCH");
             emit.accept(String.format("{\"rule\":\"J1r\",\"site\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"MISMATCH\"}", site));
             return;
         }
@@ -332,7 +319,10 @@ public final class WSJumpTables {
             return;
         }
         try {
-            applySite(now, r, monitor);
+            if (!applySite(now, r, monitor)) {
+                if (reported.add(site)) emitUnresolved(now, r);
+                return;
+            }
             done.add(site);
             quarantined.remove(site);
             reported.remove(site);
@@ -395,7 +385,10 @@ public final class WSJumpTables {
             try {
                 if (e.getValue() == null || e.getValue().targets.isEmpty()) handleUnresolved(e.getKey(), e.getValue());
                 else {
-                    applySite(e.getKey(), e.getValue(), monitor);
+                    if (!applySite(e.getKey(), e.getValue(), monitor)) {
+                        if (reported.add(e.getKey().getAddress())) emitUnresolved(e.getKey(), e.getValue());
+                        continue;
+                    }
                     done.add(e.getKey().getAddress());
                     if (quarantined.remove(e.getKey().getAddress()) != null) reported.remove(e.getKey().getAddress());
                 }
@@ -410,7 +403,7 @@ public final class WSJumpTables {
     }
 
     /** An unrecovered site: quarantine (J1l) when its guesses look conflicted, else reject. Quarantined
-     *  sites stay out of `done' so every later pass re-attempts them with the junk gone. */
+     *  sites stay out of `done' so every later pass re-attempts them with the guessed references removed. */
     void handleUnresolved(Instruction ins, Rec r) throws Exception {
         Address site = ins.getAddress();
         if (!quarantined.containsKey(site) && quarantineTrigger(ins)) {
@@ -454,7 +447,7 @@ public final class WSJumpTables {
         return false;
     }
 
-    /** J1l: delete the guessed references (observed targets stay), clear their orphan decode, re-attempt later. */
+    /** J1l: withdraw guessed references (observed targets stay), preserve/tag their code, re-attempt later. */
     void quarantine(Instruction ins) throws Exception {
         Address site = ins.getAddress();
         Set<Long> obs = observed.getOrDefault(site.getOffset(), Set.of());
@@ -470,17 +463,16 @@ public final class WSJumpTables {
         }
         quarantined.put(site, gone);
         quarMn.put(site, ins.getMnemonicString().toUpperCase());
-        AddressSet cleared = new AddressSet();
-        for (Address t : targets) cleared.add(clearOrphan(t));
-        if (!cleared.isEmpty()) removeStaleConflicts(cleared);
+        AddressSet preserved = new AddressSet();
+        for (Address t : targets) preserved.add(preserveHypothesis(site, t, "QUARANTINED_REFERENCE"));
         quarantines++;
         List<String> goneAddrs = new ArrayList<>();
         for (QuarRef q : gone) goneAddrs.add("\"" + q.to() + "\"");
-        emit.accept(String.format("{\"rule\":\"J1l\",\"site\":\"%s\",\"outcome\":\"QUARANTINED\",\"refs_deleted\":%d,\"orphan_bytes_cleared\":%d,\"deleted\":[%s]}",
-            site, gone.size(), cleared.getNumAddresses(), String.join(",", goneAddrs)));
+        emit.accept(String.format("{\"rule\":\"J1l\",\"site\":\"%s\",\"outcome\":\"QUARANTINED\",\"refs_deleted\":%d,\"hypothesis_bytes_preserved\":%d,\"deleted\":[%s]}",
+            site, gone.size(), preserved.getNumAddresses(), String.join(",", goneAddrs)));
     }
 
-    void applySite(Instruction ins, Rec r, TaskMonitor monitor) throws Exception {
+    boolean applySite(Instruction ins, Rec r, TaskMonitor monitor) throws Exception {
         Set<Long> obs = observed.getOrDefault(ins.getAddress().getOffset(), Set.of());
         Set<Long> got = new HashSet<>();
         for (Address t : r.targets) got.add(t.getOffset());
@@ -489,7 +481,16 @@ public final class WSJumpTables {
         for (long o : obs) if (!got.contains(o)) {
             missing.add(String.format("%05x", o));
             r.targets.add(seg(cs, (int) ((o - ((long) cs << 4)) & 0xFFFF)));
-            observedMissing++;
+        }
+        for (Address t : r.targets) {
+            Instruction conflict = listing.getInstructionContaining(t);
+            Data data = listing.getDefinedDataContaining(t);
+            if ((conflict != null && !conflict.getAddress().equals(t))
+                    || (data != null && !canDeshadow(t))) {
+                if (conflict != null) offcut++;
+                reportTargetConflict(ins, t);
+                return false;
+            }
         }
         boolean pushedCall = r.returnEnd != null && r.stop.equals("PUSH_RETURN_ENTRY");
         boolean isCall = ins.getMnemonicString().equalsIgnoreCase("CALL") || pushedCall;
@@ -507,13 +508,9 @@ public final class WSJumpTables {
         for (Address t : r.targets) {
             if (listing.getInstructionAt(t) == null) {
                 if (listing.getInstructionContaining(t) != null) {
-                    // target inside an existing (unexecuted) decode: conflict, reported, not forced
                     offcut++;
-                    emit.accept(String.format("{\"rule\":\"J1\",\"site\":\"%s\",\"target\":\"%s\",\"outcome\":\"TARGET_OFFCUT\",\"inside\":\"%s\"}",
-                        ins.getAddress(), t, listing.getInstructionContaining(t).getAddress()));
-                    // J1s: retried on later passes (the conflict often clears when quarantine deletes guesses)
-                    offcutPending.computeIfAbsent(ins.getAddress(), k -> new ArrayList<>()).add(new Offcut(t, cs, isCall));
-                    continue;
+                    reportTargetConflict(ins, t);
+                    return false;
                 }
                 // single-byte data shadowing a proven target (a data pointer read the slot first):
                 // cleared (user data and multi-byte data stay, keeping today's behavior there)
@@ -522,6 +519,10 @@ public final class WSJumpTables {
                 // context (CS-relative table -> same CS), else near branches resolve with CS=0 (into RAM)
                 copyContext(ins.getAddress(), t, cs);
                 new DisassembleCommand(t, null, true).applyTo(p, monitor);
+                if (listing.getInstructionAt(t) == null) {
+                    reportTargetConflict(ins, t);
+                    return false;
+                }
                 newCode++;
             }
             kept.add(t);
@@ -544,17 +545,8 @@ public final class WSJumpTables {
             superseded++;
         }
         supersededRefs += superseded;
-        // J1h: code decoded only because of a superseded reference (unexecuted, no remaining reference, not
-        // reached by fall-through) is cleared, so it no longer blocks the proven targets (junk decoded from a
-        // guessed target can overlap real handlers, which rule A1 would then clear). Bytes are kept.
-        AddressSet cleared = new AddressSet();
-        for (Address t : gone) cleared.add(clearOrphan(t));
-        if (!cleared.isEmpty()) {
-            // re-flow every proven target so a run blocked by the cleared code continues now
-            for (Address t : kept) new DisassembleCommand(t, null, true).applyTo(p, monitor);
-            removeStaleConflicts(cleared);
-            clearedOrphans += cleared.getNumAddresses();
-        }
+        // Reference withdrawal is metadata; it is not proof against the decoded hypothesis.
+        for (Address t : gone) preserveHypothesis(ins.getAddress(), t, "SUPERSEDED_REFERENCE");
         Function f = p.getFunctionManager().getFunctionContaining(ins.getAddress());
         if (!isCall && f != null) {
             // J1q: a jump-table override must stay in the site's address space: a foreign-bank target
@@ -583,72 +575,15 @@ public final class WSJumpTables {
         }
         if (dataSlots > 0)
             emit.accept(String.format("{\"rule\":\"J1w\",\"site\":\"%s\",\"outcome\":\"TABLE_WORDS\",\"slots\":%d}", ins.getAddress(), dataSlots));
+        observedMissing += missing.size();
         recovered++;
         if (!r.baseAdds.isEmpty()) computedBases++;
         emit.accept(String.format("{\"rule\":\"J1\",\"site\":\"%s\",\"insn\":\"%s\",\"outcome\":\"RECOVERED\",\"shape\":\"%s\",\"index\":\"%s\",\"scaled_by\":\"%s\",\"table\":\"%04x\",\"bound\":\"%s\",\"stop\":\"%s\",\"entries\":%d,\"superseded_refs\":%d,\"slots\":%d,\"empty_slots\":%d,\"observed\":%d,\"base_via\":\"%s\",\"observed_missing_added\":%s}",
             ins.getAddress(), ins, r.shape, r.idx, r.scaledBy, r.table, r.bound.replace("\"", "'"), r.stop, r.targets.size(), superseded, r.slots, r.empty, obs.size(),
             r.baseVia.replace("\"", "'"),
             missing.isEmpty() ? "[]" : "[\"" + String.join("\",\"", missing) + "\"]"));
+        return true;
     }
-
-    /** J1s: retry offcut-skipped targets whose conflicting decode cleared. Returns the number
-     *  committed (each can expose new table sites, so the caller runs another pass). A target that is
-     *  now decoded by another rule only gains its code reference; one still conflicted or undecodable
-     *  stays pending. Jump-table overrides are not rewritten (CALL sites never had one). */
-    int retryOffcuts(TaskMonitor monitor) throws Exception {
-        int n = 0;
-        for (Iterator<Map.Entry<Address, List<Offcut>>> it = offcutPending.entrySet().iterator(); it.hasNext();) {
-            Map.Entry<Address, List<Offcut>> e = it.next();
-            monitor.checkCancelled();
-            Instruction site = listing.getInstructionAt(e.getKey());
-            // site itself cleared after recovery (pathological: recovered sites are never quarantined,
-            // so J1r will not see this one): nothing to attach the retries to, drop them
-            if (site == null) { it.remove(); continue; }
-            for (Iterator<Offcut> jt = e.getValue().iterator(); jt.hasNext();) {
-                Offcut o = jt.next();
-                if (listing.getInstructionAt(o.target()) != null) {
-                    site.addMnemonicReference(o.target(),
-                        o.isCall() ? RefType.COMPUTED_CALL : RefType.COMPUTED_JUMP, SourceType.ANALYSIS);
-                    keptTargets.add(o.target());
-                    jt.remove(); n++;
-                    emit.accept(String.format("{\"rule\":\"J1s\",\"site\":\"%s\",\"target\":\"%s\",\"outcome\":\"DECODED_ELSEWHERE\"}",
-                        e.getKey(), o.target()));
-                    continue;
-                }
-                if (listing.getInstructionContaining(o.target()) != null) continue;   // conflict persists
-                boolean decodes;
-                try { decodes = new ghidra.app.util.PseudoDisassembler(p).disassemble(o.target()) != null; }
-                catch (Exception x) { decodes = false; }
-                if (!decodes) {
-                    jt.remove();
-                    emit.accept(String.format("{\"rule\":\"J1s\",\"site\":\"%s\",\"target\":\"%s\",\"outcome\":\"GONE\"}",
-                        e.getKey(), o.target()));
-                    continue;
-                }
-                if (listing.getDataAt(o.target()) != null) deshadow(e.getKey(), o.target());
-                copyContext(e.getKey(), o.target(), o.cs());
-                new DisassembleCommand(o.target(), null, true).applyTo(p, monitor);
-                newCode++;
-                site.addMnemonicReference(o.target(),
-                    o.isCall() ? RefType.COMPUTED_CALL : RefType.COMPUTED_JUMP, SourceType.ANALYSIS);
-                if (o.isCall() && p.getFunctionManager().getFunctionAt(o.target()) == null
-                        && listing.getInstructionAt(o.target()) != null)
-                    new CreateFunctionCmd(o.target()).applyTo(p, monitor);
-                if (!o.isCall()) {
-                    Function sf = p.getFunctionManager().getFunctionContaining(e.getKey());
-                    if (sf != null) CreateFunctionCmd.fixupFunctionBody(p, sf, monitor);
-                }
-                keptTargets.add(o.target());
-                jt.remove(); n++; offcutRetried++;
-                emit.accept(String.format("{\"rule\":\"J1s\",\"site\":\"%s\",\"target\":\"%s\",\"outcome\":\"RECOVERED\"}",
-                    e.getKey(), o.target()));
-            }
-            if (e.getValue().isEmpty()) it.remove();
-        }
-        return n;
-    }
-
-    int offcutRetried;
 
     void copyContext(Address site, Address target, int cs) throws Exception {
         ProgramContext ctx = p.getProgramContext();
@@ -658,107 +593,75 @@ public final class WSJumpTables {
         if (v != null) ctx.setValue(soc, target, target, v);
     }
 
-    long clearedOrphans;
-
-    /** J1h helper: clears the unexecuted run starting at t that only the superseded reference reached.
-     *  Stops at any instruction reached from kept code (executed, still referenced, or reached by fall-through
-     *  from outside the run): carving live flow is never orphan cleanup. Bytes inside a function entered outside
-     *  the run are still cleared when nothing reaches them: with no reference and no fall-through they are
-     *  unreachable from that function too, and the cleared tail is usually re-owned by the routine-start rule. */
-    AddressSetView clearOrphan(Address t) throws Exception {
-        AddressSet out = new AddressSet();
-        String skipped = null;
-        String container = null;
-        Instruction i = listing.getInstructionAt(t);
-        while (i != null) {
-            if (WSRamCode.isRam(p, i.getAddress())) { skipped = "RAM_CODE_KEPT"; break; }
-            if (executed(i.getAddress().getOffset())) { skipped = "EXECUTED"; break; }
-            if (p.getReferenceManager().getReferencesTo(i.getAddress()).hasNext()) { skipped = "REFERENCED"; break; }
-            Address ff = i.getFallFrom();
-            if (ff != null && !out.contains(ff)) { skipped = "FALLTHROUGH@" + ff; break; }
-            Function cf = p.getFunctionManager().getFunctionContaining(i.getAddress());
-            if (cf != null && !out.contains(cf.getEntryPoint()) && !cf.getEntryPoint().equals(t) && container == null)
-                container = cf.getEntryPoint().toString();
-            Address ft = i.getFallThrough();
-            out.add(i.getAddress(), i.getMaxAddress());
-            i = ft == null ? null : listing.getInstructionAt(ft);
-        }
-        if (skipped != null && out.isEmpty())
-            emit.accept(String.format("{\"rule\":\"J1h\",\"start\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"%s\"}", t, skipped));
-        Function orphan = p.getFunctionManager().getFunctionAt(t);
-        boolean removeOrphan = orphan != null && out.contains(orphan.getBody())
-            && !orphan.isExternal() && !orphan.isThunk() && !WSRamCode.isRam(p, t)
-            && orphan.getSymbol().getSource() != SourceType.USER_DEFINED
-            && orphan.getSymbol().getSource() != SourceType.IMPORTED
-            && orphan.getSignatureSource() != SourceType.USER_DEFINED
-            && orphan.getSignatureSource() != SourceType.IMPORTED;
-        for (AddressRange r : out) {
-            listing.clearCodeUnits(r.getMinAddress(), r.getMaxAddress(), false);
-            p.getBookmarkManager().setBookmark(r.getMinAddress(), BookmarkType.ANALYSIS, "WSEvidence",
-                "J1h SUPERSEDED_TARGET_CLEARED: decoded only from a superseded computed reference; bytes kept");
-            emit.accept(String.format(container == null
-                ? "{\"rule\":\"J1h\",\"start\":\"%s\",\"end\":\"%s\",\"outcome\":\"CLEARED\"}"
-                : "{\"rule\":\"J1h\",\"start\":\"%s\",\"end\":\"%s\",\"outcome\":\"CLEARED\",\"from\":\"%s\"}",
-                r.getMinAddress(), r.getMaxAddress(), container == null ? "" : container));
-        }
-        if (removeOrphan && p.getFunctionManager().removeFunction(t))
-            emit.accept(String.format("{\"rule\":\"J1h\",\"start\":\"%s\",\"outcome\":\"ORPHAN_FUNCTION_REMOVED\"}", t));
-        return out;
+    void reportTargetConflict(Instruction source, Address target) throws Exception {
+        Address site = source.getAddress();
+        String reason = listing.getInstructionContaining(target) != null
+            || listing.getDefinedDataContaining(target) != null ? "PRESERVED_INTERPRETATION" : "TARGET_NOT_DECODED";
+        emit.accept(String.format("{\"rule\":\"J1\",\"site\":\"%s\",\"target\":\"%s\",\"outcome\":\"UNRESOLVED_CONFLICT\",\"why\":\"%s\"}", site, target, reason));
+        preserveHypothesis(site, target, "TARGET_CONFLICT");
+        p.getBookmarkManager().setBookmark(site, BookmarkType.ANALYSIS,
+            "WSJumpConflict:" + target, "J1 UNRESOLVED: target=" + target + "; reason=" + reason);
     }
 
-    /** ERROR bookmarks of a conflict with code J1h cleared are stale: removed. J1u: a flow those cleared bytes
-     *  blocked (the bookmark's own address, reached from an instruction that is still decoded) is re-flowed, so
-     *  live fall-through or branch code that lost to the superseded decode is disassembled again. */
-    void removeStaleConflicts(AddressSetView cleared) {
-        BookmarkManager bm = p.getBookmarkManager();
-        List<Bookmark> stale = new ArrayList<>();
-        List<Address> blocked = new ArrayList<>();
-        Iterator<Bookmark> it = bm.getBookmarksIterator(BookmarkType.ERROR);
-        while (it.hasNext()) {
-            Bookmark b = it.next();
-            Matcher m = CONFLICT.matcher(b.getComment());
-            if (cleared.contains(b.getAddress())) { stale.add(b); continue; }
-            if (m.find()) {
-                Address c = p.getAddressFactory().getAddress(m.group(1));
-                if (c != null && cleared.contains(c)) {
-                    stale.add(b);
-                    Matcher f = FLOW_FROM.matcher(b.getComment());
-                    Address from = f.find() ? p.getAddressFactory().getAddress(f.group(1)) : null;
-                    if (from != null && listing.getInstructionAt(from) != null) blocked.add(b.getAddress());
-                }
-            }
+    final AddressSet preservedHypotheses = new AddressSet();
+
+    /** H2: reference withdrawal does not justify deleting instructions or functions. The category
+     *  identifies the source site, so repeat analysis updates only our own provenance bookmark. */
+    AddressSetView preserveHypothesis(Address site, Address target, String reason) throws Exception {
+        AddressSet retained = new AddressSet();
+        Instruction i = listing.getInstructionContaining(target);
+        if (i == null) {
+            emit.accept(String.format("{\"rule\":\"J1h\",\"site\":\"%s\",\"target\":\"%s\",\"outcome\":\"NO_CODE\",\"why\":\"%s\"}",
+                site, target, reason));
+            return retained;
         }
-        for (Bookmark b : stale) bm.removeBookmark(b);
-        for (Address a : blocked) {
-            if (listing.getInstructionAt(a) != null || listing.getDefinedDataContaining(a) != null) continue;
-            new DisassembleCommand(a, null, true).applyTo(p, TaskMonitor.DUMMY);
-            if (listing.getInstructionAt(a) != null) {
-                reflowedBlocked++;
-                emit.accept(String.format("{\"rule\":\"J1u\",\"start\":\"%s\",\"outcome\":\"REFLOWED\"}", a));
-            }
+        Instruction source = listing.getInstructionAt(site);
+        String sourceBytes = source == null ? "unknown" : HexFormat.of().formatHex(source.getBytes());
+        boolean offcut = !i.getAddress().equals(target);
+        while (i != null && !retained.contains(i.getAddress())) {
+            Address start = i.getAddress();
+            Function f = p.getFunctionManager().getFunctionContaining(start);
+            String bytes = HexFormat.of().formatHex(i.getBytes());
+            String support = executed(start.getOffset()) ? "EXECUTED" : "UNCONFIRMED";
+            String detail = "J1h H2 PRESERVED: source=" + site + "; source_bytes=" + sourceBytes + "; target=" + target
+                + "; reason=" + reason + "; bytes=" + bytes + "; evidence=" + support
+                + "; incoming=" + p.getReferenceManager().getReferenceCountTo(start)
+                + "; fall_from=" + i.getFallFrom() + "; function=" + (f == null ? "none" : f.getEntryPoint())
+                + "; absence of evidence does not invalidate code";
+            p.getBookmarkManager().setBookmark(start, BookmarkType.ANALYSIS,
+                "WSHypothesis:" + site + ":" + sourceBytes + ":" + target + ":" + reason + ":" + bytes, detail);
+            retained.add(start, i.getMaxAddress());
+            emit.accept(String.format("{\"rule\":\"J1h\",\"site\":\"%s\",\"target\":\"%s\",\"start\":\"%s\",\"end\":\"%s\",\"bytes\":\"%s\",\"outcome\":\"PRESERVED\",\"why\":\"%s\",\"evidence\":\"%s\"}",
+                site, target, start, i.getMaxAddress(), bytes, reason, support));
+            Address next = i.getFallThrough();
+            i = offcut || next == null ? null : listing.getInstructionAt(next);
         }
+        preservedHypotheses.add(retained);
+        return retained;
     }
-
-    int reflowedBlocked;
-
-    static final Pattern CONFLICT = Pattern.compile("conflicting instruction at (\\S+)");
-    static final Pattern FLOW_FROM = Pattern.compile("flow from (\\S+?)\\)");
 
     String summary() {
-        return String.format("J1 jump/call table sites %d (passes %d): recovered %d (J1i register base %d), unresolved %d, quarantined %d (refs dropped %d), new code %d, observed targets added %d, offcut targets %d (retried %d), deshadowed %d, superseded refs %d, orphan bytes cleared %d (blocked flows re-flowed %d), dispatches restored %d (recovered %d), site errors %d",
-            seen.size(), passes, recovered, computedBases, reported.size(), quarantines, droppedRefs, newCode, observedMissing, offcut, offcutRetried, deshadowed, supersededRefs, clearedOrphans, reflowedBlocked, restoredDispatches, restoredRecovered, errors);
+        return String.format("J1 jump/call table sites %d (passes %d): recovered %d (J1i register base %d), unresolved %d, quarantined %d (refs dropped %d), new code %d, observed targets added %d, offcut targets %d, deshadowed %d, superseded refs %d, hypothesis bytes preserved %d, dispatches restored %d (recovered %d), site errors %d",
+            seen.size(), passes, recovered, computedBases, reported.size(), quarantines, droppedRefs, newCode, observedMissing, offcut, deshadowed, supersededRefs, preservedHypotheses.getNumAddresses(), restoredDispatches, restoredRecovered, errors);
     }
 
-    /** J1n: clear single-byte data shadowing a proven table target so it disassembles. The shadowing byte
-     *  comes from a data pointer that read the table slot first; a proven code target beats one data byte.
-     *  User/imported data and multi-byte data stay (returns false, keeping the target undecoded). Analysis
-     *  references to the byte are deleted with it (the slot's code reference is added by the caller). */
+    /** J1n: only a single byte without user/imported symbols or references may be superseded by a
+     *  structurally proven table target. RAM bytes without an image remain unknown. */
+    boolean canDeshadow(Address t) {
+        MemoryBlock block = mem.getBlock(t);
+        if (block != null && !block.isOverlay() && block.getName().equals("RAM")) return false;
+        Data data = listing.getDataAt(t);
+        if (data == null || data.getLength() != 1) return false;
+        for (Symbol symbol : p.getSymbolTable().getSymbols(t))
+            if (symbol.getSource() == SourceType.USER_DEFINED || symbol.getSource() == SourceType.IMPORTED) return false;
+        for (Reference ref : p.getReferenceManager().getReferencesTo(t))
+            if (ref.getSource() == SourceType.USER_DEFINED || ref.getSource() == SourceType.IMPORTED) return false;
+        return true;
+    }
+
+    /** Positive table evidence may supersede unprotected single-byte data; never instructions. */
     boolean deshadow(Address site, Address t) throws Exception {
-        // H1: RAM targets have no image (loader zero-fill); leave the byte undecoded.
-        ghidra.program.model.mem.MemoryBlock rb = mem.getBlock(t);
-        if (rb != null && !rb.isOverlay() && rb.getName().equals("RAM")) return false;
-        var d = listing.getDataAt(t);
-        if (d == null || d.getLength() != 1) return false;
+        if (!canDeshadow(t)) return false;
         List<Reference> refs = new ArrayList<>();
         p.getReferenceManager().getReferencesTo(t).forEachRemaining(refs::add);
         for (Reference r : refs)
