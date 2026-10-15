@@ -4,6 +4,8 @@ package jidoughost.wonderswan;
 import java.io.PrintWriter;
 import java.math.BigInteger;
 import java.nio.file.*;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.*;
 
 import ghidra.app.cmd.disassemble.DisassembleCommand;
@@ -17,13 +19,14 @@ import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.pcode.JumpTable;
+import ghidra.program.disassemble.Disassembler;
 import ghidra.program.model.symbol.*;
 import ghidra.util.exception.CancelledException;
 import ghidra.util.task.TaskMonitor;
 
 /**
  * Seeds analysis with execution evidence (WSMachine run in-process, or WSEmulate outputs) and classifies
- * the decode artefacts that disassembly produces when it follows never-taken paths into data.
+ * unresolved decode hypotheses without discarding unobserved code.
  *
  * Rules (every decision is evidence-backed and can be written to a JSON-lines report):
  *   C0  before any flow, undecoded ROM bytes (linear blocks and executable bank overlays) get a default code
@@ -53,9 +56,9 @@ import ghidra.util.task.TaskMonitor;
  *       its start column (not inside an existing function); other code-strong, executed* and code seeds are
  *       instruction starts; csval = the seed's segment. Other classes (e.g. code-weak) and seeds
  *       that conflict with existing decode are reported, not applied.
- *   A1  a bad decode (ERROR bookmark) reached by fall-through from unexecuted instructions: the maximal
- *       unexecuted fall-through run ending at it is a data artefact. Its decode is cleared (bytes kept),
- *       a "WSEvidence" bookmark records the evidence. Executed instructions are never cleared.
+ *   A1  a decode-error bookmark reached by fall-through from unobserved instructions leaves an unresolved
+ *       hypothesis. Instructions, functions and diagnostics are preserved; separate source-bound bookmarks
+ *       record the retained bytes and error identity. Missing observations do not establish data.
  *
  * <p>Mesen 2 evidence (option "Mesen trace directory or CDL file", off by default) merges into the
  * same rules: executed addresses seed E1 (CS from the trace, else WSMachine, else the bank-aligned
@@ -83,7 +86,7 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
 
     public WSEvidenceAnalyzer() {
         super(NAME, "Seeds code discovery from emulator execution evidence (executed code, indirect "
-            + "targets, interrupt entries, DS at entries) and classifies decode artefacts.", AnalyzerType.BYTE_ANALYZER);
+            + "targets, interrupt entries, DS at entries) and tags preserved decode hypotheses.", AnalyzerType.BYTE_ANALYZER);
         setPriority(AnalysisPriority.BLOCK_ANALYSIS.before());
         setDefaultEnablement(true);
         setSupportsOneTimeAnalysis();
@@ -103,7 +106,7 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
         o.registerOption(OPT_SLICE, slice, null, "Instructions per frame (Mesen-measured rates are ~12000-15000)");
         o.registerOption(OPT_DIR, dir, null, "Load coverage.json + edges.tsv from this directory instead of running");
         o.registerOption(OPT_REPORT, report, null, "Write one JSON line per decision to this file");
-        o.registerOption(OPT_ARTEFACTS, artefacts, null, "Clear unexecuted fall-through runs that decode into a bad instruction");
+        o.registerOption(OPT_ARTEFACTS, artefacts, null, "Preserve and tag unobserved fall-through code preceding a decode-error bookmark");
         o.registerOption(OPT_SEEDS, seeds, null, "Seed code from this TSV (address, class, method, start, ...): code-strong/function -> function at start, executed*/code -> instruction start");
         o.registerOption(OPT_MESEN, mesen, null, "Merge Mesen 2 execution evidence (trace.tsv + coverage.tsv directory, or a .cdl file) into the same rules");
     }
@@ -777,50 +780,115 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
             }
         }
 
+        record A1Error(Address address, String category, String comment) { }
+
+        static String a1Quote(String text) {
+            if (text == null) return "null";
+            StringBuilder out = new StringBuilder("\"");
+            for (char c : text.toCharArray()) {
+                if (c == '"' || c == '\\') out.append('\\').append(c);
+                else if (c < 0x20) out.append(String.format("\\u%04x", (int)c));
+                else out.append(c);
+            }
+            return out.append('"').toString();
+        }
+
+        static String a1Address(Address address) {
+            return address == null ? "null" : "{\"space\":" + a1Quote(address.getAddressSpace().getName())
+                + ",\"address\":" + a1Quote(address.toString()) + "}";
+        }
+
+        /** Append provenance without changing an existing bookmark, including a user-owned category collision. */
+        void a1Bookmark(Address start, String detail) throws Exception {
+            String digest = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                .digest(detail.getBytes(StandardCharsets.UTF_8)));
+            String base = "WSA1Hypothesis:" + digest;
+            BookmarkManager bm = p.getBookmarkManager();
+            for (int suffix = 0; ; suffix++) {
+                String category = base + (suffix == 0 ? "" : ":" + suffix);
+                Bookmark existing = bm.getBookmark(start, BookmarkType.ANALYSIS, category);
+                if (existing == null) {
+                    bm.setBookmark(start, BookmarkType.ANALYSIS, category, detail);
+                    return;
+                }
+                if (detail.equals(existing.getComment())) return;
+            }
+        }
+
         void classifyArtefacts(java.util.Set<Address> keptTargets) throws Exception {
             int ramRuns = WSRamCode.classify(p);
             emit("{\"rule\":\"H2\",\"unknown_ram_runs\":%d,\"outcome\":\"KEPT\"}", ramRuns);
             Listing listing = p.getListing();
             BookmarkManager bm = p.getBookmarkManager();
-            List<Address> bad = new ArrayList<>();
+            List<A1Error> bad = new ArrayList<>();
             Iterator<Bookmark> it = bm.getBookmarksIterator(BookmarkType.ERROR);
-            while (it.hasNext()) bad.add(it.next().getAddress());
-            for (Address b : bad) {
+            while (it.hasNext()) {
+                Bookmark error = it.next();
+                if (Disassembler.ERROR_BOOKMARK_CATEGORY.equals(error.getCategory()))
+                    bad.add(new A1Error(error.getAddress(), error.getCategory(), error.getComment()));
+            }
+            for (A1Error error : bad) {
                 monitor.checkCancelled();
-                // walk back along fall-through while instructions were never executed; a kept jump-table
-                // target is proven code (table + bound + stops), so the walk stops before it instead of
-                // clearing a real handler that merely flows toward a bad decode
+                Address b = error.address();
+                // This local witness identifies a hypothesis, not invalid code. Observation and bank
+                // identity remain address-space aware; raw trace offsets do not prove every overlay ran.
                 List<Instruction> run = new ArrayList<>();
-                boolean keptStop = false;
+                String stop = "NO_PREDECESSOR";
                 Instruction prev = listing.getInstructionBefore(b);
-                while (prev != null && b.equals(prev.getFallThrough()) && !WSRomEvidence.executed(p, ev, prev.getAddress())) {
-                    if (WSRamCode.isRam(p, prev.getAddress())) break;
-                    if (keptTargets.contains(prev.getAddress())) { keptStop = true; break; }
-                    run.add(0, prev);
+                while (prev != null) {
+                    monitor.checkCancelled();
+                    if (!b.getAddressSpace().equals(prev.getAddress().getAddressSpace())) { stop = "ADDRESS_SPACE_BOUNDARY"; break; }
+                    if (!b.equals(prev.getFallThrough())) { stop = "FLOW_BOUNDARY"; break; }
+                    if (WSRomEvidence.executed(p, ev, prev.getAddress())) { stop = "OBSERVED_LOCAL"; break; }
+                    if (WSRamCode.isRam(p, prev.getAddress())) { stop = "RAM"; break; }
+                    if (keptTargets.contains(prev.getAddress())) { stop = "KEPT_TARGET"; break; }
+                    run.add(prev);
                     b = prev.getAddress();
                     prev = listing.getInstructionBefore(b);
                 }
-                if (run.isEmpty()) continue;
-                Address start = run.get(0).getAddress(), end = run.get(run.size() - 1).getMaxAddress();
-                StringBuilder refs = new StringBuilder();
-                for (Reference r : p.getReferenceManager().getReferencesTo(start)) {
-                    boolean exec = ev.executed(r.getFromAddress().getOffset());
-                    refs.append(refs.length() > 0 ? "," : "").append(String.format("{\"from\":\"%s\",\"executed\":%b}", r.getFromAddress(), exec));
+                if (run.isEmpty()) {
+                    emit("{\"rule\":\"A1-skip\",\"error\":%s,\"error_category\":%s,\"error_comment\":%s,\"outcome\":\"NO_SPAN\",\"stopped\":%s}",
+                        a1Address(error.address()), a1Quote(error.category()), a1Quote(error.comment()), a1Quote(stop));
+                    continue;
                 }
-                Function f = p.getFunctionManager().getFunctionContaining(start);
-                listing.clearCodeUnits(start, end, false);
-                bm.setBookmark(start, "Analysis", "WSEvidence",
-                    "A1 DATA_ARTEFACT: " + run.size() + " unexecuted fall-through instructions ending in a bad decode; decode cleared");
-                if (f != null && !f.getEntryPoint().equals(start)) CreateFunctionCmd.fixupFunctionBody(p, f, monitor);
-                else if (f != null) p.getFunctionManager().removeFunction(start);
+                Collections.reverse(run);
+                Address start = run.get(0).getAddress(), end = run.get(run.size() - 1).getMaxAddress();
+                for (Instruction instruction : run) {
+                    Address at = instruction.getAddress();
+                    List<String> refs = new ArrayList<>();
+                    for (int offset = 0; offset < instruction.getLength(); offset++) {
+                        for (Reference ref : p.getReferenceManager().getReferencesTo(at.add(offset))) {
+                            refs.add("{\"from\":" + a1Address(ref.getFromAddress()) + ",\"to\":" + a1Address(ref.getToAddress())
+                                + ",\"type\":" + a1Quote(ref.getReferenceType().toString())
+                                + ",\"source\":" + a1Quote(ref.getSource().toString()) + ",\"operand\":" + ref.getOperandIndex()
+                                + ",\"observed_local\":" + WSRomEvidence.executed(p, ev, ref.getFromAddress()) + "}");
+                        }
+                    }
+                    Collections.sort(refs);
+                    Function function = p.getFunctionManager().getFunctionContaining(at);
+                    String detail = "{\"rule\":\"A1\",\"outcome\":\"PRESERVED_HYPOTHESIS\","
+                        + "\"reason\":\"UNOBSERVED_FALLTHROUGH_TO_DECODE_ERROR\",\"error\":" + a1Address(error.address())
+                        + ",\"error_category\":" + a1Quote(error.category()) + ",\"error_comment\":" + a1Quote(error.comment())
+                        + ",\"start\":" + a1Address(at) + ",\"end\":" + a1Address(instruction.getMaxAddress())
+                        + ",\"bytes\":" + a1Quote(HexFormat.of().formatHex(instruction.getBytes()))
+                        + ",\"instruction\":" + a1Quote(instruction.toString())
+                        + ",\"span_start\":" + a1Address(start) + ",\"span_end\":" + a1Address(end)
+                        + ",\"stopped\":" + a1Quote(stop) + ",\"refs_to_instruction\":[" + String.join(",", refs) + "]"
+                        + ",\"fall_from\":" + a1Address(instruction.getFallFrom())
+                        + ",\"fall_through\":" + a1Address(instruction.getFallThrough())
+                        + ",\"function\":" + a1Address(function == null ? null : function.getEntryPoint())
+                        + ",\"evidence_source\":" + a1Quote(ev.provenance) + "}";
+                    a1Bookmark(at, detail);
+                    emit("%s", detail);
+                }
                 a1runs++; a1insns += run.size();
-                emit("{\"rule\":\"A1\",\"start\":\"%s\",\"end\":\"%s\",\"instructions\":%d,\"refs_to_start\":[%s]%s}", start, end, run.size(), refs,
-                    keptStop ? ",\"stopped\":\"KEPT_TARGET\"" : "");
+                emit("{\"rule\":\"A1-span\",\"start\":%s,\"end\":%s,\"instructions_retained\":%d,\"outcome\":\"PRESERVED\"}",
+                    a1Address(start), a1Address(end), run.size());
             }
         }
 
         String summary() {
-            return String.format("B2 bank overlays %d (edges into multi-bank code %d), B3 window flows overridden %d (jumps fenced %d, multi-bank %d, unobserved %d, context conflicts %d), E1 seeded %d (skipped %d), H1 RAM runs %d, E2 functions %d (offcut targets skipped %d), E3 jump sites %d (targets %d), N1 no-return cleared %d (%d call sites), D1 DS entries %d (SS %d), A1 artefact runs %d (%d instructions cleared)",
+            return String.format("B2 bank overlays %d (edges into multi-bank code %d), B3 window flows overridden %d (jumps fenced %d, multi-bank %d, unobserved %d, context conflicts %d), E1 seeded %d (skipped %d), H1 RAM runs %d, E2 functions %d (offcut targets skipped %d), E3 jump sites %d (targets %d), N1 no-return cleared %d (%d call sites), D1 DS entries %d (SS %d), A1 hypothesis spans %d (%d instructions retained)",
                 b2, b2ambiguous, b3, b3jump, b3multi, b3unobserved, b3conflict, e1, e1skip, h1runs, e2, e2conflict, e3, e3t, n1, n1sites, d1, d1ss, a1runs, a1insns);
         }
 

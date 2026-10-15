@@ -24,7 +24,7 @@ import ghidra.util.task.TaskMonitor;
  *   N1  clear "does not return" where a call's fall-through executed, restore the cut-off code;
  *   E1R re-seed executed addresses that later analysis removed;
  *   J1  CS-relative jump/call tables by rule ({@link WSJumpTables}), checked against observed targets;
- *   D1  DS/SS context at function entries; A1 classify decode artefacts;
+ *   D1  DS/SS context at function entries; A1 preserve and tag unresolved decode hypotheses;
  *   P1  functions whose entry has no bytes are phantoms: removed and reported with their creating references;
  *   D0  title DS/SS defaults from execution evidence ({@link WSCompilerRules}), before D1;
  *   C1  every function whose signature no user or importer set gets the title's convention: __lsic86 when
@@ -44,7 +44,7 @@ public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
 
     public WSEvidenceRepairAnalyzer() {
         super(NAME, "Checks analysis results against the execution evidence collected by '"
-            + WSEvidenceAnalyzer.NAME + "': non-returning functions, lost executed code, DS at entries, decode artefacts.",
+            + WSEvidenceAnalyzer.NAME + "': non-returning functions, lost executed code, DS at entries, decode hypotheses.",
             AnalyzerType.BYTE_ANALYZER);
         setPriority(AnalysisPriority.LOW_PRIORITY.after().after());
         setDefaultEnablement(true);

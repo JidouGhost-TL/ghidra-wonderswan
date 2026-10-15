@@ -31,7 +31,9 @@ public final class WSRamCode {
             Address address = instruction.getAddress();
             if (!isRam(program, address) || hasImage(program, address)) { previousEnd = null; continue; }
             if (previousEnd == null || !address.equals(previousEnd.next())) {
-                program.getBookmarkManager().setBookmark(address, BookmarkType.ANALYSIS, CATEGORY, UNKNOWN);
+                // An existing diagnostic may carry user evidence; classification only adds missing provenance.
+                if (program.getBookmarkManager().getBookmark(address, BookmarkType.ANALYSIS, CATEGORY) == null)
+                    program.getBookmarkManager().setBookmark(address, BookmarkType.ANALYSIS, CATEGORY, UNKNOWN);
                 runs++;
             }
             previousEnd = instruction.getMaxAddress();
