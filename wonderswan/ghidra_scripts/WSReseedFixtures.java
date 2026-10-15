@@ -37,7 +37,7 @@ public class WSReseedFixtures extends GhidraScript {
                 WSFillRuns.apply(p,null,l->{},monitor);
                 Function f=p.getFunctionManager().getFunctionAt(entry);
                 boolean ram=segment<0x2000;
-                check((f!=null)==ram,"fill entry segment="+segment+" value="+value+" decoded="+decoded+" round="+round);
+                check(f!=null,"repeated-byte entry retained segment="+segment+" value="+value+" decoded="+decoded+" round="+round);
                 if(ram&&f!=null) {
                     check(f.getBody().equals(body),"inherited body retained");
                     check(f.getTags().stream().anyMatch(t->t.getName().equals(WSRamCode.UNKNOWN)),"no-image hypothesis tagged");

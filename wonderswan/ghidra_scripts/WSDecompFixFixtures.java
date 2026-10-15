@@ -177,7 +177,8 @@ public class WSDecompFixFixtures extends GhidraScript {
         try {
             p.getFunctionManager().createFunction(null,at(p,0x100),new AddressSet(at(p,0x100)),SourceType.DEFAULT);
             WSFillRuns.apply(p,null,l->{},monitor);
-            check(p.getFunctionManager().getFunctionAt(at(p,0x100))==null,"automatic entry deep in undecoded FF fill removed");
+            check(p.getFunctionManager().getFunctionAt(at(p,0x100))!=null,"automatic entry in undecoded repeated bytes retained");
+            check(p.getBookmarkManager().getBookmarks(at(p,0)).length>0,"repeated-byte hypothesis has durable evidence");
             check(p.getMemory().getByte(at(p,0x100))==(byte)0xff,"fill bytes kept");
         } finally { release(p); }
     }

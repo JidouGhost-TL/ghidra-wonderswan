@@ -10,7 +10,7 @@ import ghidra.program.model.listing.*;
 import ghidra.program.model.symbol.*;
 import jidoughost.wonderswan.*;
 
-/** Synthetic fill boundaries, executed-byte priority and byte-preservation checks. */
+/** Repeated-byte hypotheses preserve decode, flow, functions and bytes. */
 public class WSFillFixtures extends GhidraScript {
     int checks;
     void check(boolean ok, String reason) { if (!ok) throw new AssertionError(reason); checks++; }
@@ -39,23 +39,16 @@ public class WSFillFixtures extends GhidraScript {
             if(user)f.setName("user_fill_fixture",SourceType.USER_DEFINED);
             WSEvidence ev=new WSEvidence();ev.romFlags=new byte[bytes.length];
             if(played)Arrays.fill(ev.romFlags,0x103,0x103+length,(byte)1);
+            long originalInstructions=p.getListing().getNumInstructions();AddressSet originalBody=new AddressSet(f.getBody());
             List<String> lines=new ArrayList<>();String result=WSFillRuns.apply(p,ev,lines::add,monitor);println(result);
-            boolean remove=!played&&!user&&length>=(value==0||value==255?64:256);
-            check((p.getListing().getDataAt(at(p,0x103))!=null)==remove,"fill classification byte="+value+" len="+length+" played="+played+" user="+user);
-            check(f.getBody().contains(at(p,0x104))!=remove,"function split at fill");
-            if(remove) {
-                check(!p.getMemory().getBlock(p.getListing().getInstructionAt(at(p,0x100)).getFallThrough()).isInitialized(),"empty same-space analysis boundary");
-                check(p.getListing().getInstructionAt(at(p,0x100)).getFallThrough().getAddressSpace().equals(at(p,0x100).getAddressSpace()),"boundary stays in its code space despite occupied physical address");
-                DecompInterface d=new DecompInterface();d.openProgram(p);var c=d.decompileFunction(f,30,monitor);
-                check(c.decompileCompleted(),"prefix decompiles: "+c.getErrorMessage());String text=c.getDecompiledFunction().getC();println("FILL_C "+value+" "+text);
-                check(text.split("\n").length<40 && !text.contains("unaff_DS"),"decompiler stops before any fill effects byte="+value);d.dispose();
-            }
-            if(remove) {
-                Arrays.fill(ev.romFlags,0x103,0x103+length,(byte)1);
-                check(WSFillRuns.restoreExecuted(p,ev,line->{})==1,"later execution reopens fill");
-                check(p.getListing().getDefinedDataAt(at(p,0x103))==null,"data classification withdrawn");
-                check(p.getListing().getInstructionAt(at(p,0x100)).getFallThrough().equals(at(p,0x103)),"original fallthrough restored");
-            }
+            check(p.getListing().getDefinedDataAt(at(p,0x103))==null,"hypothesis does not reclassify code as data");
+            check(f.getBody().equals(originalBody),"complete function body retained");
+            check(p.getListing().getNumInstructions()==originalInstructions,"all decoded instructions retained");
+            check(p.getListing().getInstructionAt(at(p,0x100)).getFallThrough().equals(at(p,0x103)),"original fallthrough retained");
+            check(Arrays.stream(p.getMemory().getBlocks()).noneMatch(b->b.getName().startsWith("WS_FILL_BOUNDARY_")),"no synthetic stop memory created");
+            Arrays.fill(ev.romFlags,0x103,0x103+length,(byte)1);
+            check(WSFillRuns.restoreExecuted(p,ev,line->{})==0,"no old deletion to reverse");
+            check(p.getListing().getNumInstructions()==originalInstructions,"later observation preserves current code");
             byte[] after=new byte[bytes.length];p.getMemory().getBytes(at(p,0),after);check(Arrays.equals(bytes,after),"no bytes changed");
             long count=p.getListing().getNumInstructions();WSFillRuns.apply(p,ev,line->{},monitor);check(count==p.getListing().getNumInstructions(),"idempotent");
         } finally {p.endTransaction(tx,true);p.release(this);}
@@ -80,11 +73,10 @@ public class WSFillFixtures extends GhidraScript {
             WSEvidence ev=new WSEvidence();ev.romFlags=new byte[bytes.length];ev.romFlags[0x100]=5;ev.romFlags[0x101]=1;
             WSFillRuns.apply(p,ev,line->{},monitor);
             Instruction branch=p.getListing().getInstructionAt(at(p,0x100));
-            check(branch.getFlowOverride()==FlowOverride.CALL_RETURN,"fill jump becomes opaque tail transfer");
+            check(branch.getFlowOverride()==FlowOverride.NONE,"repeated-byte target retains original jump semantics");
             if(conditional)check(branch.getFallThrough().equals(at(p,0x102)),"untaken conditional path retained");
-            DecompInterface d=new DecompInterface();d.openProgram(p);var c=d.decompileFunction(f,30,monitor);
-            check(c.decompileCompleted(),"jump prefix decompiles: "+c.getErrorMessage());
-            check(!c.getDecompiledFunction().getC().contains("unaff_DS"),"fill jump has no invented memory additions");d.dispose();
+            check(p.getListing().getInstructionAt(at(p,0x122))!=null,"unobserved target decode retained");
+            check(f.getBody().contains(at(p,0x122)),"unobserved target body retained");
             ev.romFlags[0x122]=1;WSFillRuns.restoreExecuted(p,ev,line->{});
             check(branch.getFlowOverride()==FlowOverride.NONE,"execution restores original jump");
         } finally {p.endTransaction(tx,true);p.release(this);}
@@ -115,9 +107,10 @@ public class WSFillFixtures extends GhidraScript {
             WSEvidence ev=new WSEvidence();ev.romFlags=new byte[bytes.length];Arrays.fill(ev.romFlags,0x100,0x103,(byte)1);
             WSFillRuns.apply(p,ev,line->{},monitor);
             source=fm.getFunctionAt(at(p,0x100));
-            check(fm.getFunctionAt(at(p,0x200))==null,"speculative fill target removed");
+            check(fm.getFunctionAt(at(p,0x200))!=null,"unobserved repeated-byte target retained");
             check(source!=null&&source.getBody().getNumAddresses()==3,"played thunk function body retained");
-            check(rebound?source.isThunk()&&source.getThunkedFunction(false).equals(target):!source.isThunk(),"thunk rebinds to actual target or becomes unresolved ordinary function");
+            check(source.isThunk()&&source.getThunkedFunction(false).equals(old),"original thunk relationship retained");
+            check(rebound==Arrays.stream(p.getListing().getInstructionAt(at(p,0x100)).getReferencesFrom()).anyMatch(r->r.getSource()==SourceType.IMPORTED),"imported override reference retained");
             check(p.getListing().getInstructionAt(at(p,0x100))!=null,"played thunk instruction retained");
             byte[] after=new byte[bytes.length];p.getMemory().getBytes(at(p,0),after);check(Arrays.equals(bytes,after),"thunk preservation leaves bytes intact");
         } finally {p.endTransaction(tx,true);p.release(this);}

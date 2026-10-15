@@ -1,28 +1,55 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 package jidoughost.wonderswan;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.*;
 import java.util.function.Consumer;
 import ghidra.program.model.address.*;
-import ghidra.program.model.data.*;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.*;
 import ghidra.util.task.TaskMonitor;
 
-/** Z1: long homogeneous byte runs are fill unless execution or explicit user code protects them. */
+/** Z1: repeated bytes identify a dual-use hypothesis, never exclusive proof against code. */
 public final class WSFillRuns {
+    /** Legacy properties describe old destructive decisions; new hypotheses do not write them. */
     public static final String CATEGORY = "WSFillRun", PROPERTY = "WS_FILL_RUN", EDGES = "WS_FILL_EDGE";
+    public static final String HYPOTHESIS = "WSZ1Hypothesis:";
     public static final int ZERO_FF_MIN = 64, OTHER_MIN = 256;
     private WSFillRuns() { }
 
-    private static Address transferTarget(Instruction i) {
-        // Listing flows can still describe the encoded target after an imported
-        // flow override has rebound it to an initialized RAM image.
-        for (Reference ref : i.getReferencesFrom())
-            if (ref.isPrimary() && (ref.getReferenceType() == RefType.JUMP_OVERRIDE_UNCONDITIONAL
-                || ref.getReferenceType() == RefType.CALL_OVERRIDE_UNCONDITIONAL)) return ref.getToAddress();
-        return i.getFlows().length == 1 ? i.getFlows()[0] : null;
+    private static String quote(String text) {
+        if (text == null) return "null";
+        StringBuilder out = new StringBuilder("\"");
+        for (char c : text.toCharArray()) {
+            if (c == '"' || c == '\\') out.append('\\').append(c);
+            else if (c < 0x20) out.append(String.format("\\u%04x", (int)c));
+            else out.append(c);
+        }
+        return out.append('"').toString();
+    }
+
+    private static String address(Address at) {
+        return at == null ? "null" : "{\"space\":" + quote(at.getAddressSpace().getName())
+            + ",\"address\":" + quote(at.toString()) + "}";
+    }
+
+    private static String digest(byte[] bytes) throws Exception {
+        return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
+    }
+
+    /** Append source-bound evidence, preserving even a collision with an edited diagnostic. */
+    private static void report(Program p, Address at, String detail, Consumer<String> emit) throws Exception {
+        String base = HYPOTHESIS + digest(detail.getBytes(StandardCharsets.UTF_8));
+        BookmarkManager bm = p.getBookmarkManager();
+        for (int suffix = 0; ; suffix++) {
+            String category = base + (suffix == 0 ? "" : ":" + suffix);
+            Bookmark old = bm.getBookmark(at, BookmarkType.ANALYSIS, category);
+            if (old == null) { bm.setBookmark(at, BookmarkType.ANALYSIS, category, detail); break; }
+            if (detail.equals(old.getComment())) break;
+        }
+        emit.accept(detail);
     }
 
     private static AddressSet protectedCode(Program p) throws Exception {
@@ -39,203 +66,121 @@ public final class WSFillRuns {
         }
         for (Function f : p.getFunctionManager().getFunctions(true))
             if (f.getSymbol().getSource() == SourceType.USER_DEFINED
+                || f.getSymbol().getSource() == SourceType.IMPORTED
                 || f.getSignatureSource() == SourceType.USER_DEFINED
                 || f.getSignatureSource() == SourceType.IMPORTED) proof.add(f.getBody());
         return proof;
     }
 
-    private static boolean executed(Program p, WSEvidence ev, AddressSetView range, AddressSetView proof) {
-        if (proof.intersects(range)) return true;
+    private static boolean executed(Program p, WSEvidence ev, AddressSetView range) {
         if (ev != null) for (Address a : range.getAddresses(true))
             if (WSRomEvidence.executed(p, ev, a)) return true;
         return false;
     }
 
-    private static Address boundary(Program p, AddressRange range) throws Exception {
-        String name = "WS_FILL_BOUNDARY_" + range.getMinAddress().getAddressSpace().getName();
-        MemoryBlock block = p.getMemory().getBlock(name);
-        if (block == null) {
-            // Ghidra real-mode spaces extend above the CPU's 20-bit bus. Reserve an empty
-            // analysis destination there, in the same code space, so independent pseudo-
-            // decoding stops with unknown flow rather than consuming the fill or inventing
-            // a return. The bytes and mappings in the CPU's addressable image are untouched.
-            AddressSpace space = range.getMinAddress().getAddressSpace();
-            // Overlay getAddress falls back to the physical space outside its mapped
-            // ranges. Keep this new stop in the code overlay even before it is mapped.
-            Address a = space instanceof OverlayAddressSpace overlay
-                ? overlay.getAddressInThisSpaceOnly(0x100000) : space.getAddress(0x100000);
-            if (p.getMemory().contains(a)) throw new IllegalStateException("analysis boundary address is occupied");
-            block = p.getMemory().createUninitializedBlock(name, a, 1, false);
-            block.setPermissions(true, false, false);
-            block.setComment("Analysis-only stop for unexecuted fill; outside the 20-bit CPU bus; no instruction image");
-            p.getSymbolTable().createLabel(block.getStart(), name.toLowerCase(Locale.ROOT), SourceType.ANALYSIS);
-        }
-        return block.getStart();
-    }
-
-    /** New execution evidence reopens previously classified fill before normal code seeding. */
+    /** The legacy length/flags contain no byte hash or ownership certificate. Preserve and report ambiguity. */
     public static int restoreExecuted(Program p, WSEvidence ev, Consumer<String> emit) throws Exception {
-        var map = p.getUsrPropertyManager().getIntPropertyMap(PROPERTY);
-        if (map == null || ev == null) return 0;
-        AddressSet restored = new AddressSet();
-        List<Address> starts = new ArrayList<>();
-        for (var it = map.getPropertyIterator(); it.hasNext();) starts.add(it.next());
-        for (Address start : starts) {
-            Address end = start.add(map.getInt(start) - 1);
-            AddressSet range = new AddressSet(start, end);
-            if (!executed(p, ev, range, new AddressSet())) continue;
-            p.getListing().clearCodeUnits(start, end, false);
-            map.remove(start); restored.add(range);
-            Bookmark old = p.getBookmarkManager().getBookmark(start, BookmarkType.ANALYSIS, CATEGORY);
-            if (old != null) p.getBookmarkManager().removeBookmark(old);
-            emit.accept(String.format("{\"rule\":\"Z1\",\"start\":\"%s\",\"end\":\"%s\",\"outcome\":\"EXECUTION_REOPENS_FILL\"}",start,end));
-        }
-        var edges = p.getUsrPropertyManager().getIntPropertyMap(EDGES);
-        if (edges != null && !restored.isEmpty()) {
-            List<Address> sites = new ArrayList<>();
-            for (var it = edges.getPropertyIterator(); it.hasNext();) sites.add(it.next());
-            for (Address site : sites) {
-                Instruction i = p.getListing().getInstructionAt(site);
-                if (i == null) continue;
-                int flags = edges.getInt(site);
-                if ((flags & 1) != 0 && restored.contains(i.getDefaultFallThrough())) {
-                    i.clearFallThroughOverride(); flags &= ~1;
-                }
-                if ((flags & 2) != 0 && i.getFlowOverride() == FlowOverride.CALL_RETURN)
-                    for (Address target : i.getDefaultFlows()) if (restored.contains(target)) {
-                        i.setFlowOverride(FlowOverride.NONE); flags &= ~2; break;
-                    }
-                if (flags == 0) edges.remove(site); else edges.add(site, flags);
+        for (String property : new String[]{PROPERTY, EDGES}) {
+            var map = p.getUsrPropertyManager().getIntPropertyMap(property);
+            if (map == null) continue;
+            for (var it = map.getPropertyIterator(); it.hasNext();) {
+                Address start = it.next();
+                Instruction instruction = p.getListing().getInstructionContaining(start);
+                Data data = p.getListing().getDefinedDataContaining(start);
+                CodeUnit unit = instruction == null ? data : instruction;
+                MemoryBlock block = p.getMemory().getBlock(start);
+                String currentBytes = unit == null || block == null || !block.isInitialized() ? null : digest(unit.getBytes());
+                String detail = "{\"rule\":\"Z1-legacy\",\"outcome\":\"LEGACY_STATE_PRESERVED_OPEN\","
+                    + "\"reason\":\"OWNERSHIP_AND_ORIGINAL_STATE_UNPROVED\",\"property\":" + quote(property)
+                    + ",\"start\":" + address(start) + ",\"stored_value\":" + map.getInt(start)
+                    + ",\"instruction\":" + quote(instruction == null ? null : instruction.toString())
+                    + ",\"data\":" + quote(data == null ? null : data.toString())
+                    + ",\"current_unit_sha256\":" + quote(currentBytes)
+                    + ",\"flow_override\":" + quote(instruction == null ? null : instruction.getFlowOverride().toString())
+                    + ",\"fall_through\":" + address(instruction == null ? null : instruction.getFallThrough())
+                    + ",\"evidence_source\":" + quote(ev == null ? null : ev.provenance) + "}";
+                report(p, start, detail, emit);
             }
         }
-        return restored.getNumAddressRanges();
+        // Neither fresh code nor old arrays/overrides can be erased on a stale property alone.
+        return 0;
+    }
+
+    private static String witness(Program p, AddressSet range) throws Exception {
+        List<String> instructions = new ArrayList<>(), functions = new ArrayList<>(), refs = new ArrayList<>();
+        for (Instruction i : p.getListing().getInstructions(range, true)) {
+            instructions.add("{\"at\":" + address(i.getAddress()) + ",\"bytes\":" + quote(HexFormat.of().formatHex(i.getBytes()))
+                + ",\"decode\":" + quote(i.toString()) + ",\"flow_override\":" + quote(i.getFlowOverride().toString())
+                + ",\"fall_through\":" + address(i.getFallThrough()) + "}");
+        }
+        for (Function f : p.getFunctionManager().getFunctions(true)) if (f.getBody().intersects(range))
+            functions.add("{\"entry\":" + address(f.getEntryPoint()) + ",\"body\":" + quote(f.getBody().toString())
+                + ",\"name\":" + quote(f.getName()) + ",\"source\":" + quote(f.getSymbol().getSource().toString())
+                + ",\"signature\":" + quote(f.getSignature().toString()) + ",\"thunk\":"
+                + address(f.isThunk() ? f.getThunkedFunction(false).getEntryPoint() : null) + "}");
+        for (Address a : range.getAddresses(true)) {
+            for (Reference r : p.getReferenceManager().getReferencesTo(a))
+                refs.add(address(r.getFromAddress()) + "->" + address(r.getToAddress()) + "|" + r.getReferenceType() + "|" + r.getSource() + "|" + r.getOperandIndex());
+        }
+        Collections.sort(refs);
+        return ",\"instructions\":[" + String.join(",", instructions) + "],\"functions\":[" + String.join(",", functions)
+            + "],\"incoming_references\":[" + String.join(",", refs.stream().map(WSFillRuns::quote).toList()) + "]";
     }
 
     public static String apply(Program p, WSEvidence ev, Consumer<String> emit, TaskMonitor monitor) throws Exception {
-        // A RAM snapshot can contain zero/FF bytes without recording what ran there.
-        // H2 keeps those inherited hypotheses, including entries with no decode.
         WSRamCode.classify(p);
         Listing listing = p.getListing();
-        AddressSet fill = new AddressSet(), reached = new AddressSet();
-        AddressSet proof = protectedCode(p);
+        AddressSet reached = new AddressSet(), proof = protectedCode(p);
         for (Instruction i : listing.getInstructions(true)) {
             reached.add(i.getMinAddress(), i.getMaxAddress());
             if (i.getFallThrough() != null) reached.add(i.getFallThrough());
             for (Address flow : i.getFlows()) reached.add(flow);
         }
-        // An automatic entry is a code hypothesis even if erased bytes never decoded.
-        // Include it in the existing fill test; execution and explicit code still win.
         for (Function f : p.getFunctionManager().getFunctions(true)) reached.add(f.getEntryPoint());
-        int runs = 0, preserved = 0, cleared = 0, removed = 0, split = 0, edges = 0;
+        int runs = 0, protectedRuns = 0, observed = 0, uninitialized = 0;
         for (MemoryBlock block : p.getMemory().getBlocks()) {
             monitor.checkCancelled();
-            if (!block.isInitialized() || !block.isExecute() || WonderSwanLoader.isDataOverlay(block)
-                || WSRamCode.isRam(p, block.getStart()) || WSRamCode.hasImage(p, block.getStart())
-                || block.getSize() > Integer.MAX_VALUE) continue;
+            if (!block.isExecute() || WonderSwanLoader.isDataOverlay(block) || block.getSize() > Integer.MAX_VALUE) continue;
+            if (!block.isInitialized()) {
+                AddressSet range = new AddressSet(block.getStart(), block.getEnd());
+                if (reached.intersects(range)) {
+                    report(p, block.getStart(), "{\"rule\":\"Z1\",\"outcome\":\"UNINITIALIZED_CODE_PRESERVED\",\"start\":"
+                        + address(block.getStart()) + ",\"end\":" + address(block.getEnd()) + witness(p, range) + "}", emit);
+                    uninitialized++;
+                }
+                continue;
+            }
             byte[] bytes = new byte[(int)block.getSize()];
             p.getMemory().getBytes(block.getStart(), bytes);
             for (int start = 0; start < bytes.length;) {
+                monitor.checkCancelled();
                 int end = start + 1;
                 while (end < bytes.length && bytes[end] == bytes[start]) end++;
                 int value = bytes[start] & 255, threshold = value == 0 || value == 255 ? ZERO_FF_MIN : OTHER_MIN;
                 if (end - start >= threshold) {
                     Address lo = block.getStart().add(start), hi = block.getStart().add(end - 1);
-                    // The first repeated byte may be the last operand of the preceding
-                    // instruction. Keep that complete instruction; only classify whole decode
-                    // units inside the homogeneous run, including when the prefix executed.
-                    Instruction first = listing.getInstructionContaining(lo);
+                    Instruction first = listing.getInstructionContaining(lo), last = listing.getInstructionContaining(hi);
                     if (first != null && !first.getAddress().equals(lo)) lo = first.getMaxAddress().next();
-                    Instruction last = listing.getInstructionContaining(hi);
                     if (last != null && last.getMaxAddress().compareTo(hi) > 0) hi = last.getAddress().previous();
                     if (lo.compareTo(hi) > 0 || hi.subtract(lo) + 1 < threshold) { start = end; continue; }
                     AddressSet range = new AddressSet(lo, hi);
                     if (reached.intersects(range)) {
-                        if (executed(p, ev, range, proof)) {
-                            preserved++;
-                            emit.accept(String.format("{\"rule\":\"Z1\",\"start\":\"%s\",\"end\":\"%s\",\"byte\":%d,\"outcome\":\"PROTECTED_CODE\"}",lo,hi,value));
-                        } else {
-                            fill.add(range); runs++;
-                            p.getBookmarkManager().setBookmark(lo, BookmarkType.ANALYSIS, CATEGORY,
-                                String.format("Unexecuted fill byte %02x, %d bytes; speculative flow stopped",value,end-start));
-                            emit.accept(String.format("{\"rule\":\"Z1\",\"start\":\"%s\",\"end\":\"%s\",\"byte\":%d,\"run_bytes\":%d,\"outcome\":\"FILL_DATA\"}",lo,hi,value,end-start));
-                        }
+                        String outcome = "PRESERVED_HYPOTHESIS";
+                        if (proof.intersects(range)) { outcome = "PROTECTED_CODE"; protectedRuns++; }
+                        else if (executed(p, ev, range)) { outcome = "OBSERVED_CODE"; observed++; }
+                        String detail = "{\"rule\":\"Z1\",\"outcome\":" + quote(outcome)
+                            + ",\"reason\":\"REPEATED_BYTES_DO_NOT_EXCLUDE_CODE\",\"start\":" + address(lo) + ",\"end\":" + address(hi)
+                            + ",\"byte\":" + value + ",\"run_bytes\":" + (end - start) + ",\"threshold\":" + threshold
+                            + ",\"block\":" + quote(block.getName()) + ",\"block_start\":" + address(block.getStart())
+                            + ",\"bytes_sha256\":" + quote(digest(Arrays.copyOfRange(bytes, (int)lo.subtract(block.getStart()), (int)hi.subtract(block.getStart()) + 1)))
+                            + ",\"ram\":" + WSRamCode.isRam(p, lo) + ",\"captured_ram_image\":" + WSRamCode.hasImage(p, lo)
+                            + ",\"evidence_source\":" + quote(ev == null ? null : ev.provenance) + witness(p, range) + "}";
+                        report(p, lo, detail, emit); runs++;
                     }
                 }
                 start = end;
             }
         }
-        if (fill.isEmpty()) return "Z1 fill runs 0, protected " + preserved;
-        var classified = WSRomEvidence.property(p, PROPERTY);
-        var stopped = WSRomEvidence.property(p, EDGES);
-        Map<AddressRange, Address> boundaries = new LinkedHashMap<>();
-        for (AddressRange range : fill) {
-            for (Instruction i : listing.getInstructions(new AddressSet(range), true)) cleared++;
-            listing.clearCodeUnits(range.getMinAddress(), range.getMaxAddress(), false);
-            long length = range.getLength();
-            listing.createData(range.getMinAddress(), new ArrayDataType(ByteDataType.dataType, (int)length, 1));
-            classified.add(range.getMinAddress(), (int)range.getLength());
-            boundaries.put(range, boundary(p, range));
-        }
-        List<Instruction> instructions = new ArrayList<>();
-        for (Instruction i : listing.getInstructions(true)) instructions.add(i);
-        for (Instruction i : instructions) {
-            if (fill.contains(i.getAddress())) { cleared++; continue; }
-            Address ft = i.getFallThrough();
-            if (ft != null && fill.contains(ft) && !i.isFallThroughOverridden()) {
-                Address marker = boundaries.entrySet().stream().filter(e -> e.getKey().contains(ft))
-                    .findFirst().orElseThrow().getValue();
-                i.setFallThrough(marker); edges++;
-                stopped.add(i.getAddress(), (stopped.hasProperty(i.getAddress()) ? stopped.getInt(i.getAddress()) : 0) | 1);
-                p.getReferenceManager().addMemoryReference(i.getAddress(), ft, RefType.DATA, SourceType.ANALYSIS, -1);
-                emit.accept(String.format("{\"rule\":\"Z1\",\"site\":\"%s\",\"target\":\"%s\",\"outcome\":\"OPAQUE_FILL_FALLTHROUGH\"}",i.getAddress(),ft));
-            }
-            for (Reference r : i.getReferencesFrom()) {
-                if (r.getReferenceType().isFlow() && r.getReferenceType().isComputed()
-                    && r.getSource() == SourceType.ANALYSIS && fill.contains(r.getToAddress())) {
-                    p.getReferenceManager().delete(r); edges++;
-                    emit.accept(String.format("{\"rule\":\"Z1\",\"site\":\"%s\",\"target\":\"%s\",\"outcome\":\"GUESSED_FILL_EDGE_REMOVED\"}",i.getAddress(),r.getToAddress()));
-                }
-            }
-            Address target = transferTarget(i);
-            if (i.getFlowType().isJump() && !i.getFlowType().isComputed() && target != null
-                && fill.contains(target) && i.getFlowOverride() == FlowOverride.NONE) {
-                i.setFlowOverride(FlowOverride.CALL_RETURN); edges++;
-                stopped.add(i.getAddress(), (stopped.hasProperty(i.getAddress()) ? stopped.getInt(i.getAddress()) : 0) | 2);
-                p.getReferenceManager().addMemoryReference(i.getAddress(), target, RefType.DATA, SourceType.ANALYSIS, -1);
-                emit.accept(String.format("{\"rule\":\"Z1\",\"site\":\"%s\",\"target\":\"%s\",\"outcome\":\"OPAQUE_FILL_TRANSFER\"}",i.getAddress(),target));
-            }
-        }
-        List<Function> functions = new ArrayList<>();
-        for (Function f : p.getFunctionManager().getFunctions(true)) functions.add(f);
-        for (Function f : functions) {
-            if (p.getFunctionManager().getFunctionAt(f.getEntryPoint()) == null) continue;
-            if (!f.getBody().intersects(fill)) continue;
-            if (fill.contains(f.getEntryPoint())) {
-                // Removing a target also removes its thunk function objects in Ghidra.
-                // Their instructions can be real code, and an imported flow override may
-                // already point at an imaged RAM destination. Preserve those independent
-                // bodies before deleting the speculative target.
-                Address[] thunks = f.getFunctionThunkAddresses(false);
-                if (thunks != null) for (Address entry : thunks) {
-                    Function thunk = p.getFunctionManager().getFunctionAt(entry);
-                    if (thunk == null || fill.contains(entry)) continue;
-                    Instruction jump = listing.getInstructionAt(entry);
-                    Function target = null;
-                    Address destination = jump == null ? null : transferTarget(jump);
-                    if (destination != null) target = p.getFunctionManager().getFunctionAt(destination);
-                    if (target != null && fill.contains(target.getEntryPoint())) target = null;
-                    thunk.setThunkedFunction(target);
-                    emit.accept(String.format("{\"rule\":\"Z1\",\"entry\":\"%s\",\"outcome\":\"THUNK_BODY_RETAINED\",\"target\":\"%s\"}", entry,
-                        target == null ? "unknown" : target.getEntryPoint()));
-                }
-                emit.accept(String.format("{\"rule\":\"Z1\",\"entry\":\"%s\",\"body_bytes\":%d,\"outcome\":\"FILL_FUNCTION_REMOVED\"}",f.getEntryPoint(),f.getBody().getNumAddresses()));
-                p.getFunctionManager().removeFunction(f.getEntryPoint()); removed++;
-            } else {
-                AddressSet kept = new AddressSet(f.getBody()); kept.delete(fill);
-                f.setBody(kept); split++;
-                emit.accept(String.format("{\"rule\":\"Z1\",\"entry\":\"%s\",\"outcome\":\"BODY_SPLIT_AT_FILL\"}",f.getEntryPoint()));
-            }
-        }
-        return String.format("Z1 fill runs %d, protected %d, instructions cleared %d, functions removed %d, bodies split %d, edges stopped %d",runs,preserved,cleared,removed,split,edges);
+        return String.format("Z1 hypothesis runs %d, protected %d, observed %d, uninitialized %d; code and flow preserved", runs, protectedRuns, observed, uninitialized);
     }
 }
