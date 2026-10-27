@@ -219,7 +219,7 @@ still needs it.
 | E5 | 2 | Executed code left outside every function: connected pieces by flow, each piece entry becomes a function (default address space only; work RAM skipped, rule H1) — `WSExecutedFunctions` |
 | D1 | 2 | DS context at entries with one non-zero observed DS |
 | D2 | 2 | Address-display segments do not establish architectural CS. Near branches crossing a rendered segment boundary keep their existing context, instruction and references; unknown-CS decodes remain hypotheses with a `branch-context` bookmark. Executed branches and RAM code retain their safeguards. No context repair is inferred from address presentation |
-| D3 | 2 | CS-register context over every initialized block (each span's own display segment): `MOV reg,CS` / `PUSH CS` fold to constants instead of unaffected CS inputs — `WSCompilerRules` |
+| D3 | 2 | Preserve existing CS-register context and unknown symbolic CS inputs. Address-display segments provide no architectural CS evidence and supply no defaults. `MOV reg,CS` reads regular CS; `PUSH CS` uses decode context `csval` — `WSCompilerRules` |
 | A1 | 2 | Unexecuted fall-through runs ending in a bad decode: decode cleared, bytes kept, bookmarked; the walk stops before kept jump-table targets (proven code) |
 | K1 | 2 | Compiler family from the program's own code (`WSCompilerRules`): LSI C-86 when functions with its frame save order (`PUSH BP; MOV BP,SP [; SUB SP,n]; PUSH CX/DX…`) are ≥ 10 % of ROM functions and stack-argument functions (`[BP+4..0x3f]`) ≤ 20 % (calibrated on the licensed library: 28/29 LSI titles, 0 false positives) |
 | C1 | 2 | Functions without a user/imported signature get `__lsic86` when K1 says LSI C-86, else the compiler spec's default (`__wsasm`) |

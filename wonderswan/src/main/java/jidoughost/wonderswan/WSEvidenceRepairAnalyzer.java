@@ -279,8 +279,8 @@ public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
 
     static String applyCsDefault(Program program, WSEvidenceAnalyzer.Seeder s) throws Exception {
         int[] n = WSCompilerRules.applyCsDefault(program);
-        s.emit("{\"rule\":\"D3\",\"register\":\"CS\",\"spans\":%d,\"blocks\":%d,\"outcome\":\"SET\"}", n[0], n[1]);
-        return String.format("D3 CS default %d spans over %d blocks", n[0], n[1]);
+        s.emit("{\"rule\":\"D3\",\"register\":\"CS\",\"spans\":%d,\"blocks\":%d,\"outcome\":\"KEPT\",\"why\":\"DISPLAY_IS_NOT_ARCHITECTURAL_CS\"}", n[0], n[1]);
+        return "D3 CS context kept; address display supplies no architectural evidence";
     }
 
     /** C1, convention chosen by rule K1 ({@link WSCompilerRules}): LSI C-86 register convention or the cspec default. */

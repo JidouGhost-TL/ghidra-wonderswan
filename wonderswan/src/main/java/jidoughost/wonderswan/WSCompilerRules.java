@@ -5,7 +5,6 @@ import java.math.BigInteger;
 import java.util.*;
 
 import ghidra.program.model.address.Address;
-import ghidra.program.model.address.SegmentedAddress;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.MemoryBlock;
@@ -136,35 +135,10 @@ final class WSCompilerRules {
         return blocks;
     }
 
-    /** D3: set CS to each span's own display segment over every initialized block. Code always runs with
-     *  CS = the segment Ghidra shows, so MOV reg,CS / PUSH CS fold to constants instead of surfacing as
-     *  unaffected CS inputs; bank windows are uninitialized and excluded, RAM included (CS = 0 there).
-     *  Loader data overlays (ROM_xx) are pure data and left untouched.
-     *  Returns {spans, blocks}. */
-    static int[] applyCsDefault(Program p) throws Exception {
-        ProgramContext ctx = p.getProgramContext();
-        Register cs = ctx.getRegister("CS");
-        int spans = 0, blocks = 0;
-        for (MemoryBlock b : p.getMemory().getBlocks()) {
-            if (!b.isInitialized()) continue;
-            if (WonderSwanLoader.isDataOverlay(b)) continue;
-            Address a = b.getStart(), end = b.getEnd();
-            if (!(a instanceof SegmentedAddress) || !(end instanceof SegmentedAddress)) continue;
-            blocks++;
-            while (a != null && a.compareTo(end) <= 0) {
-                int sg = ((SegmentedAddress) a).getSegment();
-                long offPart = a.getOffset() - ((long) sg << 4);
-                long chunk = (offPart >= 0 && offPart <= 0xFFFF) ? 0x10000 - offPart : 1;
-                long remaining = end.getOffset() - a.getOffset() + 1;
-                if (chunk > remaining) chunk = remaining;
-                Address spanEnd = a.add(chunk - 1);
-                if (spanEnd == null || spanEnd.compareTo(end) > 0) spanEnd = end;
-                ctx.setValue(cs, a, spanEnd, BigInteger.valueOf(sg));
-                spans++;
-                if (spanEnd.equals(end)) break;
-                a = spanEnd.next();
-            }
-        }
-        return new int[] { spans, blocks };
+    /** D3: preserve regular CS context, including unknown symbolic inputs. Address-display
+     *  segments do not establish architectural CS and cannot supply a register default.
+     *  No CS propagation is performed here; the return shape retains the caller's counters. */
+    static int[] applyCsDefault(Program p) {
+        return new int[] { 0, 0 };
     }
 }
