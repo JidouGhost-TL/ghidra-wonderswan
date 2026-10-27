@@ -27,7 +27,7 @@ Package `jidoughost.wonderswan`. Requires the `v30mz` extension (language `V30MZ
 | `WSCodePointers` | Rules F1-F4: code reached through code-pointer variables and pushed return addresses (phase 2) |
 | `WSGapCode` | Rules G1/U1: dead code and unreferenced functions found structurally after a terminator (phase 2) |
 | `WSMerge` | Rules M1/T1: merge split routines back together (post-script `WSMergeRoutines`) |
-| `WSBranchContext` | Rule D2: re-disassemble near branches resolving cross-segment with their own context (phase 2) |
+| `WSBranchContext` | Rule D2: preserve near-branch contexts across address-display segment boundaries (phase 2) |
 | `WSReturns` | Rule R1: register return values from caller/callee evidence (phase 2) |
 | `WSVolatile` | Rule V1: interrupt-written poll flags are volatile (phase 2) |
 | `WSAssets` | Headless asset core: tile / tilemap / palette / sprite decode, screen compose (via `WSRender`), PNG export |
@@ -173,7 +173,7 @@ still needs it.
 | Rule | Phase | What |
 |---|---|---|
 | E0b | 0 | Evidence hygiene in `WSMachine` (`WSComputedEdges`): a computed JMP/CALL resolves to the next instruction in its own interrupt context — an edge pre-empted by an interrupt stays pending across the handler flow (nested interrupts included) and is recorded at the post-IRET instruction, never inside the handler |
-| C0 | 1-2 | Before flow, undecoded bytes of the linear and executable bank-window ROM blocks get a default code segment (`csval` = the block's 64 KiB-aligned segment), so code reached by later disassembly resolves near branches in a plausible segment instead of CS = 0. It is a default only: existing instructions and stored segment observations (E1, D2, F2, …) are kept and win. Run by the loader and at the start of both phases (phase 1 report line `rom_context_spans`); each B2 bank overlay also gets its window segment over the whole block |
+| C0 | 1-2 | Before flow, undecoded bytes of the linear and executable bank-window ROM blocks get a default code segment (`csval` = the block's 64 KiB-aligned segment), so code reached by later disassembly resolves near branches in a plausible segment instead of CS = 0. It is a default only: existing instructions and stored segment observations (E1, F2, …) are kept and win. Run by the loader and at the start of both phases (phase 1 report line `rom_context_spans`); each B2 bank overlay also gets its window segment over the whole block |
 | B2 | 1 | Code executed in the ROM0/ROM1 windows: one overlay block per (window, bank) observed (`ROM0_BANK_xxxx`, from FileBytes), seeded like linear code; a window address that ran under several banks is seeded in each |
 | B3 | 1 | Direct call/jump into a window whose target ran under exactly one bank: resolved to that bank's overlay and disassembled there; calls get a call-override reference, jumps a data reference (a cross-space jump override fails every decompile it reaches) |
 | B3t | finish | A far jump into a window becomes a tail transfer when an uninterrupted predecessor chain proves its bank and the target is decoded in that bank view. It gets CALL_RETURN and a primary call-override reference; the bank, encoded target and resolved target are recorded in a bookmark so merges preserve the decision |
@@ -218,7 +218,7 @@ still needs it.
 | V1 | 2 | A RAM address stored on an interrupt handler's flow and loaded (never stored) in a backward-conditional-branch loop elsewhere is split out of the RAM block into a tiny volatile block, so spin-wait loops decompile as loops |
 | E5 | 2 | Executed code left outside every function: connected pieces by flow, each piece entry becomes a function (default address space only; work RAM skipped, rule H1) — `WSExecutedFunctions` |
 | D1 | 2 | DS context at entries with one non-zero observed DS |
-| D2 | 2 | A near branch resolving to another segment is always misdecoded (a 16-bit near branch cannot change CS): unexecuted branches are re-disassembled with their own segment's context (the re-decode must reproduce the mnemonic and length or the original is restored); executed branches stay |
+| D2 | 2 | Address-display segments do not establish architectural CS. Near branches crossing a rendered segment boundary keep their existing context, instruction and references; unknown-CS decodes remain hypotheses with a `branch-context` bookmark. Executed branches and RAM code retain their safeguards. No context repair is inferred from address presentation |
 | D3 | 2 | CS-register context over every initialized block (each span's own display segment): `MOV reg,CS` / `PUSH CS` fold to constants instead of unaffected CS inputs — `WSCompilerRules` |
 | A1 | 2 | Unexecuted fall-through runs ending in a bad decode: decode cleared, bytes kept, bookmarked; the walk stops before kept jump-table targets (proven code) |
 | K1 | 2 | Compiler family from the program's own code (`WSCompilerRules`): LSI C-86 when functions with its frame save order (`PUSH BP; MOV BP,SP [; SUB SP,n]; PUSH CX/DX…`) are ≥ 10 % of ROM functions and stack-argument functions (`[BP+4..0x3f]`) ≤ 20 % (calibrated on the licensed library: 28/29 LSI titles, 0 false positives) |

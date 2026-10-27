@@ -3,20 +3,17 @@ package jidoughost.wonderswan;
 
 import java.util.function.Consumer;
 
-import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.program.model.address.*;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.symbol.*;
 import ghidra.util.task.TaskMonitor;
 
 /**
- * Rule D2: a near branch resolving to another segment is always misdecoded (a 16-bit near branch
- * cannot change CS): the instruction was disassembled with the wrong decode context, typically by
- * following a context-less computed reference. Unexecuted branches are re-disassembled with the
- * context of their own segment (clear the single instruction, set csval, re-decode it alone); the
- * re-decode must reproduce the mnemonic and length or the original decode is restored. Executed
- * branches are ground truth and stay. Runs after the jump tables (their targets are the usual
- * victims) and before the body fixup, so bodies form with the corrected flows.
+ * Rule D2: preserve near branches across address-display segment boundaries.
+ * A rendered segment is a canonical address representation, not architectural CS.
+ * Near flow can cross such a boundary without changing CS, or wrap IP within a
+ * known CS. Neither case justifies replacing the instruction's decode context.
+ * Without independent context evidence, retain the decode as a hypothesis.
  */
 public final class WSBranchContext {
     final Program p;
@@ -24,7 +21,7 @@ public final class WSBranchContext {
     final WSEvidence ev;
     final Consumer<String> emit;
     final TaskMonitor monitor;
-    int fixed, skippedExec, failed;
+    int keptContext, skippedExec, unresolved;
 
     public WSBranchContext(Program p, WSEvidence ev, Consumer<String> emit, TaskMonitor monitor) {
         this.p = p;
@@ -50,58 +47,28 @@ public final class WSBranchContext {
             for (Reference r : x.getReferencesFrom()) {
                 if (!r.getReferenceType().isJump() && !r.getReferenceType().isCall()) continue;
                 if (!(r.getToAddress() instanceof SegmentedAddress tt) || tt.getSegment() == ss.getSegment()) continue;
+                String why;
                 if (ev.executed(s.getOffset())) {
                     skippedExec++;
-                    emit.accept(String.format("{\"rule\":\"D2\",\"branch\":\"%s\",\"to\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"EXECUTED\"}", s, r.getToAddress()));
-                    continue;
+                    why = "EXECUTED";
+                } else if (ctx.getValue(csval, s, false) != null) {
+                    keptContext++;
+                    why = "CONTEXT_PRESERVED";
+                } else {
+                    unresolved++;
+                    why = "UNKNOWN_CS";
+                    if (p.getBookmarkManager().getBookmark(s, BookmarkType.ANALYSIS, "branch-context") == null)
+                        p.getBookmarkManager().setBookmark(s, BookmarkType.ANALYSIS, "branch-context",
+                            "Unknown architectural CS; existing near-branch decode retained as a hypothesis");
                 }
-                fixBranch(ctx, csval, x, ss.getSegment(), r.getToAddress());
+                emit.accept(String.format("{\"rule\":\"D2\",\"branch\":\"%s\",\"to\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"%s\"}", s, r.getToAddress(), why));
                 break;
             }
         }
     }
 
-    void fixBranch(ProgramContext ctx, ghidra.program.model.lang.Register csval, Instruction x, int seg, Address was) throws Exception {
-        Address s = x.getAddress();
-        String mn = x.getMnemonicString();
-        int len = x.getLength();
-        java.math.BigInteger old = null;
-        try {
-            old = ctx.getValue(csval, s, false);
-        } catch (Exception e) { /* no value to restore */ }
-        // clear first: setting context over a decoded instruction conflicts with it
-        listing.clearCodeUnits(s, s, false);
-        ctx.setValue(csval, s, s, java.math.BigInteger.valueOf(seg));
-        try {
-            new DisassembleCommand(s, new AddressSet(s, s), true).applyTo(p, monitor);
-        } finally {
-            if (listing.getInstructionAt(s) == null) {
-                if (old != null) try {
-                    ctx.setValue(csval, s, s, old);
-                } catch (Exception e) { /* restore what we can */ }
-                new DisassembleCommand(s, new AddressSet(s, s), true).applyTo(p, monitor);
-            }
-        }
-        Instruction n = listing.getInstructionAt(s);
-        if (n != null && n.getMnemonicString().equalsIgnoreCase(mn) && n.getLength() == len) {
-            Address to = null;
-            for (Reference r : n.getReferencesFrom())
-                if (r.getReferenceType().isJump() || r.getReferenceType().isCall()) to = r.getToAddress();
-            fixed++;
-            emit.accept(String.format("{\"rule\":\"D2\",\"branch\":\"%s\",\"from\":\"%s\",\"to\":\"%s\",\"outcome\":\"FIXED\"}", s, was, to));
-            return;
-        }
-        // re-decode differs: restore the original decode rather than leave a changed one
-        listing.clearCodeUnits(s, s, false);
-        if (old != null) try {
-            ctx.setValue(csval, s, s, old);
-        } catch (Exception e) { /* restore what we can */ }
-        new DisassembleCommand(s, new AddressSet(s, s), true).applyTo(p, monitor);
-        failed++;
-        emit.accept(String.format("{\"rule\":\"D2\",\"branch\":\"%s\",\"outcome\":\"SKIPPED\",\"why\":\"REDECODE_MISMATCH\"}", s));
-    }
-
     public String summary() {
-        return String.format("D2 cross-segment branches: fixed %d, executed kept %d, re-decode mismatches %d", fixed, skippedExec, failed);
+        return String.format("D2 display-boundary branches: context kept %d, executed kept %d, unknown CS kept %d",
+            keptContext, skippedExec, unresolved);
     }
 }
