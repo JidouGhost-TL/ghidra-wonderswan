@@ -671,10 +671,11 @@ public final class WSJumpTables {
         p.getReferenceManager().getReferencesTo(t).forEachRemaining(refs::add);
         for (Reference r : refs)
             if (r.getSource() == SourceType.USER_DEFINED || r.getSource() == SourceType.IMPORTED) return false;
-        for (Reference r : refs) p.getReferenceManager().delete(r);
+        // Incoming references are evidence from their own source instructions. Clearing
+        // target data, or failing to decode it, cannot invalidate an encoded transfer.
         listing.clearCodeUnits(t, t, false);
         deshadowed++;
-        emit.accept(String.format("{\"rule\":\"J1n\",\"site\":\"%s\",\"target\":\"%s\",\"outcome\":\"DESHADOWED\",\"refs_deleted\":%d}", site, t, refs.size()));
+        emit.accept(String.format("{\"rule\":\"J1n\",\"site\":\"%s\",\"target\":\"%s\",\"outcome\":\"DESHADOWED\",\"refs_deleted\":0,\"refs_preserved\":%d}", site, t, refs.size()));
         return true;
     }
 
