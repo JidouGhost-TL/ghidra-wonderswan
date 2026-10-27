@@ -35,7 +35,7 @@ final class WSVolatile {
     final Set<Address> handlers = new HashSet<>();
     /** Title DS default (rule D0): resolves absolute operands whose DS is dynamic (no reference). */
     final int titleDs;
-    int volatileFlags, existingVolatile;
+    int volatileFlags, existingVolatile, skippedUnsafe;
 
     WSVolatile(Program p, WSEvidence ev, Set<Address> ivtHandlers, Consumer<String> emit, TaskMonitor monitor) {
         this.p = p; this.emit = emit; this.monitor = monitor;
@@ -56,8 +56,8 @@ final class WSVolatile {
     }
 
     String summary() {
-        return String.format("V1 volatile poll flags: interrupt handlers %d, flags marked volatile %d (already volatile %d)",
-            handlers.size(), volatileFlags, existingVolatile);
+        return String.format("V1 volatile poll flags: interrupt handlers %d, flags marked volatile %d (already volatile %d, safely skipped %d)",
+            handlers.size(), volatileFlags, existingVolatile, skippedUnsafe);
     }
 
     record Store(Address site, int size) { }
@@ -229,9 +229,16 @@ final class WSVolatile {
         }
         // split the flag bytes [m, m+size) out; labels and references stay by address
         Address after = m.add(size);
-        if (block.contains(after)) mem.split(block, after);
-        block = mem.getBlock(m);
-        if (!m.equals(block.getStart())) mem.split(block, m);
+        try {
+            if (block.contains(after)) WSMemorySplit.splitInitializedBlockPreservingBytes(p, block, after);
+            block = mem.getBlock(m);
+            if (!m.equals(block.getStart())) WSMemorySplit.splitInitializedBlockPreservingBytes(p, block, m);
+        } catch (WSMemorySplit.UnsafeSplitException e) {
+            skippedUnsafe++;
+            emit.accept(String.format("{\"rule\":\"V1\",\"flag\":\"%s\",\"size\":%d,\"outcome\":\"SKIPPED_UNSAFE_BACKING\",\"reason\":\"%s\"}",
+                m, size, e.getMessage().replace("\\", "/").replace("\"", "'")));
+            return;
+        }
         MemoryBlock flag = mem.getBlock(m);
         flag.setVolatile(true);
         flag.setComment(String.format("V1 VOLATILE: RAM flag written by interrupt code, polled in a spin-wait loop (%d byte%s)",
