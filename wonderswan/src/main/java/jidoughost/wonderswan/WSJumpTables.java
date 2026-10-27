@@ -100,7 +100,7 @@ public final class WSJumpTables {
 
     static final class Rec {
         String shape = "?", idx, scaledBy = null, bound = "none", stop = "BOUND";
-        Address site, returnEnd;
+        Address site, returnEnd, tableAddress;
         boolean baseFound, byteBound;
         int slots, empty;                       // slots scanned (incl. empty 0000 slots), empty slots
         List<Integer> slotOf = new ArrayList<>(); // slot index of each target
@@ -371,9 +371,14 @@ public final class WSJumpTables {
         }
         for (Rec ra : recs.values()) for (Rec rb : recs.values()) {
             if (ra == null || rb == null || ra == rb || ra.targets.isEmpty() || rb.targets.isEmpty()) continue;
-            if (rb.table > ra.table && rb.table < ra.table + 2 * ra.slots) {
+            // CS-relative offsets from separate recoveries are not spatial addresses.
+            // Retain overlay identity and resolve segment bases before comparing table extents.
+            if (ra.tableAddress == null || rb.tableAddress == null ||
+                    !ra.tableAddress.getAddressSpace().equals(rb.tableAddress.getAddressSpace())) continue;
+            long distance = rb.tableAddress.subtract(ra.tableAddress);
+            if (distance > 0 && distance < 2L * ra.slots) {
                 // keep only targets read from slots before the next table
-                int lim = (rb.table - ra.table) / 2;
+                int lim = (int) (distance / 2);
                 ra.slots = lim;
                 ra.targets = trimToSlots(ra, lim);
                 ra.empty = (int) ra.emptySlots.stream().filter(k -> k < lim).count();
@@ -1278,6 +1283,7 @@ public final class WSJumpTables {
         r.maskOffsets = maskValues(back, ix, r);
         r.table = (r.base + r.disp) & 0xFFFF;
         tableStart = seg(cs, r.table);
+        r.tableAddress = tableStart;
         r.returnEnd = pushedContinuation(site, cs);
         // J1a: the table address needs a constant (base immediate or displacement); a bare [BX] whose BX
         // comes from elsewhere is an unknown table, not one at CS:0000.
