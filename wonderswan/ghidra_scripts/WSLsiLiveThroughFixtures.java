@@ -48,6 +48,8 @@ public class WSLsiLiveThroughFixtures extends GhidraScript {
         Arrays.fill(bytes, (byte) 0xcc);
         put(bytes, 0x40, "bb0060b93412ba7856" + call + "a30010891e0210c3");
         put(bytes, 0x100, leaf);
+        boolean fallThrough = name.equals("entry-fall-through");
+        if (fallThrough) put(bytes, 0xfe, "9090");
         var program = new ProgramDB(name, currentProgram.getLanguage(),
             currentProgram.getLanguage().getCompilerSpecByID(currentProgram.getCompilerSpec().getCompilerSpecID()), this);
         int transaction = program.startTransaction(name);
@@ -65,6 +67,13 @@ public class WSLsiLiveThroughFixtures extends GhidraScript {
             }
             var function = program.getFunctionManager().getFunctionAt(at(program, 0x100));
             var caller = program.getFunctionManager().getFunctionAt(at(program, 0x40));
+            if (fallThrough) {
+                check(new DisassembleCommand(at(program, 0xfe), null, true).applyTo(program, monitor), name + " predecessor disassembly");
+                var entry = program.getListing().getInstructionAt(at(program, 0x100));
+                check(at(program, 0xff).equals(entry.getFallFrom()), name + " confirmed fall-through");
+                for (var ref : program.getReferenceManager().getReferencesTo(entry.getAddress()))
+                    check(!ref.getReferenceType().isFallthrough(), name + " default fall-through is implicit");
+            }
             function.setCallingConvention(BASE);
             if (explicit != null) {
                 function.setCustomVariableStorage(true);
@@ -144,6 +153,7 @@ public class WSLsiLiveThroughFixtures extends GhidraScript {
         test("genuine-bx-ax-result", "89c889d3cb", far, false, null, false, null);
         test("near-call", "89c8c3", "e8b400", false, null, false, null);
         test("near-call-far-return-mismatch", "89c8cb", "e8b400", false, null, false, null);
+        test("entry-fall-through", "89c8cb", far, false, null, false, null);
         test("callee-stack-cleanup", "89c8ca0200", far, false, null, false, null);
         test("writable-code", "89c8cb", far, false, null, true, null);
         test("user-signature", "89c8cb", far, false, SourceType.USER_DEFINED, false, null);

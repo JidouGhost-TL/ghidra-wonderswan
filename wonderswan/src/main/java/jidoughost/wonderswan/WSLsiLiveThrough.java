@@ -88,7 +88,7 @@ public final class WSLsiLiveThrough {
         var copy = listing.getInstructionAt(entry);
         if (copy == null || copy.getLength() != 2 || copy.getFlowOverride() != FlowOverride.NONE
                 || !copy.getMnemonicString().equals("MOV") || copy.getFallThrough() == null
-                || !copy.getFallThrough().equals(copy.getDefaultFallThrough())) return null;
+                || !copy.getFallThrough().equals(copy.getDefaultFallThrough()) || copy.getFallFrom() != null) return null;
         var ret = listing.getInstructionAt(copy.getFallThrough());
         if (ret == null || ret.getLength() != 1 || ret.getFlowOverride() != FlowOverride.NONE
                 || !ret.getMnemonicString().equals("RETF") || !ret.getFlowType().isTerminal()
@@ -110,7 +110,8 @@ public final class WSLsiLiveThrough {
             if (!ref.getReferenceType().isCall() || call == null || !call.getMnemonicString().equals("CALLF")
                     || call.getLength() != 5 || call.getFlowOverride() != FlowOverride.NONE
                     || !call.getFlowType().isCall() || call.getFlowType().isComputed()
-                    || call.getFlows().length != 1 || !entry.equals(call.getFlows()[0])) return null;
+                    || call.getFlows().length != 1 || !entry.equals(call.getFlows()[0])
+                    || call.getDefaultFlows().length != 1 || !entry.equals(call.getDefaultFlows()[0])) return null;
             callers.add(call.getAddress());
         }
         return callers.isEmpty() ? null : new Copy(input, callers);
