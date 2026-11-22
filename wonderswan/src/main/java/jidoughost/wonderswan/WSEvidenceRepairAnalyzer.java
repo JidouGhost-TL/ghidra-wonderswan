@@ -291,13 +291,14 @@ public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
         boolean lsi = k.lsi() && program.getCompilerSpec().getCallingConvention("__lsic86") != null;
         String cc = lsi ? "__lsic86" : def.getName();
         emit.accept(String.format("{\"rule\":\"K1\",\"family\":\"%s\",\"evidence\":\"%s\"}", lsi ? "LSI C-86" : "default", k.evidence()));
-        int set = 0, kept = 0;
+        int set = 0, kept = 0, specialized = 0;
         for (Function f : program.getFunctionManager().getFunctions(true)) {
             SourceType src = f.getSignatureSource();
             if (src == SourceType.USER_DEFINED || src == SourceType.IMPORTED) { kept++; continue; }
+            if (WSLsiLiveThrough.apply(f, cc, emit)) { specialized++; continue; }
             if (!cc.equals(f.getCallingConventionName())) { f.setCallingConvention(cc); set++; }
         }
-        emit.accept(String.format("{\"rule\":\"C1\",\"convention\":\"%s\",\"set\":%d,\"kept_user_or_imported\":%d}", cc, set, kept));
+        emit.accept(String.format("{\"rule\":\"C1\",\"convention\":\"%s\",\"set\":%d,\"kept_user_or_imported\":%d,\"specialized\":%d}", cc, set, kept, specialized));
         return "C1 " + cc + " set on " + set + " functions (kept " + kept + ")";
     }
 }

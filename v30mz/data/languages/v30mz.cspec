@@ -238,4 +238,28 @@
       <register name="DF"/>
     </unaffected>
   </prototype>
+  <!-- A direct register-copy leaf with a plain far return preserves the caller's BX.
+       C1b applies this only when the entry, body and call form supply that proof. -->
+  <prototype name="__lsic86_far_bx_preserved" extrapop="4" stackshift="4" strategy="register">
+    <input>
+      <pentry minsize="1" maxsize="2"><register name="CX"/></pentry>
+      <pentry minsize="1" maxsize="2"><register name="DX"/></pentry>
+    </input>
+    <output>
+      <pentry minsize="1" maxsize="2"><register name="AX"/></pentry>
+    </output>
+    <killedbycall>
+      <register name="AX"/>
+      <register name="ES"/>
+    </killedbycall>
+    <unaffected>
+      <register name="BX"/>
+      <register name="SP"/>
+      <register name="BP"/>
+      <register name="DS"/>
+      <register name="CS"/>
+      <register name="SS"/>
+      <register name="DF"/>
+    </unaffected>
+  </prototype>
 </compiler_spec>
