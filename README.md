@@ -20,7 +20,14 @@ No ROMs are included. Use cartridge dumps you are entitled to use.
 - Ghidra **12.1.3** (extensions are built against, and only install into, the exact Ghidra version)
 - JDK 21 (as required by Ghidra 12.1)
 
-## Build and install
+## Install a release
+
+Check both `v30mz` and `wonderswan` ZIPs against the release's `SHA256SUMS`. In Ghidra 12.1.3,
+open **File → Install Extensions**, add V30MZ first and WonderSwan second, enable both and
+restart. [Extension v0.1.0 downloads](https://github.com/JidouGhost-TL/ghidra-wonderswan/releases/tag/v0.1.0)
+· [Installation guide](https://github.com/JidouGhost-TL/ghidra-wonderswan/wiki/Installation)
+
+## Build from source
 
 ```sh
 tools/install.sh            # Linux: builds both extensions and installs them for Ghidra (GUI + headless)
@@ -46,6 +53,9 @@ Gotchas:
   from another SLEIGH version), Ghidra recompiles it at load. The build ships a compiled `.sla`.
 
 ## Use
+
+Follow a far call through two bank overlays, check original-file offsets, and compare an observed
+runtime selector with a static-only import. [Banked-call exercise with generated cartridges](examples/banked-call/README.md)
 
 Import and analyse a cartridge (GUI: File → Import picks the *WonderSwan Cartridge* loader):
 
