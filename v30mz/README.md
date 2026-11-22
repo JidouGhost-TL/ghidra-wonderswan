@@ -117,7 +117,12 @@ with CS=4400, and another runs some with CS=4300. This spec therefore tracks the
 stores in `io`. A word access at port p touches p and p+1. The WonderSwan's 8-bit port decode is
 **not** masked here; that belongs to the platform model.
 
-- The pspec marks `io:0000-FFFF` **volatile**, so the decompiler keeps every access.
+- The pspec marks `io:0000-FFFF` **volatile**. Ghidra 12.1.3 preserves accesses to immediate-form
+  port addresses, including a read whose result is discarded.
+- With a port address passed in DX, raw p-code records the `io` space and the access width. The stock C
+  printer displays surviving reads and writes as pointer dereferences, and the decompiler may
+  remove reads whose results it can prove unused. For runtime port accesses, check the
+  instruction listing or raw p-code.
 - The cspec puts `io` in `<global>`. Without this, the decompiler ignores labels on io addresses
   (it prints `Io00a0` instead of the label). This follows Ghidra's Z80 spec.
 - A loader creates an `io` memory block (volatile, uninitialized) and puts labels and data types

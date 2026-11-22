@@ -24,7 +24,7 @@
       <register name="DS"/>
     </constresolve>
   </segmentop>
-  <!-- I/O ports (io space) have side effects: keep every access in the decompiler. -->
+  <!-- I/O ports have side effects. See README for indirect access limits in the decompiler. -->
   <volatile outputop="write_volatile" inputop="read_volatile">
     <range space="io" first="0x0" last="0xffff"/>
   </volatile>
