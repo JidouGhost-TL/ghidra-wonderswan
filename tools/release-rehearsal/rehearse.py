@@ -5,7 +5,7 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import platform
 import re
 import shutil
@@ -65,10 +65,12 @@ def unzip(archive, dest):
     with zipfile.ZipFile(archive) as z:
         written = []
         for entry in z.infolist():
-            relative = Path(entry.filename)
+            name = entry.filename
+            relative = PurePosixPath(name)
             mode = entry.external_attr >> 16
-            require(not relative.is_absolute() and ".." not in relative.parts and "\\" not in entry.filename
-                    and not stat.S_ISLNK(mode), f"Unexpected ZIP member {entry.filename}")
+            require(relative.parts and not relative.anchor and not PureWindowsPath(name).anchor
+                    and ".." not in relative.parts and ":" not in name and "\\" not in name
+                    and not stat.S_ISLNK(mode), f"Unexpected ZIP member {name}")
             target = dest / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             if entry.is_dir():
@@ -110,6 +112,10 @@ def paths(output, host):
                GHIDRA_INSTALL_DIR=str(ghidra), GHIDRA_HEADLESS_MAXMEM="2G", GHIDRA_GUI_MAXMEM="2G",
                XDG_CONFIG_HOME=str(home / "settings"), XDG_CACHE_HOME=str(home / "cache"),
                GRADLE_USER_HOME=str(home / "gradle"))
+    if host == "Windows-x64":
+        env["USERPROFILE"] = str(home)
+        env["APPDATA"] = str(home / "settings")
+        env["LOCALAPPDATA"] = str(home / "cache")
     options = {"user.home":home, "application.settingsdir":home/"settings",
                "application.cachedir":home/"cache", "application.tempdir":home/"tmp",
                "java.io.tmpdir":home/"tmp"}
@@ -158,7 +164,16 @@ def prepare(output, host, cache):
         text = wrapper.read_text()
         require("gradle-9.6.1-bin.zip" in text and "distributionSha256Sum=" not in text, "Gradle pin drift")
         wrapper.write_text(text + f'\ndistributionSha256Sum={pins["gradle_sha256"]}\n')
-        run(["/usr/bin/xcodebuild", "-version"], env, output/"xcode.log")
+        run(["/usr/bin/xcrun", "--find", "clang"], env, output/"clang-path.log")
+        run(["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path"], env, output/"macos-sdk.log")
+        developer = env.get("DEVELOPER_DIR")
+        if developer is None:
+            developer = run(["/usr/bin/xcode-select", "-p"], env, output/"developer-dir.log").strip()
+        developer = Path(developer)
+        if developer.suffix == ".app":
+            developer = developer / "Contents/Developer"
+        if (developer / "usr/bin/xcodebuild").is_file():
+            run(["/usr/bin/xcodebuild", "-version"], env, output/"xcode.log")
         run([gradle/"gradlew", "--no-daemon", "buildNatives"], env, output/"native-build.log",
             gradle, timeout=1800)
     ids = {"Linux-x64":"linux_x86_64", "Windows-x64":"win_x86_64",
@@ -236,9 +251,14 @@ def headless(output, host, extensions, wrapper):
             require(f"rom-offset\t0x{address}\n" in text and
                     f"uRam00000200=0x{marker};" in "".join(text.split()), f"Wrong expected native output: {name}")
         reports[name] = {"saved_database_sha256":before, "receipt_sha256":digest(receipt), "overrides":overrides}
-    (output/"headless.json").write_text(json.dumps({
-        "mode":"headless", "platform":host, "installed_files":installed, "projects":reports
-    }, indent=2) + "\n")
+    result = {"mode":"headless", "platform":host, "installed_files":installed, "projects":reports}
+    (output/"headless.json").write_text(json.dumps(result, indent=2) + "\n")
+    state = json.loads((output/"setup.json").read_text())
+    for key in ("ghidra_sha256", "jdk_sha256", "native_sha256"):
+        require(re.fullmatch(r"[0-9a-f]{64}", state[key]), f"Invalid {key}")
+        result[key] = state[key]
+    result["extension_sha256"] = [spec[3] for spec in pins["extensions"]]
+    print("PUBLIC_GHIDRA_HEADLESS_PASS " + json.dumps(result, separators=(",", ":")))
 
 
 def main():
@@ -264,6 +284,7 @@ def main():
         if args.mode == "gui-probe":
             run([java, here/"DesktopProbe.java"], env, output/"desktop.log", timeout=30)
             require("DESKTOP_PROBE_PASS" in (output/"desktop.log").read_text(), "Desktop probe lacked positive evidence")
+            print("PUBLIC_GHIDRA_DESKTOP_CAPABLE " + host)
         else:
             launcher = ghidra/"support"/("launch.bat" if host == "Windows-x64" else "launch.sh")
             command = [launcher, "fg", "jdk", "Ghidra", "2G", "", "ghidra.GhidraRun"]

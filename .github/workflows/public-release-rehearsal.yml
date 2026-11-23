@@ -13,6 +13,7 @@ permissions:
 
 jobs:
   headless:
+    if: github.repository == 'JidouGhost-TL/ghidra-wonderswan' && github.ref == 'refs/heads/main'
     name: Headless ${{ matrix.host }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -41,20 +42,13 @@ jobs:
           EXPECTED_HOST: ${{ matrix.host }}
         run: |
           python tools/release-rehearsal/rehearse.py headless "$RUNNER_TEMP/ghidra-rehearsal" \
-            --expected-host "$EXPECTED_HOST"
+            --expected-host "$EXPECTED_HOST" 2>"$RUNNER_TEMP/ghidra-headless-error.log" ||
+            { echo "Headless rehearsal failed on $EXPECTED_HOST"; exit 1; }
       - name: Probe desktop capability only
         if: inputs.desktop_probe
         continue-on-error: true
         shell: bash
         run: |
-          python tools/release-rehearsal/rehearse.py gui-probe "$RUNNER_TEMP/ghidra-rehearsal"
-      - name: Preserve rehearsal evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: public-ghidra-rehearsal-${{ matrix.host }}
-          path: |
-            ${{ runner.temp }}/ghidra-rehearsal/*.log
-            ${{ runner.temp }}/ghidra-rehearsal/*.json
-            ${{ runner.temp }}/ghidra-rehearsal/*.txt
-          if-no-files-found: error
+          python tools/release-rehearsal/rehearse.py gui-probe "$RUNNER_TEMP/ghidra-rehearsal" \
+            2>"$RUNNER_TEMP/ghidra-desktop-error.log" ||
+            { echo "Desktop capability check failed"; exit 1; }
