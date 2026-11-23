@@ -11,7 +11,7 @@
     "Darwin-arm64": ["OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.13.1_2.tar.gz", "48067f2b7c958ed104a9d8a5749be7d25220b0a356b4d2d1bcfaab3e16ad0b14"],
     "Darwin-x64": ["OpenJDK21U-jdk_x64_mac_hotspot_21.0.13.1_2.tar.gz", "1b5eff1741bb83d32e2e19aade71452bb42e40f047c01d3e178d438304c9a26d"]
   },
-  "gradle_sha256": "9c0f7faeeb306cb14e4279a3e084ca6b596894089a0638e68a07c945a32c9e1426",
+  "gradle_sha256": "9c0f7faeeb306cb14e4279a3e084ca6b596894089a0638e68a07c945a32c9e14",
   "fixtures": {
     "bank-fe.ws": "a02fc44294fab2e9128b64439d8ebd98b119d84887959d4c2d03ca9558c148ef",
     "bank-ff.ws": "1f0eb635abefe5fe3516a3cc7b08870627a27b0b8cf31bb3b0b21fecdaf93ad3",

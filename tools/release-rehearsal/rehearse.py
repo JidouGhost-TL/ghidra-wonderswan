@@ -112,6 +112,17 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def validate_pins():
+    archive_pins = [pins["ghidra"], pins["extension_manifest"], *pins["extensions"]]
+    hashes = [record[3] for record in archive_pins]
+    hashes.extend(record[1] for record in pins["jdk"].values())
+    hashes.extend(pins["fixtures"].values())
+    hashes.extend(examples.values())
+    hashes.append(pins["gradle_sha256"])
+    require(all(isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha) for sha in hashes),
+            "Release pins must be 64 lowercase hexadecimal SHA-256 characters")
+
+
 class PublicReleaseRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         target = urlsplit(newurl)
@@ -206,6 +217,8 @@ def require_mach_executable(description, host):
 
 
 def prepare(output, host, cache, diagnostic):
+    diagnostic.begin("validate_release_pins")
+    validate_pins()
     diagnostic.begin("fresh_directory")
     output.mkdir()
     downloads = output/"downloads"
