@@ -233,7 +233,9 @@ def stage_candidate_source(output, checkout, diagnostic):
     readback = run(["git", "-C", checkout, "rev-parse", "HEAD"], os.environ, output / "candidate-source.log")
     require(readback.strip() == candidate_commit, "Unexpected candidate source commit")
     archive = output / "candidate-source.zip"
-    run(["git", "-C", checkout, "archive", "--format=zip", "-o", archive, candidate_commit],
+    # Git archive applies checkout line-ending settings to blob contents.
+    run(["git", "-c", "core.autocrlf=false", "-c", "core.eol=lf", "-C", checkout,
+         "archive", "--format=zip", "-o", archive, candidate_commit],
         os.environ, output / "candidate-source-archive.log")
     source = output / "candidate-source"
     unzip(archive, source)
