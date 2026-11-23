@@ -21,7 +21,8 @@ import ghidra.util.task.TaskMonitor;
  * against the same execution evidence (reused from phase 1, no second emulator run):
  *   C0  default code segment over undecoded ROM bytes ({@link WSCodeContext}); H2 RAM/SRAM code without an image
  *       is kept and tagged as an unknown hypothesis ({@link WSRamCode}), never cleared by the rules below;
- *   N1  clear "does not return" where a call's fall-through executed, restore the cut-off code;
+ *   N1  clear "does not return" where a call's fall-through executed, restore the cut-off code (a J4 saved-yield
+ *       helper is kept: its caller's next instruction runs through the saved continuation, not by return);
  *   E1R re-seed executed addresses that later analysis removed;
  *   J1  CS-relative jump/call tables by rule ({@link WSJumpTables}), checked against observed targets;
  *   D1  DS/SS context at function entries; A1 preserve and tag unresolved decode hypotheses;

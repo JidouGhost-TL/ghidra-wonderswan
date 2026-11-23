@@ -57,6 +57,11 @@ public final class WSInlineTables {
             if (CONTINUATION.equals(b.getCategory())) return true;
         return false;
     }
+    /** J4 yield helper: it returns through the older stack word; the CALL's next instruction runs only later,
+     * entered through the saved continuation, so executing it is no evidence that this helper returns. */
+    public static boolean savedYield(Function f) {
+        return f != null && f.getCallFixup() != null && f.getCallFixup().startsWith("ws_saved_yield_");
+    }
     public static List<Address> targets(Program p, Instruction i) {
         if (!modeled(p, i.getAddress())) return List.of();
         List<Address> result = new ArrayList<>();

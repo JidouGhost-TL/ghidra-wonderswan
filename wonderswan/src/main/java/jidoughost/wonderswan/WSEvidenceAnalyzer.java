@@ -31,6 +31,10 @@ import ghidra.util.task.TaskMonitor;
  * Rules (every decision is evidence-backed and can be written to a JSON-lines report):
  *   C0  before any flow, undecoded ROM bytes (linear blocks and executable bank overlays) get a default code
  *       segment ({@link WSCodeContext}); existing instructions and stored segment observations are kept.
+ *   E0  the WSMachine evidence is a function of the stored ROM bytes, the cartridge options and the run
+ *       options only. It is collected once per program and set of those inputs; a later invocation of this
+ *       analyzer (Ghidra re-schedules byte analyzers, for example after a call-fixup repair) reapplies the
+ *       rules with the same evidence instead of emulating again.
  *   E0b a computed JMP/CALL resolves to the next instruction in its own interrupt context: edges
  *       pre-empted by an interrupt are carried across the handler flow (WSMachine) and recorded at
  *       the post-IRET instruction, never inside the handler.
@@ -80,6 +84,33 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
     /** Evidence collected in phase 1, reused by {@link WSEvidenceRepairAnalyzer} (phase 2). */
     static final Map<Program, WSEvidence> EVIDENCE = Collections.synchronizedMap(new WeakHashMap<>());
     static final Map<Program, String> REPORT = Collections.synchronizedMap(new WeakHashMap<>());
+
+    /** Rule E0: everything a WSMachine run reads from the program, plus the run options. */
+    record EmulationInputs(String language, String programName, String mapper, boolean color, long romBytes,
+            String romSha256, int frames, int slice) {
+        static EmulationInputs of(Program program, int frames, int slice) throws Exception {
+            Options cart = program.getOptions(WonderSwanLoader.OPTIONS_CATEGORY);
+            List<ghidra.program.database.mem.FileBytes> fbs = program.getMemory().getAllFileBytes();
+            if (fbs.isEmpty()) throw new IllegalStateException("program has no stored ROM bytes (import with the WonderSwan loader)");
+            ghidra.program.database.mem.FileBytes fb = fbs.get(0);
+            MessageDigest sha = MessageDigest.getInstance("SHA-256");
+            byte[] chunk = new byte[1 << 16];
+            for (long at = 0; at < fb.getSize(); ) {
+                int n = fb.getOriginalBytes(at, chunk, 0, (int) Math.min(chunk.length, fb.getSize() - at));
+                if (n <= 0) throw new IllegalStateException("short read of stored ROM bytes at " + at);
+                sha.update(chunk, 0, n);
+                at += n;
+            }
+            return new EmulationInputs(program.getLanguageID().toString(), program.getName(),
+                cart.getString("Mapper", null), cart.getBoolean("Color", true), fb.getSize(),
+                HexFormat.of().formatHex(sha.digest()), frames, slice);
+        }
+    }
+
+    /** Rule E0: one WSMachine run per program and inputs; {@code failure} is the rule E4 message, or null. */
+    record Emulation(EmulationInputs inputs, WSEvidence evidence, String failure, Exception error) { }
+
+    static final Map<Program, Emulation> EMULATIONS = Collections.synchronizedMap(new WeakHashMap<>());
 
     private boolean run = true, artefacts = true;
     private int frames = 1500, slice = 15000;
@@ -131,27 +162,16 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
         try {
             if (dir != null && !dir.isBlank()) wsmEv = WSEvidence.load(Paths.get(dir));
             else if (run) {
-                monitor.setMessage("WonderSwan: emulating " + frames + " frames");
-                boolean color = program.getOptions(WonderSwanLoader.OPTIONS_CATEGORY).getBoolean("Color", true);
-                WSMachine m = new WSMachine(program, color);
-                try {
-                    m.run(frames, slice, f -> {
-                        int ph = f % 40;
-                        m.buttons = (f >= 100 && ph < 3) ? 0x02 : (f >= 100 && ph >= 20 && ph < 23) ? 0x04 : 0;
-                    });
-                    wsmEv = WSEvidence.of(m);
-                }
-                catch (Exception e) {
+                Emulation emulation = emulate(program, frames, slice, monitor);
+                wsmEv = emulation.evidence();
+                if (emulation.failure() != null) {
                     // Rule E4: a run that fails part-way is still evidence up to the failure. Keep it, minus the
-                    // untrusted tail that led into the error; report the failure loudly (not silent).
-                    Set<Long> tail = m.untrustedTail();
-                    wsmEv = WSEvidence.of(m, tail);
-                    String msg = NAME + ": emulation ended in an error after " + m.instructions + " instructions (" + e
-                        + "); rule E4 keeps the evidence before it (" + wsmEv.ds.size() + " executed addresses, "
-                        + tail.size() + " tail addresses dropped)";
-                    log.appendMsg(msg);
-                    ghidra.util.Msg.error(this, msg, e);
-                    program.getBookmarkManager().setBookmark(program.getMinAddress(), BookmarkType.ERROR, "WSEvidence", msg);
+                    // untrusted tail that led into the error; report the failure loudly (not silent), on every
+                    // invocation that uses this evidence.
+                    log.appendMsg(emulation.failure());
+                    ghidra.util.Msg.error(this, emulation.failure(), emulation.error());
+                    program.getBookmarkManager().setBookmark(program.getMinAddress(), BookmarkType.ERROR, "WSEvidence",
+                        emulation.failure());
                 }
             }
         }
@@ -197,6 +217,39 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
         catch (CancelledException c) { throw c; }
         catch (Exception e) { log.appendException(e); ghidra.util.Msg.error(this, NAME + " (phase 1) failed: " + e, e); }
         return true;
+    }
+
+    /**
+     * Rule E0: the WSMachine evidence for these inputs, emulating only when this program has none for them yet.
+     * A reused result starts from the state a fresh run has: rule B3's per-pass "site done" memory, the only
+     * state the rules add to WSMachine evidence, is cleared.
+     */
+    static Emulation emulate(Program program, int frames, int slice, TaskMonitor monitor) throws Exception {
+        EmulationInputs inputs = EmulationInputs.of(program, frames, slice);
+        Emulation previous = EMULATIONS.get(program);
+        if (previous != null && previous.inputs().equals(inputs)) {
+            previous.evidence().b3resolved.clear();
+            return previous;
+        }
+        monitor.setMessage("WonderSwan: emulating " + frames + " frames");
+        WSMachine m = new WSMachine(program, inputs.color());
+        Emulation emulation;
+        try {
+            m.run(frames, slice, f -> {
+                int ph = f % 40;
+                m.buttons = (f >= 100 && ph < 3) ? 0x02 : (f >= 100 && ph >= 20 && ph < 23) ? 0x04 : 0;
+            });
+            emulation = new Emulation(inputs, WSEvidence.of(m), null, null);
+        }
+        catch (Exception e) {
+            Set<Long> tail = m.untrustedTail();
+            WSEvidence partial = WSEvidence.of(m, tail);
+            emulation = new Emulation(inputs, partial, NAME + ": emulation ended in an error after " + m.instructions
+                + " instructions (" + e + "); rule E4 keeps the evidence before it (" + partial.ds.size()
+                + " executed addresses, " + tail.size() + " tail addresses dropped)", e);
+        }
+        EMULATIONS.put(program, emulation);
+        return emulation;
     }
 
     /**
@@ -734,6 +787,13 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
             AddressSet refall = new AddressSet();
             for (Function f : p.getFunctionManager().getFunctions(true)) {
                 if (!f.hasNoReturn()) continue;
+                if (WSInlineTables.savedYield(f)) {
+                    // J4 proved that this helper never returns to its CALL's next instruction; that instruction
+                    // executes later through the saved continuation. Clearing the attribute here would undo J4 on
+                    // every pass and make Ghidra's call-fixup repair re-schedule the byte analyzers indefinitely.
+                    emit("{\"rule\":\"N1\",\"function\":\"%s\",\"outcome\":\"KEPT_J4_SAVED_YIELD\"}", f.getEntryPoint());
+                    continue;
+                }
                 boolean contradicted = false;
                 List<Instruction> sites = new ArrayList<>();
                 for (Reference r : p.getReferenceManager().getReferencesTo(f.getEntryPoint())) {
