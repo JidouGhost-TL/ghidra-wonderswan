@@ -59,6 +59,35 @@ FIXTURE_CHECKPOINTS = {
 }
 EVIDENCE_TIMEOUT = 20
 TRANSPORT_TIMEOUT = 21
+ANALYZER_REVEAL_FAILURES = {
+    22: ("analyzer_table_lookup", None),
+    23: ("analyzer_table_inactive", "Expected an active analysis-options analyzer table"),
+    24: ("analyzer_name_ambiguous", "Analyzer name is ambiguous"),
+    25: ("analyzer_name_absent", "Expected analyzer is absent"),
+    26: ("analyzer_column_clipped", "Analyzer column is outside the visible table"),
+    27: ("analyzer_wheel_stationary", "Analyzer wheel did not move the active table"),
+    28: ("analyzer_wheel_wrong_direction", "Analyzer wheel moved the active table away from the target"),
+    29: ("analyzer_reveal_limit", "Analyzer row stayed outside the bounded viewport reveal"),
+}
+
+
+class AnalyzerRevealFailure(RuntimeError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(ANALYZER_REVEAL_FAILURES[code][0])
+
+
+def classify_analyzer_reveal(error):
+    message = str(error).strip().removeprefix("java.util.concurrent.ExecutionException: ")
+    if re.fullmatch(r"java.lang.IllegalArgumentException: Expected one shown control, found [0-9]+: analysis-table Analyzer",
+                    message):
+        return 22
+    detail = message.removeprefix("java.lang.IllegalStateException: ")
+    if detail != message:
+        for code, (_, exact) in ANALYZER_REVEAL_FAILURES.items():
+            if detail == exact:
+                return code
+    return None
 
 
 class VisibleEvidenceTimeout(TimeoutError):
@@ -214,7 +243,13 @@ class GhidraGui(Session):
         self.wait(r"^analysis-table\tAnalyzer\t")
         analyzer = "WonderSwan Execution Evidence"
         self.checkpoint("reveal_evidence_analyzer", file)
-        self.call("reveal-analyzer", analyzer)
+        try:
+            self.call("reveal-analyzer", analyzer)
+        except RuntimeError as error:
+            code = classify_analyzer_reveal(error)
+            if code is not None:
+                raise AnalyzerRevealFailure(code) from error
+            raise
         self.wait(r"^analysis-analyzer\t" + literal(analyzer) + r"\t")
         self.checkpoint("select_evidence_analyzer", file)
         self.call("select-analyzer", analyzer)
@@ -593,12 +628,20 @@ def main():
     args.output.write_text(json.dumps({"gui_jvm_pid": pid, "cases": data}, indent=2) + "\n")
 
 
-if __name__ == "__main__":
+def run_cli():
     try:
         main()
     except VisibleEvidenceTimeout:
         traceback.print_exc()
-        raise SystemExit(EVIDENCE_TIMEOUT)
+        return EVIDENCE_TIMEOUT
     except TimeoutError:
         traceback.print_exc()
-        raise SystemExit(TRANSPORT_TIMEOUT)
+        return TRANSPORT_TIMEOUT
+    except AnalyzerRevealFailure as error:
+        traceback.print_exc()
+        return error.code
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_cli())

@@ -496,8 +496,11 @@ public class GuiAgent {
             robot.waitForIdle();
             robot.delay(100);
             AnalyzerViewport next = edt(() -> analyzerViewport(control, name));
-            if (Integer.signum(next.visible.y - current.visible.y) != direction) {
-                throw new IllegalStateException("Analyzer wheel did not move the active table toward the target");
+            int movement = Integer.signum(next.visible.y - current.visible.y);
+            if (movement != direction) {
+                throw new IllegalStateException(movement == 0
+                    ? "Analyzer wheel did not move the active table"
+                    : "Analyzer wheel moved the active table away from the target");
             }
             current = next;
         }

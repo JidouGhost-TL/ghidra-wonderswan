@@ -13,7 +13,7 @@ import sys
 import time
 
 from exercise import (
-    CHECKPOINT_FILE, CHECKPOINTS, EVIDENCE_TIMEOUT, FIXTURE_CHECKPOINTS, FIXTURES, PROJECT,
+    ANALYZER_REVEAL_FAILURES, CHECKPOINT_FILE, CHECKPOINTS, EVIDENCE_TIMEOUT, FIXTURE_CHECKPOINTS, FIXTURES, PROJECT,
     TRANSPORT_TIMEOUT, VISIBLE_STORE,
 )
 
@@ -28,27 +28,42 @@ def emit(tag, receipt):
 
 
 class Diagnostic(rehearse.Diagnostic):
-    def emit(self, status, reason=None):
+    def emit(self, status, reason=None, *, launcher_exit_status=None):
         record = {"platform": self.platform, "stage": self.stage, "status": status}
         if reason is not None:
             record["reason"] = reason
+        if launcher_exit_status is not None:
+            record["launcher_exit_status"] = launcher_exit_status
         if self.item is not None:
             record["checkpoint"] = self.item
         emit("PUBLIC_GHIDRA_GUI_STAGE", record)
 
     def fail(self, error):
         if isinstance(error, GuiDriverFailure):
-            self.emit("failed", error.reason)
+            reason = error.reason
+            if error.analyzer_reveal and not (self.item or "").startswith("reveal_evidence_analyzer "):
+                reason = "gui_driver_exit"
+            self.emit("failed", reason)
+        elif isinstance(error, ForegroundLauncherExit):
+            self.emit("failed", "foreground_launcher_nonzero", launcher_exit_status=error.status)
         else:
             super().fail(error)
+
+
+class ForegroundLauncherExit(RuntimeError):
+    def __init__(self, status):
+        super().__init__("Foreground Ghidra did not exit cleanly")
+        self.status = status & 0xffffffff
 
 
 class GuiDriverFailure(RuntimeError):
     def __init__(self, returncode):
         super().__init__("GUI driver exited unsuccessfully")
+        self.analyzer_reveal = returncode in ANALYZER_REVEAL_FAILURES
         self.reason = {
             EVIDENCE_TIMEOUT: "visible_evidence_timeout",
             TRANSPORT_TIMEOUT: "gui_transport_timeout",
+            **{code: reason for code, (reason, _) in ANALYZER_REVEAL_FAILURES.items()},
         }.get(returncode, "gui_driver_exit")
 
 
@@ -171,7 +186,9 @@ def phase_run(phase, output, ghidra, agent, projects, env, session, diagnostic):
                 diagnostic.item = read_checkpoint(control, phase)
                 raise
             diagnostic.begin("gui_" + phase + "_exit")
-            require(child.wait(timeout=45) == 0, "Foreground Ghidra did not exit cleanly")
+            exit_status = child.wait(timeout=45)
+            if exit_status != 0:
+                raise ForegroundLauncherExit(exit_status)
         except BaseException as failure:
             try:
                 if child.poll() is None:
