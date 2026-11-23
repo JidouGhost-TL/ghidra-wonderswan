@@ -48,7 +48,9 @@ class Diagnostic(rehearse.Diagnostic):
                 reason = "gui_driver_exit"
             if error.reference_key:
                 step, _, fixture = (self.item or "").partition(" ")
-                if step in {"restore_reference_listing_focus", "reacquire_reference_browser"}:
+                if step in {
+                    "await_reference_dialog_clear", "restore_reference_listing_focus", "reacquire_reference_browser",
+                }:
                     allowed = reason in REFERENCE_FOREGROUND_FAILURES or (
                         step == "restore_reference_listing_focus" and reason == REFERENCE_GO_HANDOFF_UNVERIFIED
                     )

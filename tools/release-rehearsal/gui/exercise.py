@@ -58,7 +58,8 @@ FIXTURE_CHECKPOINTS = {
                "wait_for_analysis", "save_program", "set_read_only"},
     "reopen": {"open_read_only_program", "open_references", "activate_reference_listing",
                "open_reference_go", "await_reference_go", "verify_reference_go_editor",
-               "submit_reference_go_address", "await_reference_go_dismissal", "restore_reference_listing_focus",
+               "submit_reference_go_address", "await_reference_go_dismissal", "await_reference_dialog_clear",
+               "restore_reference_listing_focus",
                "verify_reference_listing_address",
                "focus_reference_listing_address", "verify_reference_key_readiness", "reacquire_reference_browser",
                "refocus_reference_listing_address", "open_reference_editor_key",
@@ -86,9 +87,15 @@ ANALYZER_REVEAL_FAILURES = {
 }
 REFERENCE_KEY_INPUT_REFUSED = "reference_key_input_refused"
 REFERENCE_RECOVERABLE_FOREGROUND = {"reference_foreground_project_manager"}
+REFERENCE_OTHER_DIALOGS = {
+    "reference_foreign_active_modeless_dialog", "reference_foreign_active_document_modal",
+    "reference_foreign_active_application_modal", "reference_foreign_inactive_application_modal",
+    "reference_foreign_active_toolkit_modal", "reference_foreign_inactive_toolkit_modal",
+    "reference_foreground_multiple_dialogs",
+}
 REFERENCE_BLOCKED_FOREGROUND = {
     "reference_foreground_go_dialog", "reference_foreground_owned_dialog",
-    "reference_foreground_other_dialog", "reference_foreground_other_window",
+    "reference_foreground_other_window", *REFERENCE_OTHER_DIALOGS,
 }
 REFERENCE_FOREGROUND_FAILURES = {
     "reference_browser_lookup", "reference_foreground_none",
@@ -108,10 +115,16 @@ REFERENCE_KEY_FAILURES = {
     REFERENCE_KEY_INPUT_REFUSED: 45,
     "reference_foreground_go_dialog": 46,
     "reference_foreground_owned_dialog": 47,
-    "reference_foreground_other_dialog": 48,
+    "reference_foreign_active_modeless_dialog": 48,
     "reference_foreground_project_manager": 49,
     "reference_foreground_other_window": 50,
     REFERENCE_GO_HANDOFF_UNVERIFIED: 51,
+    "reference_foreign_active_document_modal": 52,
+    "reference_foreign_active_application_modal": 53,
+    "reference_foreign_inactive_application_modal": 54,
+    "reference_foreign_active_toolkit_modal": 55,
+    "reference_foreign_inactive_toolkit_modal": 56,
+    "reference_foreground_multiple_dialogs": 57,
 }
 
 
@@ -401,6 +414,19 @@ class GhidraGui(Session):
                 raise ReferenceKeyFailure(outcome)
             time.sleep(0.15)
 
+    def await_post_go_dialog_release(self, title):
+        deadline = time.monotonic() + 4
+        while True:
+            outcome = self.call("read-reference-browser-foreground", title)
+            if outcome in {"reference_browser_active", "reference_foreground_none",
+                           *REFERENCE_RECOVERABLE_FOREGROUND}:
+                return
+            if outcome not in REFERENCE_FOREGROUND_FAILURES:
+                raise RuntimeError("Unexpected reference foreground result")
+            if outcome not in REFERENCE_OTHER_DIALOGS or time.monotonic() >= deadline:
+                raise ReferenceKeyFailure(outcome)
+            time.sleep(0.15)
+
     def restore_reference_browser(self, title, *, after_go):
         command = "restore-reference-browser" if after_go else "reacquire-reference-browser"
         outcome = self.call(command, title)
@@ -425,6 +451,8 @@ class GhidraGui(Session):
         self.call("submit-go-address", title, "F000:010D")
         self.checkpoint("await_reference_go_dismissal", file)
         self.wait(r"^(?:ACTIVE|WINDOW)\tGo To \.\.\.\t", present=False)
+        self.checkpoint("await_reference_dialog_clear", file)
+        self.await_post_go_dialog_release(title)
         self.checkpoint("restore_reference_listing_focus", file)
         self.restore_reference_browser(title, after_go=True)
         self.checkpoint("verify_reference_listing_address", file)

@@ -413,6 +413,17 @@ public class GuiAgent {
             && containsStockListing(owner);
     }
 
+    private static String foreignReferenceDialog(Dialog dialog) {
+        return switch (dialog.getModalityType()) {
+            case MODELESS -> "reference_foreign_active_modeless_dialog";
+            case DOCUMENT_MODAL -> "reference_foreign_active_document_modal";
+            case APPLICATION_MODAL -> dialog.isActive() ? "reference_foreign_active_application_modal"
+                : "reference_foreign_inactive_application_modal";
+            case TOOLKIT_MODAL -> dialog.isActive() ? "reference_foreign_active_toolkit_modal"
+                : "reference_foreign_inactive_toolkit_modal";
+        };
+    }
+
     private static ReferenceBrowser referenceBrowser(String browser) throws Exception {
         Window owner;
         try {
@@ -426,6 +437,7 @@ public class GuiAgent {
         }
 
         String blocker = null;
+        int blockerCount = 0;
         for (Window shown : Window.getWindows()) {
             if (!(shown instanceof Dialog dialog) || !dialog.isShowing()) {
                 continue;
@@ -436,8 +448,12 @@ public class GuiAgent {
             boolean owned = ownedBy(dialog, owner);
             if (dialog.isActive() || (dialog.isModal() &&
                     (owned || dialog.getModalityType() != Dialog.ModalityType.DOCUMENT_MODAL))) {
-                blocker = owned ? "reference_foreground_owned_dialog" : "reference_foreground_other_dialog";
+                blocker = owned ? "reference_foreground_owned_dialog" : foreignReferenceDialog(dialog);
+                blockerCount++;
             }
+        }
+        if (blockerCount > 1) {
+            return new ReferenceBrowser(owner, "reference_foreground_multiple_dialogs");
         }
         if (blocker != null) {
             return new ReferenceBrowser(owner, blocker);
