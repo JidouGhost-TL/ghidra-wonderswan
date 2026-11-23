@@ -457,12 +457,13 @@ public final class WSCallLocks {
 
     Set<String>[] value(State st, Register r) {
         String[] h = halves(r);
-        if (h == null || h.length != 2) return slot(new HashSet<>(Set.of(OTHER)), new HashSet<>(Set.of(OTHER)));
-        return slot(new HashSet<>(st.units.get(h[0])), new HashSet<>(st.units.get(h[1])));
+        if (h == null) return slot(new HashSet<>(Set.of(OTHER)), new HashSet<>(Set.of(OTHER)));
+        return slot(new HashSet<>(st.units.get(h[0])), new HashSet<>(st.units.get(h[h.length - 1])));
     }
 
     void assign(State st, Register r, Set<String>[] v) {
         String[] h = halves(r);
+        if (h.length == 1) { st.units.put(h[0], new HashSet<>(v[0])); return; }
         if (h[0].equals(h[1])) {
             Set<String> both = new HashSet<>(v[0]); both.addAll(v[1]);
             st.units.put(h[0], both);

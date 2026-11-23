@@ -247,6 +247,12 @@ public class WSCallBindingFixtures extends GhidraScript {
             check(call.getNumInputs() == 2 && constant(call.getInput(1), 5, 1), "F5 call binds BH: " + show(call));
             locked(fn(p, fx, 0x100), "F5", "BH:1", true);
         });
+        // F5b: a byte register copy carries the entry value (MOV BL,AL then a BL store reads AL).
+        fixture("F5b", new Fx("f5b").fn(0x100, "88c3", "881e0021", "c3").fn(0x40, "b004", "call:0100", "c3"), null, (p, fx, l) -> {
+            var call = callAt(decompile(p, fx, 0x40), p, fx, 0x42);
+            check(call.getNumInputs() == 2 && constant(call.getInput(1), 4, 1), "F5b call binds AL: " + show(call));
+            locked(fn(p, fx, 0x100), "F5b", "AL:1", true);
+        });
         // F6 SAVE: PUSH AX ... POP AX is no input and no result; AX survives the call.
         fixture("F6", new Fx("f6").fn(0x100, "50", "a10621", "a30021", "58", "c3")
                 .fn(0x40, "b83412", "call:0100", "a30221", "c3"), null, (p, fx, l) -> {
