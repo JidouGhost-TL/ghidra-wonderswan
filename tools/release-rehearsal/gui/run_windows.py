@@ -28,12 +28,14 @@ def emit(tag, receipt):
 
 
 class Diagnostic(rehearse.Diagnostic):
-    def emit(self, status, reason=None, *, launcher_exit_status=None):
+    def emit(self, status, reason=None, *, launcher_exit_status=None, artifact_counts=None):
         record = {"platform": self.platform, "stage": self.stage, "status": status}
         if reason is not None:
             record["reason"] = reason
         if launcher_exit_status is not None:
             record["launcher_exit_status"] = launcher_exit_status
+        if artifact_counts is not None:
+            record["artifact_counts"] = artifact_counts
         if self.item is not None:
             record["checkpoint"] = self.item
         emit("PUBLIC_GHIDRA_GUI_STAGE", record)
@@ -46,6 +48,8 @@ class Diagnostic(rehearse.Diagnostic):
             self.emit("failed", reason)
         elif isinstance(error, ForegroundLauncherExit):
             self.emit("failed", "foreground_launcher_nonzero", launcher_exit_status=error.status)
+        elif isinstance(error, SavedDatabaseCount):
+            self.emit("failed", "saved_database_count", artifact_counts=error.counts)
         else:
             super().fail(error)
 
@@ -54,6 +58,22 @@ class ForegroundLauncherExit(RuntimeError):
     def __init__(self, status):
         super().__init__("Foreground Ghidra did not exit cleanly")
         self.status = status & 0xffffffff
+
+
+class SavedDatabaseCount(RuntimeError):
+    def __init__(self, projects, database_count):
+        super().__init__("Expected two saved GUI program databases")
+        shapes = {
+            "project_files": ("*.gpr", Path.is_file),
+            "repositories": ("*.rep", Path.is_dir),
+            "program_store_roots": ("*.rep/idata", Path.is_dir),
+            "program_item_records": ("*.rep/idata/**/*.prp", Path.is_file),
+            "program_database_dirs": ("*.rep/idata/**/*.db", Path.is_dir),
+            "user_database_files": ("*.rep/user/**/*.gbf", Path.is_file),
+        }
+        self.counts = {name: min(99, sum(check(path) for path in projects.glob(pattern)))
+                       for name, (pattern, check) in shapes.items()}
+        self.counts["program_database_files"] = min(database_count, 99)
 
 
 class GuiDriverFailure(RuntimeError):
@@ -88,7 +108,8 @@ def require(condition, message):
 
 def saved_databases(projects):
     saved = {path.relative_to(projects): rehearse.digest(path) for path in projects.glob("*.rep/idata/**/*.gbf")}
-    require(len(saved) == 2, "Expected two saved GUI program databases")
+    if len(saved) != 2:
+        raise SavedDatabaseCount(projects, len(saved))
     return saved
 
 
@@ -198,6 +219,7 @@ def phase_run(phase, output, ghidra, agent, projects, env, session, diagnostic):
             except (OSError, subprocess.SubprocessError) as cleanup:
                 failure.add_note(f"Owned launcher cleanup failed: {type(cleanup).__name__}")
             raise
+    diagnostic.begin("gui_" + phase + "_proof_read")
     return json.loads(proof.read_bytes())
 
 
@@ -261,11 +283,14 @@ def main():
         projects = output / "projects"
         projects.mkdir()
         imported = phase_run("import", output, ghidra, agent, projects, env, session, diagnostic)
+        diagnostic.begin("gui_inventory_before_reopen")
         before = saved_databases(projects)
         reopened = phase_run("reopen", output, ghidra, agent, projects, env, session, diagnostic)
+        diagnostic.begin("gui_inventory_after_reopen")
+        after = saved_databases(projects)
         diagnostic.begin("verify_gui_receipt")
         events = [json.loads(line) for line in (output / "observed.jsonl").read_text().splitlines()]
-        fixtures = collect_proof(imported, reopened, before, saved_databases(projects), events)
+        fixtures = collect_proof(imported, reopened, before, after, events)
         state = json.loads((output / "setup.json").read_bytes())
         pin_fields = ("ghidra_sha256", "jdk_sha256", "native_sha256")
         require(all(re.fullmatch(r"[0-9a-f]{64}", state[key]) for key in pin_fields), "Invalid release receipt pin")

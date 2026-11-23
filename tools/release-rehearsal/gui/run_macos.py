@@ -163,6 +163,7 @@ def phase_run(phase, output, ghidra, agent, projects, env, diagnostic, *, finish
             except (OSError, RuntimeError, subprocess.SubprocessError) as cleanup:
                 failure.add_note(f"Owned launcher cleanup failed: {type(cleanup).__name__}")
             raise
+    diagnostic.begin("gui_" + phase + "_proof_read")
     result = json.loads(proof.read_bytes())
     require(result["gui_jvm_pid"] == gui, "GUI receipt does not identify the verified JVM")
     return result
@@ -195,11 +196,14 @@ def main():
         projects.mkdir()
         imported = phase_run("import", output, ghidra, agent, projects, env, diagnostic,
                              finish_with_space=host == "Darwin-arm64")
+        diagnostic.begin("gui_inventory_before_reopen")
         before = saved_databases(projects)
         reopened = phase_run("reopen", output, ghidra, agent, projects, env, diagnostic)
+        diagnostic.begin("gui_inventory_after_reopen")
+        after = saved_databases(projects)
         diagnostic.begin("verify_gui_receipt")
         events = [json.loads(line) for line in (output / "observed.jsonl").read_text().splitlines()]
-        fixtures = collect_proof(imported, reopened, before, saved_databases(projects), events)
+        fixtures = collect_proof(imported, reopened, before, after, events)
         state = json.loads((output / "setup.json").read_bytes())
         pin_fields = ("ghidra_sha256", "jdk_sha256", "native_sha256")
         require(state["platform"] == host and all(re.fullmatch(r"[0-9a-f]{64}", state[key]) for key in pin_fields),
