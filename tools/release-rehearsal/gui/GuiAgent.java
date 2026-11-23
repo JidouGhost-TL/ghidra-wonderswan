@@ -321,30 +321,57 @@ public class GuiAgent {
         return editor;
     }
 
-    private static Control listingField(String browser, String address) throws Exception {
-        Window owner = activeWindow(browser);
+    private static List<Control> listingFields(Window owner, String address) {
         var rows = new ArrayList<Control>();
         collect(owner, rows, owner);
-        var matches = rows.stream().filter(control -> "field".equals(control.role) &&
+        return rows.stream().filter(control -> "field".equals(control.role) &&
             control.name.equalsIgnoreCase(address) && control.point != null &&
             owner.getBounds().contains(control.point)).toList();
+    }
+
+    private static Control listingField(String browser, String address) throws Exception {
+        var matches = listingFields(activeWindow(browser), address);
         if (matches.size() != 1) {
             throw new IllegalStateException("Expected one exact visible listing address in the active program");
         }
         return matches.getFirst();
     }
 
-    private static void requireFocusedListingAddress(String browser, String address) throws Exception {
-        Control field = listingField(browser, address);
-        Component panel = field.component;
-        if (KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner() != panel) {
-            throw new IllegalStateException("Expected focus on the active program listing");
+    private static String listingReferenceReadiness(String browser, String address) throws Exception {
+        Window owner;
+        try {
+            owner = window(Pattern.quote(browser));
         }
-        Object current = panel.getClass().getMethod("getCurrentField").invoke(panel);
-        Class<?> type = Class.forName("docking.widgets.fieldpanel.field.Field", false,
-            panel.getClass().getClassLoader());
-        if (current == null || !address.equalsIgnoreCase((String) type.getMethod("getText").invoke(current))) {
-            throw new IllegalStateException("Expected the exact address at the focused listing cursor");
+        catch (IllegalArgumentException error) {
+            return "reference_browser_lookup";
+        }
+        if (!owner.isActive()) {
+            return "reference_browser_inactive";
+        }
+        List<Control> matches = listingFields(owner, address);
+        if (matches.size() != 1) {
+            return matches.isEmpty() ? "reference_listing_address_absent" : "reference_listing_address_ambiguous";
+        }
+        Component panel = matches.getFirst().component;
+        Component focus = KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner();
+        if (focus == null) {
+            return "reference_listing_focus_absent";
+        }
+        if (focus != panel || SwingUtilities.getWindowAncestor(panel) != owner) {
+            return "reference_listing_focus_other";
+        }
+        try {
+            Object current = panel.getClass().getMethod("getCurrentField").invoke(panel);
+            Class<?> type = Class.forName("docking.widgets.fieldpanel.field.Field", false,
+                panel.getClass().getClassLoader());
+            if (current == null) {
+                return "reference_cursor_unavailable";
+            }
+            return address.equalsIgnoreCase((String) type.getMethod("getText").invoke(current))
+                ? "reference_ready" : "reference_cursor_mismatch";
+        }
+        catch (ReflectiveOperationException error) {
+            return "reference_cursor_readback";
         }
     }
 
@@ -849,13 +876,21 @@ public class GuiAgent {
                 robot.waitForIdle();
                 yield field.describe();
             }
+            case "read-listing-reference-state" ->
+                edt(() -> listingReferenceReadiness(parts[1], parts[2]));
             case "open-listing-references" -> {
-                edt(() -> {
-                    requireFocusedListingAddress(parts[1], parts[2]);
-                    return null;
-                });
-                chord(robot, "R");
-                yield "";
+                String readiness = edt(() -> listingReferenceReadiness(parts[1], parts[2]));
+                if (!readiness.equals("reference_ready")) {
+                    yield readiness;
+                }
+                try {
+                    robot.keyPress(KeyEvent.VK_R);
+                    robot.keyRelease(KeyEvent.VK_R);
+                }
+                catch (IllegalArgumentException | SecurityException error) {
+                    yield "reference_key_input_refused";
+                }
+                yield "reference_key_sent";
             }
             case "click-analysis-button" -> {
                 Control button = find("JButton:enabled", Pattern.quote(parts[1]));

@@ -14,7 +14,7 @@ import time
 
 from exercise import (
     ANALYZER_REVEAL_FAILURES, CHECKPOINT_FILE, CHECKPOINTS, EVIDENCE_TIMEOUT, FIXTURE_CHECKPOINTS, FIXTURES, PROJECT,
-    TRANSPORT_TIMEOUT, VISIBLE_STORE,
+    REFERENCE_KEY_FAILURES, REFERENCE_KEY_INPUT_REFUSED, TRANSPORT_TIMEOUT, VISIBLE_STORE,
 )
 
 from indexed_storage import IndexedStorageError, saved_programs
@@ -45,6 +45,14 @@ class Diagnostic(rehearse.Diagnostic):
             reason = error.reason
             if error.analyzer_reveal and not (self.item or "").startswith("reveal_evidence_analyzer "):
                 reason = "gui_driver_exit"
+            if error.reference_key:
+                step, _, fixture = (self.item or "").partition(" ")
+                valid_step = step in {
+                    "verify_reference_key_readiness", "open_reference_editor_key",
+                }
+                submit_only = reason == REFERENCE_KEY_INPUT_REFUSED and step != "open_reference_editor_key"
+                if self.stage != "gui_readonly_reopen" or fixture not in FIXTURES or not valid_step or submit_only:
+                    reason = "gui_driver_exit"
             self.emit("failed", reason)
         elif isinstance(error, ForegroundLauncherExit):
             self.emit("failed", "foreground_launcher_nonzero", launcher_exit_status=error.status)
@@ -64,10 +72,12 @@ class GuiDriverFailure(RuntimeError):
     def __init__(self, returncode):
         super().__init__("GUI driver exited unsuccessfully")
         self.analyzer_reveal = returncode in ANALYZER_REVEAL_FAILURES
+        self.reference_key = returncode in REFERENCE_KEY_FAILURES.values()
         self.reason = {
             EVIDENCE_TIMEOUT: "visible_evidence_timeout",
             TRANSPORT_TIMEOUT: "gui_transport_timeout",
             **{code: reason for code, (reason, _) in ANALYZER_REVEAL_FAILURES.items()},
+            **{code: reason for reason, code in REFERENCE_KEY_FAILURES.items()},
         }.get(returncode, "gui_driver_exit")
 
 

@@ -59,7 +59,8 @@ FIXTURE_CHECKPOINTS = {
                "open_reference_go", "await_reference_go", "verify_reference_go_editor",
                "submit_reference_go_address", "await_reference_go_dismissal", "restore_reference_listing_focus",
                "verify_reference_listing_address",
-               "focus_reference_listing_address", "open_reference_editor_key", "await_reference_editor",
+               "focus_reference_listing_address", "verify_reference_key_readiness", "open_reference_editor_key",
+               "await_reference_editor",
                "inspect_references", "inspect_decompiler",
                "close_program"},
 }
@@ -81,12 +82,31 @@ ANALYZER_REVEAL_FAILURES = {
     34: ("analyzer_page_wrong_direction", "Analyzer page key moved the active table away from the target"),
     35: ("analyzer_page_focus_moved", "The analyzer viewport changed while acquiring keyboard focus"),
 }
+REFERENCE_KEY_INPUT_REFUSED = "reference_key_input_refused"
+REFERENCE_KEY_FAILURES = {
+    "reference_browser_lookup": 36,
+    "reference_browser_inactive": 37,
+    "reference_listing_address_absent": 38,
+    "reference_listing_address_ambiguous": 39,
+    "reference_listing_focus_absent": 40,
+    "reference_listing_focus_other": 41,
+    "reference_cursor_unavailable": 42,
+    "reference_cursor_mismatch": 43,
+    "reference_cursor_readback": 44,
+    REFERENCE_KEY_INPUT_REFUSED: 45,
+}
 
 
 class AnalyzerRevealFailure(RuntimeError):
     def __init__(self, code):
         self.code = code
         super().__init__(ANALYZER_REVEAL_FAILURES[code][0])
+
+
+class ReferenceKeyFailure(RuntimeError):
+    def __init__(self, outcome):
+        self.code = REFERENCE_KEY_FAILURES[outcome]
+        super().__init__(outcome)
 
 
 def classify_analyzer_reveal(error):
@@ -337,6 +357,18 @@ class GhidraGui(Session):
         self.enter_text(address)
         self.call("key", "ENTER")
 
+    def observe_reference_key_readiness(self, title, address):
+        deadline = time.monotonic() + 4
+        while True:
+            outcome = self.call("read-listing-reference-state", title, address)
+            if outcome == "reference_ready":
+                return
+            if outcome not in REFERENCE_KEY_FAILURES or outcome == REFERENCE_KEY_INPUT_REFUSED:
+                raise RuntimeError("Unexpected reference readiness result")
+            if outcome == "reference_cursor_readback" or time.monotonic() >= deadline:
+                raise ReferenceKeyFailure(outcome)
+            time.sleep(0.15)
+
     def open_scoped_references(self, file, title):
         address = "ram:f000:010d"
         self.checkpoint("activate_reference_listing", file)
@@ -359,8 +391,14 @@ class GhidraGui(Session):
         self.wait(r"^field\t" + literal(address) + r"\t", active_dialog=title)
         self.checkpoint("focus_reference_listing_address", file)
         self.call("focus-listing-address", title, address)
+        self.checkpoint("verify_reference_key_readiness", file)
+        self.observe_reference_key_readiness(title, address)
         self.checkpoint("open_reference_editor_key", file)
-        self.call("open-listing-references", title, address)
+        outcome = self.call("open-listing-references", title, address)
+        if outcome in REFERENCE_KEY_FAILURES:
+            raise ReferenceKeyFailure(outcome)
+        if outcome != "reference_key_sent":
+            raise RuntimeError("Unexpected reference key submission result")
         reference = literal("References Editor @ " + address) + r" +" + literal(f"({file}) [{title}]")
         self.checkpoint("await_reference_editor", file)
         self.wait(r"^ACTIVE\t" + reference + r"\t")
@@ -701,7 +739,7 @@ def run_cli():
     except TimeoutError:
         traceback.print_exc()
         return TRANSPORT_TIMEOUT
-    except AnalyzerRevealFailure as error:
+    except (AnalyzerRevealFailure, ReferenceKeyFailure) as error:
         traceback.print_exc()
         return error.code
     return 0
