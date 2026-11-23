@@ -3,16 +3,17 @@
 param(
     [Parameter(Mandatory = $true)]
     [string] $Output,
-    [string] $Cache,
     [string] $Python = 'python'
 )
 
 $ErrorActionPreference = 'Stop'
-$arguments = @('-B', (Join-Path $PSScriptRoot 'run_windows.py'), $Output)
-if ($Cache) {
-    $arguments += @('--cache', $Cache)
+if (-not $IsWindows -or [System.Diagnostics.Process]::GetCurrentProcess().SessionId -eq 0) {
+    Write-Output 'PUBLIC_GHIDRA_GUI_STAGE {"platform":"Windows-x64","stage":"console_session","status":"failed","reason":"interactive_session_required"}'
+    exit 1
 }
-& $Python @arguments
-if ($LASTEXITCODE -ne 0) {
-    throw "The native GUI rehearsal did not pass. Its private stage logs remain in the job directory."
-}
+
+# The Python launcher creates a new Windows console and uses Ghidra's foreground
+# mode. This PowerShell step can have redirected standard streams.
+$driver = Join-Path $PSScriptRoot 'run_windows.py'
+& $Python -B $driver $Output
+exit $LASTEXITCODE

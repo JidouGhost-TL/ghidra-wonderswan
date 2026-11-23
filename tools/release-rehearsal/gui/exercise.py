@@ -16,6 +16,7 @@ FIXTURES = {
     "bank-unknown.ws": "bbe488e4cdc1e9427c9c2592245ea5409a477d1688b1976d12e8b604d9ad0964",
 }
 PROJECT = "portable-gui"
+VISIBLE_STORE = r"uRam00000200 *= *0x42 *;"
 MANAGER = "Ghidra: " + PROJECT
 
 
@@ -125,6 +126,9 @@ def stage_import(ui, fixture_dir, project_dir, report_path):
         ui.button("Select File To Import")
         ui.wait(r"^JTextField\tV30MZ:LE:16:default:default\t")
         ui.wait(r"^GhidraComboBox\t.*WonderSwanLoader")
+        import_dialog = r"Import (?!Results Summary$).+"
+        ui.call("front", import_dialog)
+        ui.wait(r"^ACTIVE\t" + import_dialog + r"\t")
         ui.button("OK")
         ui.wait(r"^JTextField\t" + sha + r"\t")
         ui.wait(r"^JTextField\tWonderSwan Cartridge\t")
@@ -209,8 +213,9 @@ def stage_reopen(ui):
             ui.go("ROM0_BANK_00FE::020069")
             ui.wait(r"^field\tAL,0x42\t")
             ui.direct("click", "field", literal("AL,0x42"))
-            ui.wait(r"^decompiled\t.*00000200.*0x42")
-            record["marker"] = "Visible decompiler stores 0x42 to 00000200"
+            rendered = ui.wait(r"^decompiled\t(" + VISIBLE_STORE + r")\t")
+            record["visible_store"] = re.search(r"^decompiled\t(" + VISIBLE_STORE + r")\t",
+                                                rendered, flags=re.M).group(1)
             record["marker_capture"] = ui.call("capture", literal(title))
         else:
             assert not overrides
