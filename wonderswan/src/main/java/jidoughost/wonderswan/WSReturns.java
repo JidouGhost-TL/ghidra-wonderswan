@@ -19,8 +19,9 @@ import ghidra.util.task.TaskMonitor;
  * expecting their own pre-call value. Register inputs come from use before definition.
  * Explicit signatures and compiler conventions other than the register convention win.
  * L2 (H2): after a call or interrupt whose outputs are not proven, a read of a unit it may write
- * leaves the input set unknown, and so does a frame read at or above the return address; no lock
- * is written, and an earlier lock of this rule is reset. Status flags are never inputs.
+ * leaves the input set unknown; no lock is written, and an earlier lock of this rule is reset.
+ * Status flags are never inputs. Stack arguments stay outside R1b: the register convention cannot
+ * bind them at a call either way, so a frame read does not withdraw a proven register result.
  */
 public final class WSReturns {
     static final List<String> UNITS = List.of("AL", "AH", "BL", "BH", "CL", "CH", "DL", "DH",
@@ -391,30 +392,8 @@ public final class WSReturns {
         path.remove(a); return source;
     }
     static boolean flag(String unit) { return unit.length() == 2 && unit.endsWith("F") && !unit.equals("DF"); }
-    private static boolean frameSetup(Instruction i) {
-        String m = i.getMnemonicString().toUpperCase();
-        if (m.equals("ENTER")) return true;
-        if (!m.equals("MOV") || i.getNumOperands() != 2) return false;
-        Object[] d = i.getOpObjects(0), s = i.getOpObjects(1);
-        return d.length == 1 && s.length == 1 && d[0] instanceof Register rd && s[0] instanceof Register rs
-            && rd.getName().equals("BP") && rs.getName().equals("SP");
-    }
-    /** A BP-based memory operand at a non-negative displacement: saved BP, return address or arguments. */
-    private static boolean frameRead(Instruction i) {
-        for (int k = 0; k < i.getNumOperands(); k++) {
-            if (!ghidra.program.model.lang.OperandType.isDynamic(i.getOperandType(k))) continue;
-            boolean bp = false; long disp = 0;
-            for (Object o : i.getOpObjects(k)) {
-                if (o instanceof Register r && r.getName().equals("BP")) bp = true;
-                if (o instanceof ghidra.program.model.scalar.Scalar sc) disp = sc.getSignedValue();
-            }
-            if (bp && disp >= 0) return true;
-        }
-        return false;
-    }
     /** Register inputs from use before definition, or null when L2 leaves them unknown. */
     Set<String> inputs(Graph g) {
-        boolean frame = g.code.values().stream().anyMatch(WSReturns::frameSetup);
         Map<Address, Set<String>> defined = new HashMap<>(), tainted = new HashMap<>();
         ArrayDeque<Address> work = new ArrayDeque<>();
         Address entry = g.f.getEntryPoint(); defined.put(entry, new HashSet<>()); tainted.put(entry, new HashSet<>()); work.add(entry);
@@ -423,7 +402,6 @@ public final class WSReturns {
         while (!work.isEmpty() && steps++ < MAX_BODY * 32) {
             Address a = work.remove(); Instruction i = g.code.get(a); if (i == null) continue;
             Set<String> have = new HashSet<>(defined.get(a)), taint = new HashSet<>(tainted.get(a));
-            if (frame && frameRead(i)) { unknownReason = "FRAME_READ"; unknownAt = a; return null; }
             for (String u : reads(i)) if (!have.contains(u) && !flag(u)) {
                 if (taint.contains(u)) { unknownReason = "READ_AFTER_UNPROVEN_CALL"; unknownAt = a; return null; }
                 inputs.add(u);

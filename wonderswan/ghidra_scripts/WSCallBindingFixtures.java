@@ -346,11 +346,14 @@ public class WSCallBindingFixtures extends GhidraScript {
                 "L2b AX result locked " + f.getPrototypeString(true, true));
             check(f.getParameterCount() == 0, "L2b no flag input " + f.getPrototypeString(true, true));
         });
-        // L2c: a read above the return address ([BP+4] after MOV BP,SP) vetoes the R1b lock.
+        // L2c control: a frame read ([BP+4] after MOV BP,SP) does not withdraw the proven AX result,
+        // which the register convention cannot express without the lock; no register input is invented.
         fixture("L2c", new Fx("l2c").fn(0x100, "55", "8bec", "8b4604", "5d", "c3")
                 .fn(0x40, "53", "call:0100", "a30221", "5b", "c3").fn(0x60, "53", "call:0100", "a30421", "5b", "c3"), null, (p, fx, l) -> {
-            unlocked(fn(p, fx, 0x100), "L2c");
-            check(l.stream().anyMatch(x -> x.contains("\"rule\":\"R1b\"") && x.contains("VETO_INPUTS_UNKNOWN")), "L2c R1b veto emitted");
+            var f = fn(p, fx, 0x100);
+            check(f.hasCustomVariableStorage() && f.getReturn().getVariableStorage().toString().equals("AX:2")
+                && f.getParameterCount() == 0, "L2c AX result kept without inputs " + f.getPrototypeString(true, true));
+            check(f.getCallingConventionName().equals("__wsasm"), "L2c no L1 model on a stack frame");
         });
         // L2d: an R1b lock saved by an earlier build (in_AL after the unresolved call) is reset.
         fixture("L2d", new Fx("l2d").fn(0x100, UNRESOLVED, "a20021", "b80100", "c3")
