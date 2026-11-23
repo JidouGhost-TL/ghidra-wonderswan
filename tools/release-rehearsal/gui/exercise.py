@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import traceback
 import time
 
 from drive import Session
@@ -18,6 +19,23 @@ FIXTURES = {
 PROJECT = "portable-gui"
 VISIBLE_STORE = r"uRam00000200 *= *0x42 *;"
 MANAGER = "Ghidra: " + PROJECT
+CHECKPOINT_FILE = "driver-checkpoint.txt"
+CHECKPOINTS = {
+    "import": {"startup", "create_project", "save_project", "exit_ghidra"},
+    "reopen": {"startup", "open_saved_project", "exit_ghidra"},
+}
+FIXTURE_CHECKPOINTS = {
+    "import": {"open_import_chooser", "select_import_file", "confirm_import_format", "inspect_import_summary",
+               "open_program", "configure_analysis", "wait_for_analysis", "save_program", "set_read_only"},
+    "reopen": {"open_read_only_program", "open_references", "inspect_references", "inspect_decompiler",
+               "close_program"},
+}
+EVIDENCE_TIMEOUT = 20
+TRANSPORT_TIMEOUT = 21
+
+
+class VisibleEvidenceTimeout(TimeoutError):
+    pass
 
 
 def literal(text):
@@ -25,6 +43,10 @@ def literal(text):
 
 
 class GhidraGui(Session):
+    def checkpoint(self, step, fixture=None):
+        value = step if fixture is None else f"{step} {fixture}"
+        (self.directory / CHECKPOINT_FILE).write_text(value, encoding="ascii")
+
     def wait(self, pattern, timeout=45):
         start = time.monotonic()
         while True:
@@ -32,7 +54,7 @@ class GhidraGui(Session):
             if re.search(pattern, view, flags=re.M | re.I):
                 return view
             if time.monotonic() - start > timeout:
-                raise RuntimeError(f"Expected visible GUI evidence: {pattern}")
+                raise VisibleEvidenceTimeout(f"Expected visible GUI evidence: {pattern}")
             time.sleep(0.25)
 
     def direct(self, operation, role, label):
@@ -71,7 +93,7 @@ class GhidraGui(Session):
                     read_only or "ACTIVE\tAnalyze?\t" in view):
                 return title
             time.sleep(0.25)
-        raise RuntimeError(f"Expected a visible {'read-only' if read_only else 'fresh'} CodeBrowser")
+        raise VisibleEvidenceTimeout(f"Expected a visible {'read-only' if read_only else 'fresh'} CodeBrowser")
 
     def analysis_option(self, label, role):
         view = self.wait(rf"^GDLabel\t{literal(label)}\t")
@@ -108,6 +130,7 @@ def stage_import(ui, fixture_dir, project_dir, report_path):
         if "Ghidra: NO ACTIVE PROJECT" in view:
             break
         time.sleep(0.3)
+    ui.checkpoint("create_project")
     ui.call("focus", literal("Ghidra: NO ACTIVE PROJECT"))
     ui.choose("File", "New Project...")
     ui.button("Next >>")
@@ -119,17 +142,21 @@ def stage_import(ui, fixture_dir, project_dir, report_path):
     ui.wait(r"^(?:WINDOW|ACTIVE)\t" + literal(MANAGER) + r"\t")
     summary = {}
     for file, sha in FIXTURES.items():
+        ui.checkpoint("open_import_chooser", file)
         ui.call("focus", literal(MANAGER))
         ui.choose("File", "Import File...")
+        ui.checkpoint("select_import_file", file)
         ui.direct("click", "DropDownSelectionTextField", ".*")
         ui.enter_text(str(Path(fixture_dir) / file))
         ui.button("Select File To Import")
+        ui.checkpoint("confirm_import_format", file)
         ui.wait(r"^JTextField\tV30MZ:LE:16:default:default\t")
         ui.wait(r"^GhidraComboBox\t.*WonderSwanLoader")
         import_dialog = r"Import (?!Results Summary$).+"
         ui.call("front", import_dialog)
         ui.wait(r"^ACTIVE\t" + import_dialog + r"\t")
         ui.button("OK")
+        ui.checkpoint("inspect_import_summary", file)
         ui.wait(r"^JTextField\t" + sha + r"\t")
         ui.wait(r"^JTextField\tWonderSwan Cartridge\t")
         ui.call("front", literal("Import Results Summary"))
@@ -137,10 +164,12 @@ def stage_import(ui, fixture_dir, project_dir, report_path):
         summary[file] = {"import_sha256": sha, "import_visible_capture": ui.call("capture", literal("Import Results Summary"))}
         ui.button("OK")
     for file in FIXTURES:
+        ui.checkpoint("open_program", file)
         title = ui.open_program(file)
         ui.call("fit", literal(title))
         ui.call("front", literal("Analyze?"))
         ui.button("Yes")
+        ui.checkpoint("configure_analysis", file)
         ui.wait(r"^ACTIVE\tAnalysis Options\t")
         ui.call("front", literal("Analysis Options"))
         ui.click("table:Analyzer", "Aggressive Instruction Finder (Prototype)")
@@ -158,8 +187,10 @@ def stage_import(ui, fixture_dir, project_dir, report_path):
         summary[file]["analyzer_options_capture"] = ui.call("capture", literal("Analysis Options"))
         ui.button("Apply")
         ui.button("Analyze")
+        ui.checkpoint("wait_for_analysis", file)
         ui.wait(r"^ACTIVE\tAuto Analysis Summary\t", timeout=120)
         ui.button("OK")
+        ui.checkpoint("save_program", file)
         ui.call("focus", literal(title))
         ui.choose("File", "Save '" + file + "'")
         ui.choose("File", "Close Tool")
@@ -167,12 +198,15 @@ def stage_import(ui, fixture_dir, project_dir, report_path):
         if "ACTIVE\tSave Program?\t" in view:
             ui.button("Save")
         ui.wait(r"^(?:WINDOW|ACTIVE)\t" + literal(MANAGER) + r"\t")
+        ui.checkpoint("set_read_only", file)
         ui.call("focus", literal(MANAGER))
         ui.direct("right", "tree", literal(file))
         ui.wait(r"^DockingCheckBoxMenuItem:checked\tRead-Only=false\t")
         ui.click("DockingCheckBoxMenuItem", "Read-Only")
+    ui.checkpoint("save_project")
     ui.call("focus", literal(MANAGER))
     ui.choose("File", "Save Project")
+    ui.checkpoint("exit_ghidra")
     ui.exit_ghidra(MANAGER)
     return summary
 
@@ -191,15 +225,19 @@ def rows_at(view, address, expected_type, expected_source):
 
 
 def stage_reopen(ui):
+    ui.checkpoint("open_saved_project")
     ui.wait(r"^(?:ACTIVE|WINDOW)\t" + literal(MANAGER) + r"\t")
     receipt = {}
     for file in FIXTURES:
+        ui.checkpoint("open_read_only_program", file)
         title = ui.open_program(file, read_only=True)
         ui.call("fit", literal(title))
+        ui.checkpoint("open_references", file)
         ui.go("F000:010D")
         ui.direct("right", "field", "(?i:ram:f000:010d)")
         ui.click("JMenu", "References")
         ui.click("DockingMenuItem", "Add/Edit...")
+        ui.checkpoint("inspect_references", file)
         reference = r"References Editor @ ram:f000:010d .*"
         view = ui.wait(r"^ACTIVE\t" + reference + r"\t")
         rows = rows_at(view, "ram:2000:0069", "UNCONDITIONAL_CALL", "DEFAULT")
@@ -209,6 +247,7 @@ def stage_reopen(ui):
         if file == "bank-fe.ws":
             rows_at(view, "ROM0_BANK_00FE::020069", "CALL_OVERRIDE_UNCONDITIONAL", "ANALYSIS")
             assert len(overrides) == 1
+            ui.checkpoint("inspect_decompiler", file)
             ui.call("focus", literal(title))
             ui.go("ROM0_BANK_00FE::020069")
             ui.wait(r"^field\tAL,0x42\t")
@@ -220,8 +259,10 @@ def stage_reopen(ui):
         else:
             assert not overrides
         receipt[file] = record
+        ui.checkpoint("close_program", file)
         ui.call("focus", literal(title))
         ui.choose("File", "Close Tool")
+    ui.checkpoint("exit_ghidra")
     ui.exit_ghidra(MANAGER)
     return receipt
 
@@ -243,6 +284,7 @@ def main():
             raise TimeoutError("Native AWT Robot did not initialize")
         time.sleep(0.2)
     pid = int(ready.read_text())
+    ui.checkpoint("startup")
     if args.phase == "import":
         data = stage_import(ui, args.fixture_dir, args.project_dir, args.report)
     else:
@@ -251,4 +293,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except VisibleEvidenceTimeout:
+        traceback.print_exc()
+        raise SystemExit(EVIDENCE_TIMEOUT)
+    except TimeoutError:
+        traceback.print_exc()
+        raise SystemExit(TRANSPORT_TIMEOUT)

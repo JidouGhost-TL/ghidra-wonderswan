@@ -12,7 +12,10 @@ import subprocess
 import sys
 import time
 
-from exercise import FIXTURES, PROJECT, VISIBLE_STORE
+from exercise import (
+    CHECKPOINT_FILE, CHECKPOINTS, EVIDENCE_TIMEOUT, FIXTURE_CHECKPOINTS, FIXTURES, PROJECT,
+    TRANSPORT_TIMEOUT, VISIBLE_STORE,
+)
 
 here = Path(__file__).resolve().parent
 sys.path.insert(0, str(here.parent))
@@ -29,7 +32,38 @@ class Diagnostic(rehearse.Diagnostic):
         record = {"platform": self.platform, "stage": self.stage, "status": status}
         if reason is not None:
             record["reason"] = reason
+        if self.item is not None:
+            record["checkpoint"] = self.item
         emit("PUBLIC_GHIDRA_GUI_STAGE", record)
+
+    def fail(self, error):
+        if isinstance(error, GuiDriverFailure):
+            self.emit("failed", error.reason)
+        else:
+            super().fail(error)
+
+
+class GuiDriverFailure(RuntimeError):
+    def __init__(self, returncode):
+        super().__init__("GUI driver exited unsuccessfully")
+        self.reason = {
+            EVIDENCE_TIMEOUT: "visible_evidence_timeout",
+            TRANSPORT_TIMEOUT: "gui_transport_timeout",
+        }.get(returncode, "gui_driver_exit")
+
+
+def read_checkpoint(control, phase):
+    try:
+        with (control / CHECKPOINT_FILE).open("rb") as stream:
+            value = stream.read(81).decode("ascii")
+    except (OSError, UnicodeError):
+        return None
+    if len(value) > 80:
+        return None
+    step, separator, fixture = value.partition(" ")
+    if separator:
+        return value if step in FIXTURE_CHECKPOINTS[phase] and fixture in FIXTURES else None
+    return step if step in CHECKPOINTS[phase] else None
 
 
 def require(condition, message):
@@ -123,16 +157,28 @@ def phase_run(phase, output, ghidra, agent, projects, env, session, diagnostic):
             require(console_session(child.pid) == session, "Foreground console changed session")
             verify_foreground_console(child, control, env, output / (phase + "-console.log"), session)
             diagnostic.begin("gui_import_save" if phase == "import" else "gui_readonly_reopen")
-            rehearse.run([sys.executable, "-B", here / "exercise.py", phase, control, proof,
-                          "--fixture-dir", output / "roms", "--project-dir", projects,
-                          "--report", output / "observed.jsonl"],
-                         env, output / (phase + "-driver.log"), timeout=600)
+            try:
+                rehearse.run([sys.executable, "-B", here / "exercise.py", phase, control, proof,
+                              "--fixture-dir", output / "roms", "--project-dir", projects,
+                              "--report", output / "observed.jsonl"],
+                             env, output / (phase + "-driver.log"), timeout=600)
+            except subprocess.CalledProcessError as error:
+                diagnostic.item = read_checkpoint(control, phase)
+                raise GuiDriverFailure(error.returncode) from error
+            except subprocess.TimeoutExpired:
+                diagnostic.item = read_checkpoint(control, phase)
+                raise
+            diagnostic.begin("gui_" + phase + "_exit")
             require(child.wait(timeout=45) == 0, "Foreground Ghidra did not exit cleanly")
-        finally:
-            if child.poll() is None:
-                subprocess.run([str(system / "taskkill.exe"), "/pid", str(child.pid), "/t", "/f"],
-                               stdout=log, stderr=subprocess.STDOUT, timeout=30, check=True)
-                child.wait(timeout=30)
+        except BaseException as failure:
+            try:
+                if child.poll() is None:
+                    subprocess.run([str(system / "taskkill.exe"), "/pid", str(child.pid), "/t", "/f"],
+                                   stdout=log, stderr=subprocess.STDOUT, timeout=30, check=True)
+                    child.wait(timeout=30)
+            except (OSError, subprocess.SubprocessError) as cleanup:
+                failure.add_note(f"Owned launcher cleanup failed: {type(cleanup).__name__}")
+            raise
     return json.loads(proof.read_bytes())
 
 
