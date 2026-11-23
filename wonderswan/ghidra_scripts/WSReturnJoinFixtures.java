@@ -3,25 +3,34 @@ import java.io.ByteArrayInputStream;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HexFormat;
+import java.util.Map;
 
 import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.cmd.function.CreateFunctionCmd;
+import ghidra.app.decompiler.ClangFieldToken;
+import ghidra.app.decompiler.ClangNode;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.script.GhidraScript;
 import ghidra.program.database.ProgramDB;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.address.SegmentedAddressSpace;
+import ghidra.program.model.data.Structure;
 import ghidra.program.model.data.WordDataType;
+import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FlowOverride;
 import ghidra.program.model.listing.VariableStorage;
 import ghidra.program.model.pcode.PcodeOp;
+import ghidra.program.model.pcode.SequenceNumber;
 import ghidra.program.model.symbol.SourceType;
 import jidoughost.wonderswan.WSReturns;
 
-/** R1b direct-jump continuation and unchanged control receivers. */
+/** R1b direct-jump continuation and joined return layout. */
 public class WSReturnJoinFixtures extends GhidraScript {
+    private record JoinedResult(String storage, Map<Integer, String> fields) {}
+
     private int checks;
 
     private void check(boolean ok, String message) {
@@ -43,6 +52,11 @@ public class WSReturnJoinFixtures extends GhidraScript {
     }
 
     private void exercise(String name, String continuation, String body, boolean expected, boolean explicit) throws Exception {
+        exercise(name, continuation, body, expected, explicit, null);
+    }
+
+    private void exercise(String name, String continuation, String body, boolean expected, boolean explicit,
+            JoinedResult joined) throws Exception {
         byte[] bytes = new byte[0x200];
         Arrays.fill(bytes, (byte) 0xcc);
         write(bytes, 0x40, "b91000a10021e8b700" + continuation);
@@ -87,7 +101,12 @@ public class WSReturnJoinFixtures extends GhidraScript {
             WSReturns.apply(p, evidence::add, monitor);
             String actual = leaf.getReturn().getVariableStorage().toString();
             println(name + " storage " + actual + " " + evidence);
-            check(actual.equals("AX:2") == expected, name + " claimed AX output " + actual);
+            if (joined == null) {
+                check(actual.equals("AX:2") == expected, name + " claimed AX output " + actual);
+            } else {
+                check(actual.equals(joined.storage()), name + " ordered return storage " + actual);
+                verifyFields(p, leaf, name, joined.fields());
+            }
             if (name.equals("popped-input") || name.equals("frame-address") || name.equals("stack-segment-address")) {
                 check(!leaf.hasCustomVariableStorage() && leaf.getParameterCount() == 0,
                     name + " native signature remains open");
@@ -100,7 +119,9 @@ public class WSReturnJoinFixtures extends GhidraScript {
             if (expected) {
                 check(leaf.getParameterCount() == 1 && leaf.getParameter(0).getVariableStorage().toString().equals("AX:2"),
                     name + " one actual AX input");
-                verifyCaller(p, name);
+            }
+            if (expected || joined != null) {
+                verifyCaller(p, name, joined);
                 evidence.clear();
                 WSReturns.apply(p, evidence::add, monitor);
                 check(evidence.stream().noneMatch(line -> line.contains("\"outcome\":\"SET\"")), name + " stable replay");
@@ -114,7 +135,25 @@ public class WSReturnJoinFixtures extends GhidraScript {
         }
     }
 
-    private void verifyCaller(ProgramDB p, String name) {
+    private void verifyFields(ProgramDB p, Function leaf, String name, Map<Integer, String> expected) {
+        check(leaf.getReturnType() instanceof Structure, name + " joined return structure");
+        var type = (Structure) leaf.getReturnType();
+        check(type.getLength() == leaf.getReturn().getVariableStorage().size(), name + " joined width");
+        var observed = new HashMap<Integer, String>();
+        for (var field : type.getDefinedComponents()) {
+            observed.put(field.getOffset(), field.getFieldName());
+        }
+        check(observed.equals(expected), name + " structure fields by offset " + observed);
+        String shape = String.join("_", Arrays.stream(type.getDefinedComponents())
+            .map(f -> f.getFieldName().substring("out_".length())).toList());
+        check(type.getName().equals("result_joined_" + shape), name + " type name follows field offsets");
+        for (var field : type.getDefinedComponents()) {
+            var register = p.getRegister(field.getFieldName().substring("out_".length()));
+            check(field.getLength() == register.getMinimumByteSize(), name + " width of " + field.getFieldName());
+        }
+    }
+
+    private void verifyCaller(ProgramDB p, String name, JoinedResult joined) {
         var decompiler = new DecompInterface();
         try {
             check(decompiler.openProgram(p), "open synthetic caller");
@@ -125,6 +164,36 @@ public class WSReturnJoinFixtures extends GhidraScript {
             while (ops.hasNext()) {
                 var op = ops.next();
                 if (op.getOpcode() != PcodeOp.CALL) continue;
+                if (joined != null) {
+                    var leaf = p.getFunctionManager().getFunctionAt(at(p, 0x100));
+                    check(op.getOutput() != null && op.getOutput().getSize() == leaf.getReturnType().getLength(),
+                        name + " joined CALL output width");
+                    var numeric = new HashMap<Integer, String>();
+                    var slices = new HashMap<SequenceNumber, Integer>();
+                    for (var uses = op.getOutput().getDescendants(); uses.hasNext();) {
+                        var use = uses.next();
+                        if (use.getOpcode() != PcodeOp.SUBPIECE || !use.getInput(1).isConstant()) continue;
+                        var register = p.getRegister(use.getOutput().getAddress(), use.getOutput().getSize());
+                        check(register != null, name + " joined slice reaches an exact register");
+                        int offset = (int) use.getInput(1).getOffset();
+                        check(numeric.put(offset, "out_" + register.getName()) == null, name + " distinct slice offset");
+                        slices.put(use.getSeqnum(), offset);
+                    }
+                    check(numeric.equals(joined.fields()), name + " High register slices " + numeric);
+                    var tokens = new ArrayList<ClangNode>();
+                    result.getCCodeMarkup().flatten(tokens);
+                    var rendered = new HashMap<Integer, String>();
+                    for (var node : tokens) {
+                        if (!(node instanceof ClangFieldToken token) || token.getPcodeOp() == null) continue;
+                        Integer offset = slices.get(token.getPcodeOp().getSeqnum());
+                        if (offset == null) continue;
+                        check(offset == token.getOffset(), name + " field token offset equals its High slice");
+                        check(token.getText().equals(numeric.get(offset)), name + " field token names its High register");
+                        rendered.put(offset, token.getText());
+                    }
+                    check(rendered.equals(numeric), name + " field tokens match High register slices " + rendered);
+                    return;
+                }
                 check(op.getNumInputs() == 2 && op.getOutput() != null && op.getOutput().getSize() == 2,
                     name + " one input and a 16-bit result");
                 var operand = op.getInput(1);
@@ -163,6 +232,11 @@ public class WSReturnJoinFixtures extends GhidraScript {
         exercise("popped-input", join, "53bb78565b891e002383c001c3", false, false);
         exercise("frame-address", join, "530346005bc3", false, false);
         exercise("stack-segment-address", join, "533603075bc3", false, false);
+        // Each register is assigned a distinct constant and stored by the caller.
+        exercise("equal-width-return", "891e0021893e0221c3", "bb1122bf3344c3", false, false,
+            new JoinedResult("BX:2,DI:2", Map.of(0, "out_DI", 2, "out_BX")));
+        exercise("mixed-width-return", "a2002189360221c3", "b011be3344c3", false, false,
+            new JoinedResult("AL:1,SI:2", Map.of(0, "out_SI", 2, "out_AL")));
         println("WSReturnJoinFixtures: PASS checks=" + checks);
     }
 }
