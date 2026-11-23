@@ -72,7 +72,7 @@ class GhidraGui(Session):
         self.click("JButton", name)
 
     def enter_text(self, text):
-        self.call("key", "CONTROL+A")
+        self.call("select-all")
         self.call("paste", text)
 
     def open_program(self, name, read_only=False):

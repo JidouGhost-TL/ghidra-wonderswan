@@ -295,6 +295,8 @@ public class GuiAgent {
 
     private static String command(Robot robot, String request) throws Exception {
         String[] parts = request.split("\t", 3);
+        String editModifier = Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx() == InputEvent.META_DOWN_MASK
+            ? "META" : "CONTROL";
         return switch (parts[0]) {
             case "snapshot" -> String.join("\n", edt(GuiAgent::visible).stream().map(Control::describe).toList());
             case "click", "double", "right" -> {
@@ -339,9 +341,13 @@ public class GuiAgent {
                 chord(robot, parts[1]);
                 yield "";
             }
+            case "select-all" -> {
+                chord(robot, editModifier + "+A");
+                yield "";
+            }
             case "paste" -> {
                 Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(parts[1]), null);
-                chord(robot, System.getProperty("os.name").startsWith("Mac") ? "META+V" : "CONTROL+V");
+                chord(robot, editModifier + "+V");
                 yield "";
             }
             case "capture" -> {

@@ -1,0 +1,36 @@
+name: Public macOS Ghidra GUI rehearsal
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-gui:
+    if: github.repository == 'JidouGhost-TL/ghidra-wonderswan' && github.ref == 'refs/heads/main'
+    name: GUI ${{ matrix.host }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            host: Darwin-arm64
+          - runner: macos-15-intel
+            host: Darwin-x64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: "3.13"
+      - name: Rehearse the published GUI in the foreground
+        shell: bash
+        env:
+          EXPECTED_HOST: ${{ matrix.host }}
+        run: |
+          python -B tools/release-rehearsal/gui/run_macos.py \
+            "$RUNNER_TEMP/ghidra-public-gui" --expected-host "$EXPECTED_HOST"
