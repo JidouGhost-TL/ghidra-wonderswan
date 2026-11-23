@@ -170,7 +170,15 @@ public class GuiAgent {
         if (label != null && !label.isBlank() && component.getWidth() > 0 && component.getHeight() > 0) {
             Rectangle bounds = new Rectangle(0, 0, component.getWidth(), component.getHeight());
             if (!(component instanceof JComponent widget) || widget.getVisibleRect().intersects(bounds)) {
-                rows.add(new Control(type, label, center(component, bounds), bounds, owner));
+                Point point = center(component, bounds);
+                rows.add(new Control(type, label, point, bounds, owner));
+                if (component instanceof JTextComponent text && text.getName() != null) {
+                    rows.add(new Control(type + ":name", text.getName(), point, bounds, owner));
+                    rows.add(new Control(type + ":value:" + text.getName(), label, point, bounds, owner));
+                }
+                if (component instanceof AbstractButton button && button.isEnabled()) {
+                    rows.add(new Control(type + ":enabled", label, point, bounds, owner));
+                }
             }
         }
         if (component instanceof Container parent) {

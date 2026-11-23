@@ -19,9 +19,14 @@ FIXTURES = {
 PROJECT = "portable-gui"
 VISIBLE_STORE = r"uRam00000200 *= *0x42 *;"
 MANAGER = "Ghidra: " + PROJECT
+EMPTY_MANAGER = "Ghidra: NO ACTIVE PROJECT"
+PROJECT_WIZARD = "New Project"
 CHECKPOINT_FILE = "driver-checkpoint.txt"
 CHECKPOINTS = {
-    "import": {"startup", "create_project", "save_project", "exit_ghidra"},
+    "import": {"startup", "create_project", "activate_empty_project_manager", "open_project_file_menu",
+               "open_project_wizard", "activate_project_wizard", "select_project_type",
+               "enter_project_directory", "enter_project_name", "submit_project_wizard",
+               "verify_project_created", "save_project", "exit_ghidra"},
     "reopen": {"startup", "open_saved_project", "exit_ghidra"},
 }
 FIXTURE_CHECKPOINTS = {
@@ -123,6 +128,37 @@ class GhidraGui(Session):
         self.call("key", "ENTER")
 
 
+def create_project(ui, project_dir):
+    ui.checkpoint("activate_empty_project_manager")
+    ui.call("front", literal(EMPTY_MANAGER))
+    ui.wait(r"^ACTIVE\t" + literal(EMPTY_MANAGER) + r"\t")
+    ui.checkpoint("open_project_file_menu")
+    ui.click("JMenu", "File")
+    ui.checkpoint("open_project_wizard")
+    ui.click("DockingMenuItem", "New Project...")
+    window = r"^(?:WINDOW|ACTIVE)\t" + literal(PROJECT_WIZARD) + r"\t"
+    ui.wait(window)
+    ui.checkpoint("activate_project_wizard")
+    ui.call("front", literal(PROJECT_WIZARD))
+    ui.wait(r"^ACTIVE\t" + literal(PROJECT_WIZARD) + r"\t")
+    ui.checkpoint("select_project_type")
+    ui.wait(r"^GRadioButton:checked\tNon-Shared Project=true\t")
+    ui.click("JButton:enabled", "Next >>")
+    ui.checkpoint("enter_project_directory")
+    ui.click("ElidingFilePathTextField:name", "Project Directory")
+    ui.enter_text(project_dir)
+    ui.wait(r"^ElidingFilePathTextField:value:Project Directory\t" + literal(project_dir) + r"\t")
+    ui.checkpoint("enter_project_name")
+    ui.click("JTextField:name", "Project Name")
+    ui.enter_text(PROJECT)
+    ui.wait(r"^JTextField:value:Project Name\t" + literal(PROJECT) + r"\t")
+    ui.checkpoint("submit_project_wizard")
+    ui.click("JButton:enabled", "Finish")
+    ui.checkpoint("verify_project_created")
+    ui.wait(window, present=False)
+    ui.wait(r"^(?:WINDOW|ACTIVE)\t" + literal(MANAGER) + r"\t")
+
+
 def stage_import(ui, fixture_dir, project_dir, report_path):
     ui.wait(r"^(?:ACTIVE|WINDOW)\t")
     start = time.monotonic()
@@ -130,19 +166,10 @@ def stage_import(ui, fixture_dir, project_dir, report_path):
         view = ui.call("snapshot")
         if "JButton\tI Agree\t" in view:
             ui.button("I Agree")
-        if "Ghidra: NO ACTIVE PROJECT" in view:
+        if EMPTY_MANAGER in view:
             break
         time.sleep(0.3)
-    ui.checkpoint("create_project")
-    ui.call("focus", literal("Ghidra: NO ACTIVE PROJECT"))
-    ui.choose("File", "New Project...")
-    ui.button("Next >>")
-    ui.direct("click", "ElidingFilePathTextField", ".*")
-    ui.enter_text(project_dir)
-    ui.direct("click", "JTextField", r"\(empty\)")
-    ui.call("paste", PROJECT)
-    ui.button("Finish")
-    ui.wait(r"^(?:WINDOW|ACTIVE)\t" + literal(MANAGER) + r"\t")
+    create_project(ui, project_dir)
     summary = {}
     for file, sha in FIXTURES.items():
         ui.checkpoint("open_import_chooser", file)
