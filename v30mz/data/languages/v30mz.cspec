@@ -262,4 +262,23 @@
       <register name="DF"/>
     </unaffected>
   </prototype>
+  <!-- R1c: a proved near leaf has one ES input and preserves incoming AX. -->
+  <prototype name="__wsasm_near_ax_preserved" extrapop="2" stackshift="2" strategy="register">
+    <input>
+      <pentry minsize="2" maxsize="2"><register name="ES"/></pentry>
+    </input>
+    <output/>
+    <killedbycall>
+      <register name="BX"/>
+      <register name="CX"/>
+    </killedbycall>
+    <unaffected>
+      <register name="AX"/>
+      <register name="SP"/>
+      <register name="DS"/>
+      <register name="CS"/>
+      <register name="SS"/>
+      <register name="DF"/>
+    </unaffected>
+  </prototype>
 </compiler_spec>

@@ -82,6 +82,14 @@ public final class WSReturns {
         // monotone parameter additions now, rather than on the next trace import.
         int previous;
         do { previous = functions; applyPass(); } while (functions != previous);
+        // Established output signatures take precedence over a void leaf with
+        // proved AX live-through.
+        if (p.getCompilerSpec().getCallingConvention(WSAsmAxLiveThrough.CONVENTION) != null) {
+            for (Function f : p.getFunctionManager().getFunctions(true)) {
+                monitor.checkCancelled();
+                WSAsmAxLiveThrough.apply(f, emit);
+            }
+        }
     }
     void applyPass() throws Exception {
         for (Function f : p.getFunctionManager().getFunctions(true)) {

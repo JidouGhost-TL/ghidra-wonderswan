@@ -296,6 +296,7 @@ public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
             SourceType src = f.getSignatureSource();
             if (src == SourceType.USER_DEFINED || src == SourceType.IMPORTED) { kept++; continue; }
             if (WSLsiLiveThrough.apply(f, cc, emit)) { specialized++; continue; }
+            if (WSAsmAxLiveThrough.reconcileConvention(f, cc, emit)) { specialized++; continue; }
             if (!cc.equals(f.getCallingConventionName())) { f.setCallingConvention(cc); set++; }
         }
         emit.accept(String.format("{\"rule\":\"C1\",\"convention\":\"%s\",\"set\":%d,\"kept_user_or_imported\":%d,\"specialized\":%d}", cc, set, kept, specialized));
