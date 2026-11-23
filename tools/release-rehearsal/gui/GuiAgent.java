@@ -52,6 +52,8 @@ public class GuiAgent {
     private static final String EVIDENCE_ANALYZER = "WonderSwan Execution Evidence";
     private static final String STATIC_OPTION = "Run WSMachine";
     private static final String REPORT_OPTION = "Evidence report file (JSON lines; empty = none)";
+    private static final String ANALYZER_PAGE_NO_FOCUS = "The active analyzer dialog has no keyboard focus owner";
+    private static final String ANALYZER_PAGE_OTHER_CONTROL = "Another control in the active analyzer dialog has focus";
     private static Window preferredWindow;
     private static Window referenceProjectManager;
     private static String referenceProject;
@@ -880,12 +882,47 @@ public class GuiAgent {
         chord(robot, "SPACE");
     }
 
-    private static void requireAnalyzerPageKey(Control control, int key, int direction) {
-        JTable table = (JTable) control.component;
-        if (!control.owner.isActive() || KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner() != table
-                || table.isEditing()) {
-            throw new IllegalStateException("The active analyzer table lacks keyboard focus");
+    private static String analyzerPageFocusProblem(Control control) {
+        var manager = KeyboardFocusManager.getCurrentKeyboardFocusManager();
+        if (!control.owner.isActive() || manager.getActiveWindow() != control.owner) {
+            return "The analyzer dialog lost activation before the page key";
         }
+        if (!(control.component instanceof JTable table) || !table.isShowing() || !isAnalyzerTable(table, control.owner)) {
+            return "The active analyzer dialog no longer owns the table";
+        }
+        if (table.isEditing()) {
+            return "The analyzer table has an active cell editor";
+        }
+        Component focus = manager.getFocusOwner();
+        if (focus == null) {
+            return ANALYZER_PAGE_NO_FOCUS;
+        }
+        if (focus == table) {
+            return null;
+        }
+        return SwingUtilities.getWindowAncestor(focus) == control.owner
+            ? ANALYZER_PAGE_OTHER_CONTROL : "Keyboard focus left the active analyzer dialog";
+    }
+
+    private static void awaitInitialAnalyzerPageFocus(Control control) throws Exception {
+        for (int sample = 0; ; sample++) {
+            String problem = edt(() -> analyzerPageFocusProblem(control));
+            if (problem == null) {
+                return;
+            }
+            if (sample == 12 || !(ANALYZER_PAGE_NO_FOCUS.equals(problem) || ANALYZER_PAGE_OTHER_CONTROL.equals(problem))) {
+                throw new IllegalStateException(problem);
+            }
+            Thread.sleep(100);
+        }
+    }
+
+    private static void requireAnalyzerPageKey(Control control, int key, int direction) {
+        String problem = analyzerPageFocusProblem(control);
+        if (problem != null) {
+            throw new IllegalStateException(problem);
+        }
+        JTable table = (JTable) control.component;
         KeyStroke stroke = KeyStroke.getKeyStroke(key, 0);
         Object binding = table.getInputMap(JComponent.WHEN_FOCUSED).get(stroke);
         if (binding == null) {
@@ -905,6 +942,7 @@ public class GuiAgent {
             Point focus = edt(() -> analyzerFocusPoint(control, name));
             click(robot, focus, 1, InputEvent.BUTTON1_DOWN_MASK);
             robot.waitForIdle();
+            awaitInitialAnalyzerPageFocus(control);
             current = edt(() -> analyzerViewport(control, name));
             if (!initial.equals(current.visible)) {
                 throw new IllegalStateException("The analyzer viewport changed while acquiring keyboard focus");
@@ -920,8 +958,13 @@ public class GuiAgent {
             int direction = current.target.y < current.visible.y ? -1 : 1;
             if (pageKeys) {
                 int key = direction > 0 ? KeyEvent.VK_PAGE_DOWN : KeyEvent.VK_PAGE_UP;
+                AnalyzerViewport planned = current;
                 edt(() -> {
                     requireAnalyzerPageKey(control, key, direction);
+                    AnalyzerViewport measured = analyzerViewport(control, name);
+                    if (!planned.visible.equals(measured.visible) || !planned.target.equals(measured.target)) {
+                        throw new IllegalStateException("The analyzer viewport or target changed before the page key");
+                    }
                     return null;
                 });
                 robot.keyPress(key);

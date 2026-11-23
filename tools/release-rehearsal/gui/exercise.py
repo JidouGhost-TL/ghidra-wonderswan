@@ -87,6 +87,13 @@ ANALYZER_REVEAL_FAILURES = {
     33: ("analyzer_page_stationary", "Analyzer page key did not move the active table"),
     34: ("analyzer_page_wrong_direction", "Analyzer page key moved the active table away from the target"),
     35: ("analyzer_page_focus_moved", "The analyzer viewport changed while acquiring keyboard focus"),
+    70: ("analyzer_page_owner_inactive", "The analyzer dialog lost activation before the page key"),
+    71: ("analyzer_page_table_unowned", "The active analyzer dialog no longer owns the table"),
+    72: ("analyzer_page_cell_editing", "The analyzer table has an active cell editor"),
+    73: ("analyzer_page_focus_absent", "The active analyzer dialog has no keyboard focus owner"),
+    74: ("analyzer_page_sibling_focus", "Another control in the active analyzer dialog has focus"),
+    75: ("analyzer_page_external_focus", "Keyboard focus left the active analyzer dialog"),
+    76: ("analyzer_page_viewport_changed", "The analyzer viewport or target changed before the page key"),
 }
 REFERENCE_KEY_INPUT_REFUSED = "reference_key_input_refused"
 REFERENCE_RECOVERABLE_FOREGROUND = {"reference_foreground_project_manager"}
