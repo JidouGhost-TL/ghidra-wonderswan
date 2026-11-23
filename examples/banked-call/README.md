@@ -4,7 +4,15 @@ This exercise uses three original 128 KiB WonderSwan cartridges that you generat
 
 ## Set up
 
-Install Ghidra 12.1.3 and JDK 21. Download both extension ZIPs and check them against `SHA256SUMS`. In the Ghidra project window, choose **File → Install Extensions**, add V30MZ first and WonderSwan second, enable both and restart. The headless launcher uses the same user installation. For the commands below, use a shell with Python 3 and point `GHIDRA_INSTALL_DIR` at the Ghidra distribution. Run them from the extension source checkout. [Extension v0.1.0 downloads](https://github.com/JidouGhost-TL/ghidra-wonderswan/releases/tag/v0.1.0) · [Installation guide](https://github.com/JidouGhost-TL/ghidra-wonderswan/wiki/Installation)
+Install Ghidra 12.1.3 and JDK 21. Download the V30MZ and WonderSwan ZIPs from the extension v0.1.0 release and check both files against the release checksum list. In the Ghidra project window, choose **File → Install Extensions**, add V30MZ first and WonderSwan second, enable both and restart. The headless launcher uses the same user installation. [Ghidra 12.1.3](https://github.com/NationalSecurityAgency/ghidra/releases/tag/Ghidra_12.1.3_build) · [Extension v0.1.0 downloads](https://github.com/JidouGhost-TL/ghidra-wonderswan/releases/tag/v0.1.0) · [Release SHA256SUMS](https://github.com/JidouGhost-TL/ghidra-wonderswan/releases/download/v0.1.0/SHA256SUMS) · [Installation guide](https://github.com/JidouGhost-TL/ghidra-wonderswan/wiki/Installation)
+
+Get the example scripts from the source checkout. The result table uses the released v0.1.0 extensions and the example files at the revision below. Use a shell with Git and Python 3 and point `GHIDRA_INSTALL_DIR` at the installed Ghidra distribution.
+
+```sh
+git clone https://github.com/JidouGhost-TL/ghidra-wonderswan.git
+cd ghidra-wonderswan
+git checkout --detach cd774aee301bf0e9afc24e33406987673dd6d75b
+```
 
 ```sh
 example="$PWD/examples/banked-call"
@@ -64,7 +72,7 @@ head -13 "$run/trace.tsv"
 
 The trace enters `2000:0069` at instruction 9. The far return at instruction 11 returns to `F000:0112` with SP restored to `0x3000` at instruction 12. The marker should match the table.
 
-To check the runtime result with a separate emulator, use the repository's Mesen 2 trace runner with Docker.
+To check the runtime result with a separate emulator, use the repository's Mesen 2 trace runner with Docker. The first invocation builds its container image.
 
 ```sh
 tools/mesen2/run-trace.sh "$workdir/roms/$sample.ws" "$workdir/$sample-reference" 1 32 0
