@@ -108,21 +108,15 @@ public final class WSAsmAxLiveThrough {
             Address fallThrough = ins.getFallThrough();
             if (fallThrough == null || !body.contains(fallThrough)) return List.of();
 
-            // A zero-count repeat can skip its register writes. Do not use those
-            // writes as definitions for another instruction.
-            boolean repeat = mnemonic.equals("MOVSB.REP") || mnemonic.equals("MOVSW.REP");
-            Set<Address> current = repeat ? new HashSet<>(definitions) : definitions;
             for (PcodeOp op : ins.getPcode()) {
                 switch (op.getOpcode()) {
                     case PcodeOp.CALLOTHER -> {
                         if (!"segment".equals(program.getLanguage().getUserDefinedOpName((int) op.getInput(0).getOffset())))
                             return List.of();
                     }
-                    case PcodeOp.BRANCH, PcodeOp.CBRANCH -> {
-                        Address target = op.getInput(0).getAddress();
-                        if (!repeat || !target.equals(ins.getAddress()) && !target.equals(fallThrough)) return List.of();
-                    }
-                    case PcodeOp.CALL, PcodeOp.CALLIND, PcodeOp.BRANCHIND, PcodeOp.RETURN -> { return List.of(); }
+                    // Unproved memory stores can change the saved IP through an alias.
+                    case PcodeOp.STORE, PcodeOp.BRANCH, PcodeOp.CBRANCH, PcodeOp.CALL,
+                            PcodeOp.CALLIND, PcodeOp.BRANCHIND, PcodeOp.RETURN -> { return List.of(); }
                     default -> { }
                 }
                 for (var input : op.getInputs()) {
@@ -131,18 +125,19 @@ public final class WSAsmAxLiveThrough {
                     if (r == null || IMPLICIT_READS.contains(r.getName())) continue;
                     if (FRAME.contains(r.getName()) || ax.equals(r) || ax.contains(r) || r.contains(ax)) return List.of();
                     for (int i = 0; i < input.getSize(); i++) {
-                        if (current.contains(input.getAddress().add(i))) continue;
+                        if (definitions.contains(input.getAddress().add(i))) continue;
                         if (!r.getName().equals("ES")) return List.of();
                         esInput = true;
                     }
                 }
                 var output = op.getOutput();
+                if (output != null && output.getAddress().isMemoryAddress()) return List.of();
                 Register r = register(function, output);
                 if (output != null && output.isRegister() && r == null) return List.of();
                 if (r != null) {
                     if (FRAME.contains(r.getName()) || r.getName().equals("ES")
                             || ax.equals(r) || ax.contains(r) || r.contains(ax)) return List.of();
-                    for (int i = 0; i < output.getSize(); i++) current.add(output.getAddress().add(i));
+                    for (int i = 0; i < output.getSize(); i++) definitions.add(output.getAddress().add(i));
                 }
             }
             ins = listing.getInstructionAt(fallThrough);

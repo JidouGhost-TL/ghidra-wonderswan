@@ -56,6 +56,7 @@ public class WSAxLiveThroughFixtures extends GhidraScript {
             var context = program.getProgramContext();
             context.setValue(program.getRegister("csval"), at(program, 0), at(program, bytes.length - 1), BigInteger.valueOf(0x4000));
             context.setValue(program.getRegister("DS"), at(program, 0), at(program, bytes.length - 1), BigInteger.ZERO);
+            context.setValue(program.getRegister("SS"), at(program, 0), at(program, bytes.length - 1), BigInteger.ZERO);
             for (int start : new int[] {0x100, 0x40}) {
                 check(new DisassembleCommand(at(program, start), null, true).applyTo(program, monitor), name + " disassembly");
                 check(new CreateFunctionCmd(at(program, start)).applyTo(program, monitor), name + " creation");
@@ -134,18 +135,23 @@ public class WSAxLiveThroughFixtures extends GhidraScript {
     }
 
     @Override public void run() throws Exception {
+        String read = "268b0e0021";
+        String leaf = read + "c3";
         String rep = "b90200be0010bf0020f3a5c3";
         String plain = "e8b500";
-        test("es-copy", rep, plain, true, null);
-        test("low-byte-clobber", "b07f" + rep, plain, false, null);
-        test("other-input", "89debf0020b90200f3a5c3", plain, false, null);
-        test("return-frame", "535b" + rep, plain, false, null);
-        test("interrupt", "cd20" + rep, plain, false, null);
-        test("fall-through", rep, plain, false, null);
-        test("wrong-call-frame", rep, "9a00010040", false, null);
+        test("es-read", leaf, plain, true, null);
+        test("repeat-store", rep, plain, false, null);
+        test("direct-saved-ip-alias", read + "c706fe7f5000c3", plain, false, null);
+        test("segmented-store", read + "26c706fe7f5000c3", plain, false, null);
+        test("low-byte-clobber", "b07f" + leaf, plain, false, null);
+        test("other-input", "89de" + leaf, plain, false, null);
+        test("return-frame", "535b" + leaf, plain, false, null);
+        test("interrupt", "cd20" + leaf, plain, false, null);
+        test("fall-through", leaf, plain, false, null);
+        test("wrong-call-frame", leaf, "9a00010040", false, null);
         test("genuine-other-result", "8cc1c3", plain, false, null);
-        test("explicit", rep, plain, false, SourceType.USER_DEFINED);
-        test("imported", rep, plain, false, SourceType.IMPORTED);
+        test("explicit", leaf, plain, false, SourceType.USER_DEFINED);
+        test("imported", leaf, plain, false, SourceType.IMPORTED);
         println("WSAxLiveThroughFixtures: PASS checks=" + checks);
     }
 }

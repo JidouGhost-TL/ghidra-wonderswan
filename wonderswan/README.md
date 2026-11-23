@@ -263,10 +263,10 @@ storage take precedence.
 The raw p-code proof requires an ES read before definition as the sole explicit register
 input. Reads of CS, DS and DF are treated as architectural context. Outside the final
 `RET`, any AX access, including AL or AH, excludes the body. Stack and frame accesses,
-writes to ES or to the tracked architectural context, calls, interrupts, computed control
-flow, flow overrides, and user operations other than segment address construction also
-exclude it. A repeat byte or word copy may loop to itself or exit at its fall-through.
-The proof treats its register writes as optional because the repeat count can be zero.
+writes to ES or to the tracked architectural context, calls, interrupts, control transfers,
+flow overrides, and user operations other than segment address construction also exclude it.
+The body must have no memory stores or direct writes to memory or port addresses. Even an
+ordinary data-segment store can alias the saved return IP when segment ranges overlap.
 
 The resulting `__wsasm_near_ax_preserved` convention models the two-byte near return frame.
 It declares AX, SP, DS, CS, SS and DF unaffected and still treats BX and CX as clobbered.
