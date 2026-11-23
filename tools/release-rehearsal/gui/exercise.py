@@ -22,6 +22,10 @@ MANAGER = "Ghidra: " + PROJECT
 EMPTY_MANAGER = "Ghidra: NO ACTIVE PROJECT"
 PROJECT_WIZARD = "New Project"
 CHECKPOINT_FILE = "driver-checkpoint.txt"
+SUMMARY_REFUSALS = {
+    "summary_changed", "summary_rows_missing", "summary_other_fixture", "summary_other_digest",
+    "summary_digest_missing", "summary_wrong_format", "summary_viewport_limited", "summary_scroll_ignored",
+}
 CHECKPOINTS = {
     "import": {"startup", "create_project", "activate_empty_project_manager", "open_project_file_menu",
                "open_project_wizard", "activate_project_wizard", "select_project_type",
@@ -39,6 +43,7 @@ FIXTURE_CHECKPOINTS = {
                "focus_import_confirmation", "deliver_import_confirmation", "dismiss_import_options",
                "show_import_summary", "activate_import_summary", "verify_import_summary_sha",
                "verify_import_summary_metadata", "capture_import_summary", "import_error_dialog",
+               "prepare_import_summary", *SUMMARY_REFUSALS,
                "open_program", "await_prior_import_summary_dismissal", "activate_project_tree",
                "verify_project_file_row", "open_project_file_row", "await_fresh_codebrowser",
                "dismiss_optional_plugin_prompt", "await_fresh_analyze_prompt", "verify_fresh_analyze_prompt",
@@ -278,6 +283,12 @@ def confirm_second_windows_import(ui, import_dialog, fixture, digest):
     ui.checkpoint("activate_import_summary", fixture)
     ui.call("front", literal(summary))
     ui.wait(r"^ACTIVE\t" + literal(summary) + r"\t", import_fixture=fixture)
+    ui.checkpoint("prepare_import_summary", fixture)
+    outcome = ui.call("prepare-import-summary", digest, FIXTURES["bank-fe.ws"])
+    if outcome != "summary_ready":
+        if outcome in SUMMARY_REFUSALS:
+            ui.checkpoint(outcome, fixture)
+        raise RuntimeError("The stock import summary could not present the required metadata")
     ui.checkpoint("verify_import_summary_sha", fixture)
     ui.wait(r"^JTextField\t" + digest + r"\t", active_dialog=summary, import_fixture=fixture)
     ui.checkpoint("verify_import_summary_metadata", fixture)

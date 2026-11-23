@@ -34,7 +34,9 @@ import javax.swing.JComboBox;
 import javax.swing.JLabel;
 import javax.swing.JList;
 import javax.swing.JProgressBar;
+import javax.swing.JScrollPane;
 import javax.swing.JTable;
+import javax.swing.JTextField;
 import javax.swing.JTree;
 import javax.swing.KeyStroke;
 import javax.swing.SwingUtilities;
@@ -365,11 +367,142 @@ public class GuiAgent {
             !dialog.isShowing() || !dialog.isActive() || !active.bounds.equals(dialog.getBounds())) {
             return false;
         }
-        var controls = new ArrayList<Control>();
-        collect(active.owner, controls, active.owner);
-        var fields = controls.stream().filter(control -> "JTextField".equals(control.role))
-            .map(Control::name).toList();
-        return fields.contains(digest) && fields.contains("WonderSwan Cartridge");
+        ImportMetadata fields = importMetadata(dialog);
+        return fields != null && digest.equals(fields.sha.getText()) &&
+            "WonderSwan Cartridge".equals(fields.format.getText()) && fields.fullyVisible();
+    }
+
+    private record ImportMetadata(JScrollPane pane, JTextField shaLabel, JTextField sha,
+                                  JTextField formatLabel, JTextField format) {
+        List<JTextField> fields() {
+            return List.of(shaLabel, sha, formatLabel, format);
+        }
+
+        private static Rectangle glyphBounds(JTextField field) {
+            var insets = field.getInsets();
+            int width = field.getFontMetrics(field.getFont()).stringWidth(field.getText());
+            return new Rectangle(insets.left, 0, width + 1, field.getHeight());
+        }
+
+        Rectangle textBounds() {
+            Rectangle bounds = null;
+            for (JTextField field : fields()) {
+                var rendered = SwingUtilities.convertRectangle(field, glyphBounds(field), pane.getViewport().getView());
+                bounds = bounds == null ? rendered : bounds.union(rendered);
+            }
+            return bounds;
+        }
+
+        boolean fullyVisible() {
+            return pane.getViewport().getViewRect().contains(textBounds()) && fields().stream()
+                .allMatch(field -> field.isShowing() && field.getVisibleRect().contains(glyphBounds(field)));
+        }
+    }
+
+    private static ImportMetadata importMetadata(Dialog dialog) {
+        var matches = new ArrayList<ImportMetadata>();
+        findImportMetadata(dialog, matches);
+        return matches.size() == 1 ? matches.getFirst() : null;
+    }
+
+    private static void findImportMetadata(Component component, List<ImportMetadata> matches) {
+        if (component instanceof JScrollPane pane && pane.isShowing() &&
+            pane.getViewport() != null &&
+            pane.getViewport().getView() instanceof Container rows) {
+            // The stock metadata pane contains alternating label and value text fields.
+            JTextField shaLabel = null, sha = null, formatLabel = null, format = null;
+            Component[] fields = rows.getComponents();
+            for (int i = 0; i + 1 < fields.length; i += 2) {
+                if (fields[i] instanceof JTextField label && fields[i + 1] instanceof JTextField value) {
+                    switch (label.getText()) {
+                        case "Executable SHA256:" -> {
+                            if (sha != null) {
+                                return;
+                            }
+                            shaLabel = label;
+                            sha = value;
+                        }
+                        case "Executable Format:" -> {
+                            if (format != null) {
+                                return;
+                            }
+                            formatLabel = label;
+                            format = value;
+                        }
+                    }
+                }
+            }
+            if (sha != null && format != null) {
+                matches.add(new ImportMetadata(pane, shaLabel, sha, formatLabel, format));
+            }
+        }
+        if (component instanceof Container container) {
+            for (Component child : container.getComponents()) {
+                findImportMetadata(child, matches);
+            }
+        }
+    }
+
+    private static String prepareImportSummary(Robot robot, String expected, String otherFixture) throws Exception {
+        Control active = find("ACTIVE", IMPORT_SUMMARY);
+        record ScrollState(String outcome, Point point, int rotations, int position) {}
+        int previous = Integer.MIN_VALUE;
+        for (int attempt = 0; attempt <= 48; attempt++) {
+            ScrollState state = edt(() -> {
+                if (!(active.owner instanceof Dialog dialog) || !dialog.isActive() ||
+                    !dialog.isShowing() || !IMPORT_SUMMARY.equals(dialog.getTitle())) {
+                    return new ScrollState("summary_changed", null, 0, 0);
+                }
+                ImportMetadata fields = importMetadata(dialog);
+                if (fields == null) {
+                    return new ScrollState("summary_rows_missing", null, 0, 0);
+                }
+                String digest = fields.sha.getText();
+                if (!expected.equals(digest)) {
+                    String outcome = otherFixture.equals(digest) ? "summary_other_fixture" :
+                        digest.matches("[0-9a-fA-F]{64}") ? "summary_other_digest" : "summary_digest_missing";
+                    return new ScrollState(outcome, null, 0, 0);
+                }
+                if (!"WonderSwan Cartridge".equals(fields.format.getText())) {
+                    return new ScrollState("summary_wrong_format", null, 0, 0);
+                }
+                if (fields.fullyVisible()) {
+                    return new ScrollState("summary_ready", null, 0, 0);
+                }
+                var viewport = fields.pane.getViewport();
+                Rectangle visible = viewport.getViewRect();
+                Rectangle wanted = fields.textBounds();
+                if (wanted.height > visible.height || wanted.x < visible.x ||
+                    wanted.x + wanted.width > visible.x + visible.width) {
+                    return new ScrollState("summary_viewport_limited", null, 0, 0);
+                }
+                int delta = wanted.y < visible.y ? wanted.y - visible.y :
+                    wanted.y + wanted.height - visible.y - visible.height;
+                int direction = Integer.signum(delta);
+                int increment = Math.max(1, fields.pane.getVerticalScrollBar().getUnitIncrement(direction));
+                int turns = Math.min(8, Math.max(1, Math.abs(delta) / increment / 3));
+                Point point = center(viewport, new Rectangle(0, 0, viewport.getWidth(), viewport.getHeight()));
+                Rectangle screen = dialog.getGraphicsConfiguration().getBounds();
+                if (direction == 0 || !dialog.getBounds().contains(point) || !screen.contains(point)) {
+                    return new ScrollState("summary_viewport_limited", null, 0, 0);
+                }
+                return new ScrollState(null, point, direction * turns, visible.y);
+            });
+            if (state.outcome != null) {
+                return state.outcome;
+            }
+            if (state.position == previous) {
+                return "summary_scroll_ignored";
+            }
+            if (attempt == 48) {
+                break;
+            }
+            previous = state.position;
+            robot.mouseMove(state.point.x, state.point.y);
+            robot.mouseWheel(state.rotations);
+            robot.waitForIdle();
+        }
+        return "summary_viewport_limited";
     }
 
     private static boolean isProjectDataTree(Component component) {
@@ -511,6 +644,12 @@ public class GuiAgent {
                 Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(parts[1]), null);
                 chord(robot, editModifier + "+V");
                 yield "";
+            }
+            case "prepare-import-summary" -> {
+                if (!parts[1].matches("[0-9a-f]{64}") || !parts[2].matches("[0-9a-f]{64}")) {
+                    throw new IllegalArgumentException("Expected pinned import fixture digests");
+                }
+                yield prepareImportSummary(robot, parts[1], parts[2]);
             }
             case "capture", "capture-import-summary" -> {
                 boolean importSummary = parts[0].equals("capture-import-summary");
