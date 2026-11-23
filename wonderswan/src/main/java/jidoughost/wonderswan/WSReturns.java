@@ -412,9 +412,20 @@ public final class WSReturns {
         if (outputs.size() == 1) result = type(outputs.get(0));
         else {
             String shape = String.join("_", outputs.stream().map(Register::getName).toList());
-            StructureDataType st = new StructureDataType(new CategoryPath("/WonderSwan/Registers"), "result_" + shape, 0);
-            for (Register r : outputs) st.add(type(r), "out_" + r.getName(), null);
-            result = st;
+            CategoryPath category = new CategoryPath("/WonderSwan/Registers");
+            // The native join receives VariableStorage pieces from most to least significant.
+            // Little-endian structure offsets start at the least significant byte.
+            StructureDataType st = new StructureDataType(category, "result_joined_" + shape, 0);
+            List<Register> fields = p.getLanguage().isBigEndian() ? outputs : outputs.reversed();
+            for (Register r : fields) st.add(type(r), "out_" + r.getName(), null);
+            // Keep the legacy type intact, including references outside this analysis.
+            DataType existing = p.getDataTypeManager().getDataType(category, st.getName());
+            if (existing != null && !st.isEquivalent(existing)) {
+                emit.accept(String.format("{\"rule\":\"R1b\",\"function\":\"%s\",\"outcome\":\"VETO_RESULT_LAYOUT\"}",
+                    f.getEntryPoint()));
+                return;
+            }
+            result = existing == null ? st : existing;
         }
         VariableStorage storage = new VariableStorage(p, outputs.toArray(new Register[0]));
         if (storage.size() != bytes || result.getLength() != bytes) throw new IllegalStateException("R1b result size mismatch");
