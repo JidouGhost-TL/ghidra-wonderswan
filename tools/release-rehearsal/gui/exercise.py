@@ -51,6 +51,7 @@ FIXTURE_CHECKPOINTS = {
                "await_analyze_prompt_dismissal", "await_analysis_options", "activate_analysis_options",
                "verify_analyzer_table", "reveal_evidence_analyzer", "select_evidence_analyzer",
                "verify_evidence_analyzer_selected", "verify_run_wsmachine", "set_evidence_report",
+               "verify_default_run_wsmachine", "toggle_static_wsmachine", "await_static_wsmachine_off",
                "verify_evidence_report", "apply_analysis_options", "verify_applied_analysis_options",
                "submit_analysis_options", "await_analysis_options_dismissal",
                "wait_for_analysis", "save_program", "set_read_only"},
@@ -243,6 +244,18 @@ class GhidraGui(Session):
             raise RuntimeError("Expected exactly one matching editor in the active Analysis Options")
         return editors[0][1], editors[0][-1].split(",")
 
+    def await_static_wsmachine_off(self):
+        deadline = time.monotonic() + 8
+        while True:
+            state, _ = self.scoped_analysis_option("Run WSMachine", "PropertyBoolean:checked")
+            if state.endswith("=false"):
+                return
+            if not state.endswith("=true"):
+                raise RuntimeError("Static WSMachine editor did not report a boolean state")
+            if time.monotonic() >= deadline:
+                raise VisibleEvidenceTimeout("The active WSMachine editor stayed enabled after a single click")
+            time.sleep(0.25)
+
     def configure_visible_analysis(self, file, report_path, analyzer_page_keys=False):
         options = literal("Analysis Options")
         self.checkpoint("await_analysis_options", file)
@@ -269,6 +282,7 @@ class GhidraGui(Session):
         self.wait(r"^analysis-selected-enabled\t" + literal(analyzer) + r"=true\t")
         self.checkpoint("verify_run_wsmachine", file)
         state, point = self.scoped_analysis_option("Run WSMachine", "PropertyBoolean:checked")
+        self.checkpoint("verify_default_run_wsmachine", file)
         if not state.endswith("=true"):
             raise RuntimeError("Expected the default execution evidence setting")
         if file == "bank-fe.ws":
@@ -282,10 +296,10 @@ class GhidraGui(Session):
             if value != report_path:
                 raise RuntimeError("Evidence report editor did not retain the expected path")
         else:
+            self.checkpoint("toggle_static_wsmachine", file)
             self.call("point", *point)
-            state, _ = self.scoped_analysis_option("Run WSMachine", "PropertyBoolean:checked")
-            if not state.endswith("=false"):
-                raise RuntimeError("Static analysis requires the execution evidence option off")
+            self.checkpoint("await_static_wsmachine_off", file)
+            self.await_static_wsmachine_off()
 
     def verify_applied_analysis_values(self, file, report_path):
         self.wait(r"^ACTIVE\tAnalysis Options\t")
