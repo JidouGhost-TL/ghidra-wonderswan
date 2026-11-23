@@ -40,6 +40,8 @@ public final class WSEvidence {
     public final Map<Long, Set<Integer>> ds = new HashMap<>();
     /** Executed linear address -> SS values seen (first 64 visits; rule D0 gives SS the same treatment as DS). */
     public final Map<Long, Set<Integer>> ss = new HashMap<>();
+    /** Exact ROM file offset for DS/SS samples whose instruction image is established. */
+    final Map<Long, Long> segmentSampleImages = new HashMap<>();
     public final List<Edge> edges = new ArrayList<>();
     /** Executed ROM0/ROM1 window address (linear 20000-3FFFF) -> ROM bank values it executed under (rule B1). */
     public final Map<Long, Set<Integer>> windowBanks = new TreeMap<>();
@@ -90,6 +92,15 @@ public final class WSEvidence {
         }
         for (Map.Entry<Long, Set<Integer>> x : m.windowBanks.entrySet())
             if (!drop.contains(x.getKey())) e.windowBanks.put(x.getKey(), new TreeSet<>(x.getValue()));
+        for (long lin : e.ds.keySet()) {
+            if (lin < 0x20000 || lin >= 0x100000 || m.unmatchedRomRegisterSamples.get((int) lin)) continue;
+            if (lin >= 0x40000) {
+                e.recordSegmentImage(lin, WSHardware.linearToRom(lin, WSHardware.RESET_C0, m.rom.length),
+                    m.cartridge.fileSize);
+            } else {
+                e.recordWindowSegmentImage(lin, e.windowBanks.get(lin), m.cartridge.fileSize);
+            }
+        }
         e.provenance = String.format("WSMachine in-process: %d instructions%s", m.instructions,
             drop.isEmpty() ? "" : String.format(" (run ended in an error; %d tail addresses dropped)", drop.size()));
         e.e0bCarried = m.computedEdges.carried();
@@ -170,12 +181,18 @@ public final class WSEvidence {
         if (coverage != null) linears.addAll(coverage.byLinear.keySet());
         if (trace != null) linears.addAll(trace.firstCs.keySet());
         Set<Long> c0skip = new HashSet<>();
+        long effectiveSize = WSHardware.effectiveSize(romLen);
+        boolean romMatches = cdl == null || cdl.headerless || romCrc < 0 || cdl.storedCrc == romCrc;
         long csFromTrace = 0, csFromWsm = 0, csGuessed = 0, c0Skipped = 0, multiC0 = 0,
             windowNoBank = 0, windowBanked = 0, sramAddrs = 0, ramAddrs = 0;
         for (long lin : linears) {
-            // DS evidence covers every observed address (rule D0 scans it); code seeding below is gated.
+            // Title defaults use all samples. A zero override needs a separately qualified image.
+            WSMesenTrace.Cov row = coverage == null ? null : coverage.byLinear.get(lin);
+            boolean traceSamples = trace != null && (trace.ds.containsKey(lin) || trace.ss.containsKey(lin));
+            boolean tracePlacementKnown = trace == null || !trace.unplacedSegmentSamples.contains(lin);
+            boolean coverageSamples = row != null && !row.ds().isEmpty();
             Set<Integer> ds = new TreeSet<>();
-            if (coverage != null && coverage.byLinear.containsKey(lin)) ds.addAll(coverage.byLinear.get(lin).ds());
+            if (coverageSamples) ds.addAll(row.ds());
             if (trace != null && trace.ds.containsKey(lin)) ds.addAll(trace.ds.get(lin));
             if (!ds.isEmpty()) e.ds.put(lin, ds);
             // SS evidence comes from the trace window only (coverage logs have no SS column).
@@ -187,29 +204,33 @@ public final class WSEvidence {
             long off = lin - ((long) cs << 4);
             if (off < 0 || off > 0xFFFF) { cs = (int) ((lin & 0xF0000) >> 4); }
             if (lin >= 0x40000) {
-                Set<Integer> c0 = new TreeSet<>();
-                if (coverage != null && coverage.byLinear.containsKey(lin)) c0.addAll(coverage.byLinear.get(lin).c0());
-                if (trace != null && trace.c0.containsKey(lin)) c0.addAll(trace.c0.get(lin));
+                Set<Integer> coverageC0 = row == null ? Set.of() : row.c0();
+                Set<Integer> traceC0 = trace == null ? Set.of() : trace.c0.getOrDefault(lin, Set.of());
+                Set<Integer> c0 = new TreeSet<>(coverageC0);
+                c0.addAll(traceC0);
                 // Keep an address its observed C0 maps to the same bytes the loader shows (effective-ROM
                 // offset under RESET_C0): several C0 values alias to one image once the size mask applies.
                 // Only a C0 showing genuinely other bytes is skipped (no image for what it executed).
-                long effLen = WSHardware.effectiveSize(romLen);
-                long loaderOff = WSHardware.linearToRom(lin, WSHardware.RESET_C0, effLen);
+                long loaderOff = WSHardware.linearToRom(lin, WSHardware.RESET_C0, effectiveSize);
                 boolean imaged = c0.isEmpty();
-                for (int v : c0) if (WSHardware.linearToRom(lin, v, effLen) == loaderOff) { imaged = true; break; }
+                for (int v : c0) if (WSHardware.linearToRom(lin, v, effectiveSize) == loaderOff) { imaged = true; break; }
                 if (!imaged) { c0Skipped++; c0skip.add(lin); continue; }
                 if (c0.size() > 1) multiC0++;
                 e.cs.put(lin, cs);
+                if (romMatches && tracePlacementKnown && (!traceSamples || !traceC0.isEmpty()) && (!coverageSamples || !coverageC0.isEmpty())
+                    && !c0.isEmpty() && c0.stream().allMatch(v -> WSHardware.linearToRom(lin, v, effectiveSize) == loaderOff))
+                    e.recordSegmentImage(lin, loaderOff, romLen);
             } else if (lin >= 0x20000) {
-                Set<Integer> banks = new TreeSet<>();
-                if (coverage != null && coverage.byLinear.containsKey(lin)) {
-                    WSMesenTrace.Cov c = coverage.byLinear.get(lin);
-                    banks.addAll(lin < 0x30000 ? c.c2() : c.c3());
-                }
-                if (trace != null && trace.windowBanks.containsKey(lin)) banks.addAll(trace.windowBanks.get(lin));
+                Set<Integer> coverageBanks = row == null ? Set.of() : lin < 0x30000 ? row.c2() : row.c3();
+                Set<Integer> traceBanks = trace == null ? Set.of() : trace.windowBanks.getOrDefault(lin, Set.of());
+                Set<Integer> banks = new TreeSet<>(coverageBanks);
+                banks.addAll(traceBanks);
                 if (banks.isEmpty()) { windowNoBank++; continue; }
                 e.cs.put(lin, cs);
                 e.windowBanks.put(lin, banks);
+                if (romMatches && tracePlacementKnown && (!traceSamples || !traceBanks.isEmpty())
+                    && (!coverageSamples || !coverageBanks.isEmpty()))
+                    e.recordWindowSegmentImage(lin, banks, romLen);
                 windowBanked++;
             } else if (lin >= 0x10000) {
                 sramAddrs++;
@@ -288,6 +309,8 @@ public final class WSEvidence {
             e.ss.computeIfAbsent(x.getKey(), k -> new TreeSet<>()).addAll(x.getValue());
         for (Map.Entry<Long, Set<Integer>> x : primary.ss.entrySet())
             e.ss.computeIfAbsent(x.getKey(), k -> new TreeSet<>()).addAll(x.getValue());
+        e.mergeSegmentImages(primary, secondary);
+        e.mergeSegmentImages(secondary, primary);
         Map<String, Edge> edges = new LinkedHashMap<>();
         for (Edge x : secondary.edges) edges.put(edgeKey(x), x);
         for (Edge x : primary.edges)
@@ -304,6 +327,25 @@ public final class WSEvidence {
         e.mesenStats = primary.mesenStats != null ? primary.mesenStats : secondary.mesenStats;
         e.provenance = primary.provenance + " + " + secondary.provenance;
         return e;
+    }
+
+    private void recordSegmentImage(long linear, long effectiveOffset, long fileSize) {
+        long fileOffset = WSHardware.fileOffset(effectiveOffset, fileSize);
+        if (fileOffset >= 0 && fileOffset < fileSize) segmentSampleImages.put(linear, fileOffset);
+    }
+
+    private void recordWindowSegmentImage(long linear, Set<Integer> banks, long fileSize) {
+        if (banks == null || banks.size() != 1) return;
+        long effectiveOffset = WSHardware.bankToRom(banks.iterator().next(), WSHardware.effectiveSize(fileSize));
+        recordSegmentImage(linear, effectiveOffset + (linear & 0xFFFF), fileSize);
+    }
+
+    private void mergeSegmentImages(WSEvidence source, WSEvidence other) {
+        source.segmentSampleImages.forEach((linear, offset) -> {
+            if (offset.equals(other.segmentSampleImages.get(linear))
+                || !other.ds.containsKey(linear) && !other.ss.containsKey(linear))
+                segmentSampleImages.put(linear, offset);
+        });
     }
 
     private static String edgeKey(Edge x) {

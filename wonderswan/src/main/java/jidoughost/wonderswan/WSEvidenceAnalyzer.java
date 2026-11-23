@@ -47,7 +47,8 @@ import ghidra.util.task.TaskMonitor;
  *   E2  a call / int / irq edge target is a function entry (RAM and last-overlay-byte targets excluded).
  *   E3  a computed JMP site gets COMPUTED_JUMP references to every observed target, and a JumpTable
  *       override listing them (observed targets only; a static table rule may add more later).
- *   D1  a function entry where only one non-zero DS (SS) value was observed gets that DS (SS) as context.
+ *   D1  a singleton DS/SS observation can override the entry context. A zero override requires
+ *       evidence for the exact ROM image backing the function entry.
  *   B2  ROM0/ROM1 window code: for every (window, bank) the evidence executed in (rule B1, WSMachine), an
  *       overlay block of that ROM bank is created over the window, and E1/E2/E3 seed into it. A window
  *       address that executed under several banks is seeded in each of them.
@@ -756,29 +757,52 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
             if (!refall.isEmpty()) new DisassembleCommand(refall, null, true).applyTo(p, monitor);
         }
 
-        /** D1: DS/SS context at function entries with a single non-zero observed DS/SS. */
+        /** D1: a singleton entry observation can override the D0 default. */
         void seedDs() throws Exception {
             for (Function f : p.getFunctionManager().getFunctions(true)) {
-                long lin = f.getEntryPoint().getOffset();
-                Set<Integer> d = ev.ds.get(lin);
-                if (d != null && d.size() == 1) {
-                    int v = d.iterator().next();
-                    if (v != 0) {
-                        ctx.setValue(rDS, f.getEntryPoint(), f.getEntryPoint(), BigInteger.valueOf(v));
-                        d1++;
-                        emit("{\"rule\":\"D1\",\"entry\":\"%s\",\"ds\":\"%04x\"}", f.getEntryPoint(), v);
-                    }
+                Address entry = f.getEntryPoint();
+                long lin = entry.getOffset();
+                Integer ds = singleSegment(ev.ds.get(lin));
+                Integer ss = singleSegment(ev.ss.get(lin));
+                boolean zeroDs = ds != null && ds == 0 && !BigInteger.ZERO.equals(ctx.getValue(rDS, entry, false));
+                boolean zeroSs = ss != null && ss == 0 && !BigInteger.ZERO.equals(ctx.getValue(rSS, entry, false));
+                boolean exactImage = (zeroDs || zeroSs) && hasExactSegmentSample(entry);
+
+                if (ds != null && (ds != 0 || zeroDs && exactImage)) {
+                    ctx.setValue(rDS, entry, entry, BigInteger.valueOf(ds));
+                    d1++;
+                    emit("{\"rule\":\"D1\",\"entry\":\"%s\",\"ds\":\"%04x\"}", entry, ds);
                 }
-                Set<Integer> s = ev.ss.get(lin);
-                if (s != null && s.size() == 1) {
-                    int v = s.iterator().next();
-                    if (v != 0) {
-                        ctx.setValue(rSS, f.getEntryPoint(), f.getEntryPoint(), BigInteger.valueOf(v));
-                        d1ss++;
-                        emit("{\"rule\":\"D1\",\"entry\":\"%s\",\"ss\":\"%04x\"}", f.getEntryPoint(), v);
-                    }
+                if (ss != null && (ss != 0 || zeroSs && exactImage)) {
+                    ctx.setValue(rSS, entry, entry, BigInteger.valueOf(ss));
+                    d1ss++;
+                    emit("{\"rule\":\"D1\",\"entry\":\"%s\",\"ss\":\"%04x\"}", entry, ss);
                 }
             }
+        }
+
+        private static Integer singleSegment(Set<Integer> values) {
+            return values != null && values.size() == 1 ? values.iterator().next() : null;
+        }
+
+        private boolean hasExactSegmentSample(Address entry) throws Exception {
+            long linear = entry.getOffset();
+            Long image = ev.segmentSampleImages.get(linear);
+            if (image == null || !ev.executed(linear)) return false;
+            MemoryBlock block = p.getMemory().getBlock(entry);
+            if (block == null || !block.isExecute()) return false;
+            if (linear < 0x40000) {
+                Set<Integer> banks = ev.windowBanks.get(linear);
+                if (banks == null || banks.size() != 1 || !entry.getAddressSpace().isOverlaySpace()) return false;
+                int segment = linear < 0x30000 ? WSHardware.SEG_ROM0 : WSHardware.SEG_ROM1;
+                if (!block.getName().equals(WSRomWindows.name(segment, banks.iterator().next()))) return false;
+            } else if (!entry.getAddressSpace().equals(space)) {
+                return false;
+            }
+            if (WSRom.offsetOf(p, entry).orElse(-1) != image) return false;
+            Instruction instruction = p.getListing().getInstructionAt(entry);
+            return instruction != null
+                && Arrays.equals(instruction.getBytes(), WSRom.read(p, image, instruction.getLength()));
         }
 
         record A1Error(Address address, String category, String comment) { }

@@ -105,6 +105,8 @@ public class WSMachine {
     /** Executed instruction linear address -> (C0, C2, C3) at execution time, packed. */
     private final WSAddressMap<Integer> executedBanksArray = new WSAddressMap<>(0x110000);
     public final Map<Long, Integer> executedBanks = executedBanksArray;
+    /** Register samples at these starts included a different or unverifiable instruction image. */
+    final java.util.BitSet unmatchedRomRegisterSamples = new java.util.BitSet();
     /** Executed ROM0/ROM1 window address (linear 20000-3FFFF) -> every bank value (16-bit, incl. 2003-mapper high byte) it executed under. */
     private final WSAddressMap<Set<Integer>> windowBanksArray = new WSAddressMap<>(0x40000);
     public final Map<Long, Set<Integer>> windowBanks = windowBanksArray;
@@ -1711,6 +1713,7 @@ public class WSMachine {
         public void beforeExecuteInstruction(PcodeThread<byte[]> t, Instruction ins, PcodeProgram program) {
             pendingIoWrites = noIoWrites;
             curStart = ins.getAddress().getOffset();
+            boolean pendingPrefetch = pfLo >= 0;
             if (pfLo >= 0 && (curStart != pfExpect || curStart < pfLo || curStart >= pfHi)) prefetchRelease();
             ifBefore = flag(rIF);
             tfBefore = flag(rTF);
@@ -1793,6 +1796,14 @@ public class WSMachine {
                 Set<Integer> ss = executedSsArray.get(lin);
                 if (ss == null) { ss = new HashSet<>(); executedSsArray.putAt(lin, ss); }
                 ss.add((int) reg(rSS));
+                if (lin >= 0x20000 && lin < 0x100000 && !unmatchedRomRegisterSamples.get((int) lin)) {
+                    int physical = (int) romOffset(lin);
+                    boolean loaderImage = lin < 0x40000
+                        || physical == WSHardware.linearToRom(lin, WSHardware.RESET_C0, rom.length);
+                    if (!loaderImage || pendingPrefetch || curBytes.length == 0 || physical + curBytes.length > rom.length
+                        || !java.util.Arrays.equals(curBytes, 0, curBytes.length, rom, physical, physical + curBytes.length))
+                        unmatchedRomRegisterSamples.set((int) lin);
+                }
             }
         }
 

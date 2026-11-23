@@ -78,6 +78,8 @@ public final class WSMesenTrace {
         public final Map<Long, Set<Integer>> c0 = new HashMap<>();
         /** Linear -> C2/C3 values seen in the trace window (ROM0/ROM1-window addresses). */
         public final Map<Long, Set<Integer>> windowBanks = new HashMap<>();
+        /** Starts with a DS/SS sample but no bank identity on at least one corresponding row. */
+        final Set<Long> unplacedSegmentSamples = new HashSet<>();
         /** Consecutive-step transfers (fromLin, fromCs, toLin, toCs) -> occurrences. */
         public final Map<List<Long>, int[]> transfers = new LinkedHashMap<>();
         public long skipped;
@@ -163,6 +165,9 @@ public final class WSMesenTrace {
                 d.firstCs.putIfAbsent(lin, cs);
                 if (t.length > 12) d.ds.computeIfAbsent(lin, k -> new TreeSet<>()).add(ds);
                 if (t.length > 14) d.ss.computeIfAbsent(lin, k -> new TreeSet<>()).add(ss);
+                if (t.length > 12 && lin >= 0x20000
+                    && (lin < 0x30000 ? c2 : lin < 0x40000 ? c3 : c0) < 0)
+                    d.unplacedSegmentSamples.add(lin);
                 if (c0 >= 0 && lin >= 0x40000) d.c0.computeIfAbsent(lin, k -> new TreeSet<>()).add(c0);
                 if (lin >= 0x20000 && lin < 0x30000 && c2 >= 0)
                     d.windowBanks.computeIfAbsent(lin, k -> new TreeSet<>()).add(c2);
