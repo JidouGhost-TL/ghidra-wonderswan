@@ -148,6 +148,8 @@ def phase_run(phase, output, ghidra, agent, projects, env, diagnostic, *, finish
                     driver.extend(("--guarded-analysis-options", "--analyzer-page-keys"))
                     if finish_with_space:
                         driver.extend(("--wizard-finish-with-space", "--project-row-open"))
+                else:
+                    driver.append("--guarded-reference-open")
                 rehearse.run(driver, env, output / (phase + "-driver.log"), timeout=600)
             except subprocess.CalledProcessError as error:
                 diagnostic.item = read_checkpoint(control, phase)

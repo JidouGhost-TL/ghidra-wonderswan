@@ -266,7 +266,7 @@ public class GuiAgent {
                     String text = (String) fieldType.getMethod("getText").invoke(displayed);
                     if (text != null && !text.isBlank()) {
                         String role = panel.getClass().getSimpleName().equals("FieldPanel") ? "field" : "decompiled";
-                        controls.add(new Control(role, text, center(panel, bounds), bounds, owner));
+                        controls.add(new Control(role, text, center(panel, bounds), bounds, owner, panel));
                     }
                 }
             }
@@ -290,6 +290,62 @@ public class GuiAgent {
         Point origin = component.getLocationOnScreen();
         origin.translate(rectangle.x + rectangle.width / 2, rectangle.y + rectangle.height / 2);
         return origin;
+    }
+
+    private static Window activeWindow(String title) throws Exception {
+        Window owner = window(Pattern.quote(title));
+        if (!owner.isActive()) {
+            throw new IllegalStateException("Expected the exact window to own the desktop");
+        }
+        return owner;
+    }
+
+    private static boolean ownedBy(Window child, Window owner) {
+        for (Window current = child.getOwner(); current != null; current = current.getOwner()) {
+            if (current == owner) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static JTextComponent focusedGoEditor(String browser) throws Exception {
+        Window dialog = activeWindow("Go To ...");
+        Window owner = window(Pattern.quote(browser));
+        Component focus = KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner();
+        if (!ownedBy(dialog, owner) || !(focus instanceof JTextComponent editor) ||
+                !editor.isShowing() || !editor.isEnabled() || !editor.isEditable() ||
+                SwingUtilities.getWindowAncestor(editor) != dialog) {
+            throw new IllegalStateException("Expected the focused editor in the owned Go To dialog");
+        }
+        return editor;
+    }
+
+    private static Control listingField(String browser, String address) throws Exception {
+        Window owner = activeWindow(browser);
+        var rows = new ArrayList<Control>();
+        collect(owner, rows, owner);
+        var matches = rows.stream().filter(control -> "field".equals(control.role) &&
+            control.name.equalsIgnoreCase(address) && control.point != null &&
+            owner.getBounds().contains(control.point)).toList();
+        if (matches.size() != 1) {
+            throw new IllegalStateException("Expected one exact visible listing address in the active program");
+        }
+        return matches.getFirst();
+    }
+
+    private static void requireFocusedListingAddress(String browser, String address) throws Exception {
+        Control field = listingField(browser, address);
+        Component panel = field.component;
+        if (KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner() != panel) {
+            throw new IllegalStateException("Expected focus on the active program listing");
+        }
+        Object current = panel.getClass().getMethod("getCurrentField").invoke(panel);
+        Class<?> type = Class.forName("docking.widgets.fieldpanel.field.Field", false,
+            panel.getClass().getClassLoader());
+        if (current == null || !address.equalsIgnoreCase((String) type.getMethod("getText").invoke(current))) {
+            throw new IllegalStateException("Expected the exact address at the focused listing cursor");
+        }
     }
 
     private static Control find(String rolePattern, String names) throws Exception {
@@ -768,6 +824,39 @@ public class GuiAgent {
                 collect(owner, rows, owner);
                 return String.join("\n", rows.stream().map(Control::describe).toList());
             });
+            case "start-listing-go" -> {
+                edt(() -> activeWindow(parts[1]));
+                chord(robot, "G");
+                yield "";
+            }
+            case "verify-go-editor" -> {
+                edt(() -> focusedGoEditor(parts[1]));
+                yield "";
+            }
+            case "submit-go-address" -> {
+                edt(() -> {
+                    if (!parts[2].equals(focusedGoEditor(parts[1]).getText())) {
+                        throw new IllegalStateException("The focused Go To editor lacks the exact requested address");
+                    }
+                    return null;
+                });
+                chord(robot, "ENTER");
+                yield "";
+            }
+            case "focus-listing-address" -> {
+                Control field = edt(() -> listingField(parts[1], parts[2]));
+                click(robot, field.point, 1, InputEvent.BUTTON1_DOWN_MASK);
+                robot.waitForIdle();
+                yield field.describe();
+            }
+            case "open-listing-references" -> {
+                edt(() -> {
+                    requireFocusedListingAddress(parts[1], parts[2]);
+                    return null;
+                });
+                chord(robot, "R");
+                yield "";
+            }
             case "click-analysis-button" -> {
                 Control button = find("JButton:enabled", Pattern.quote(parts[1]));
                 if (!edt(() -> button.component instanceof JButton control && control.isShowing()

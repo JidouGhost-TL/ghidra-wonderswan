@@ -54,7 +54,12 @@ FIXTURE_CHECKPOINTS = {
                "verify_evidence_report", "apply_analysis_options", "verify_applied_analysis_options",
                "submit_analysis_options", "await_analysis_options_dismissal",
                "wait_for_analysis", "save_program", "set_read_only"},
-    "reopen": {"open_read_only_program", "open_references", "inspect_references", "inspect_decompiler",
+    "reopen": {"open_read_only_program", "open_references", "activate_reference_listing",
+               "open_reference_go", "await_reference_go", "verify_reference_go_editor",
+               "submit_reference_go_address", "await_reference_go_dismissal", "restore_reference_listing_focus",
+               "verify_reference_listing_address",
+               "focus_reference_listing_address", "open_reference_editor_key", "await_reference_editor",
+               "inspect_references", "inspect_decompiler",
                "close_program"},
 }
 EVIDENCE_TIMEOUT = 20
@@ -318,6 +323,35 @@ class GhidraGui(Session):
         self.enter_text(address)
         self.call("key", "ENTER")
 
+    def open_scoped_references(self, file, title):
+        address = "ram:f000:010d"
+        self.checkpoint("activate_reference_listing", file)
+        self.wait(r"^ACTIVE\t" + literal(title) + r"\t")
+        self.checkpoint("open_reference_go", file)
+        self.call("start-listing-go", title)
+        self.checkpoint("await_reference_go", file)
+        self.wait(r"^ACTIVE\tGo To \.\.\.\t")
+        self.checkpoint("verify_reference_go_editor", file)
+        self.call("verify-go-editor", title)
+        self.enter_text("F000:010D")
+        self.checkpoint("submit_reference_go_address", file)
+        self.call("submit-go-address", title, "F000:010D")
+        self.checkpoint("await_reference_go_dismissal", file)
+        self.wait(r"^(?:ACTIVE|WINDOW)\tGo To \.\.\.\t", present=False)
+        self.checkpoint("restore_reference_listing_focus", file)
+        self.call("front", literal(title))
+        self.wait(r"^ACTIVE\t" + literal(title) + r"\t")
+        self.checkpoint("verify_reference_listing_address", file)
+        self.wait(r"^field\t" + literal(address) + r"\t", active_dialog=title)
+        self.checkpoint("focus_reference_listing_address", file)
+        self.call("focus-listing-address", title, address)
+        self.checkpoint("open_reference_editor_key", file)
+        self.call("open-listing-references", title, address)
+        reference = literal("References Editor @ " + address) + r" +" + literal(f"({file}) [{title}]")
+        self.checkpoint("await_reference_editor", file)
+        self.wait(r"^ACTIVE\t" + reference + r"\t")
+        return reference
+
 
 def create_project(ui, project_dir, finish_with_space=False):
     ui.checkpoint("activate_empty_project_manager")
@@ -562,7 +596,7 @@ def rows_at(view, address, expected_type, expected_source):
     return rows
 
 
-def stage_reopen(ui):
+def stage_reopen(ui, guarded_reference_open=False):
     ui.checkpoint("open_saved_project")
     ui.wait(r"^(?:ACTIVE|WINDOW)\t" + literal(MANAGER) + r"\t")
     receipt = {}
@@ -570,14 +604,20 @@ def stage_reopen(ui):
         ui.checkpoint("open_read_only_program", file)
         title = ui.open_program(file, read_only=True)
         ui.call("fit", literal(title))
-        ui.checkpoint("open_references", file)
-        ui.go("F000:010D")
-        ui.direct("right", "field", "(?i:ram:f000:010d)")
-        ui.click("JMenu", "References")
-        ui.click("DockingMenuItem", "Add/Edit...")
+        if guarded_reference_open:
+            reference = ui.open_scoped_references(file, title)
+        else:
+            ui.checkpoint("open_references", file)
+            ui.go("F000:010D")
+            ui.direct("right", "field", "(?i:ram:f000:010d)")
+            ui.click("JMenu", "References")
+            ui.click("DockingMenuItem", "Add/Edit...")
+            reference = r"References Editor @ ram:f000:010d .*"
         ui.checkpoint("inspect_references", file)
-        reference = r"References Editor @ ram:f000:010d .*"
-        view = ui.wait(r"^ACTIVE\t" + reference + r"\t")
+        if guarded_reference_open:
+            view = ui.call("snapshot-active-window", reference)
+        else:
+            view = ui.wait(r"^ACTIVE\t" + reference + r"\t")
         rows = rows_at(view, "ram:2000:0069", "UNCONDITIONAL_CALL", "DEFAULT")
         record = {"read_only_title": title, "visible_reference_rows": rows,
                   "reference_capture": ui.call("capture", reference)}
@@ -618,6 +658,7 @@ def main():
     parser.add_argument("--project-row-open", action="store_true")
     parser.add_argument("--guarded-analysis-options", action="store_true")
     parser.add_argument("--analyzer-page-keys", action="store_true")
+    parser.add_argument("--guarded-reference-open", action="store_true")
     args = parser.parse_args()
     ui = GhidraGui(args.control)
     deadline = time.monotonic() + 90
@@ -633,7 +674,7 @@ def main():
                             args.wizard_finish_with_space, args.project_row_open, args.guarded_analysis_options,
                             args.analyzer_page_keys)
     else:
-        data = stage_reopen(ui)
+        data = stage_reopen(ui, args.guarded_reference_open)
     args.output.write_text(json.dumps({"gui_jvm_pid": pid, "cases": data}, indent=2) + "\n")
 
 
