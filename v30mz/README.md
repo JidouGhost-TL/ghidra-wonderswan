@@ -126,6 +126,11 @@ switchable ROM window, also verify the selected bank for that access before assi
 physical ROM offset. Keep the source or target unresolved when the live segment or bank
 remains unknown.
 
+Pay particular attention to addresses calculated with BP. A BP-relative memory operand normally
+uses SS, while an explicit DS override can select a different segment at the same stack offset.
+The decompiled C can show both accesses as the same stack expression. Check the instruction's segment
+selection and the applicable SS and DS values before treating those accesses as aliases.
+
 ## I/O ports: the `io` space
 
 `define space io type=ram_space size=2 wordsize=1`. IN, OUT, INS and OUTS are plain loads and
