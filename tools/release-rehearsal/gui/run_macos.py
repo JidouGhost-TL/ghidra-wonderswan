@@ -210,7 +210,7 @@ def main():
                 "Invalid native release receipt")
         result = {"schema": 1, "platform": host, "owned_foreground_process_groups": 2,
                   "desktop_pixels_and_input": True, "forced_headless_refused": True, "fresh_gui_process": True,
-                  "installed_files": installed, "same_saved_database_sha256": sorted(before.values()),
+                  "installed_files": installed, "same_saved_database_sha256": sorted(before.files.values()),
                   "fixtures": fixtures, "extension_sha256": [item[3] for item in rehearse.pins["extensions"]],
                   **{key: state[key] for key in pin_fields}}
         (output / "GUI-RECEIPT.json").write_text(json.dumps(result, indent=2) + "\n")

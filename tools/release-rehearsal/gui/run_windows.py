@@ -17,6 +17,8 @@ from exercise import (
     TRANSPORT_TIMEOUT, VISIBLE_STORE,
 )
 
+from indexed_storage import IndexedStorageError, saved_programs
+
 here = Path(__file__).resolve().parent
 sys.path.insert(0, str(here.parent))
 
@@ -28,14 +30,12 @@ def emit(tag, receipt):
 
 
 class Diagnostic(rehearse.Diagnostic):
-    def emit(self, status, reason=None, *, launcher_exit_status=None, artifact_counts=None):
+    def emit(self, status, reason=None, *, launcher_exit_status=None):
         record = {"platform": self.platform, "stage": self.stage, "status": status}
         if reason is not None:
             record["reason"] = reason
         if launcher_exit_status is not None:
             record["launcher_exit_status"] = launcher_exit_status
-        if artifact_counts is not None:
-            record["artifact_counts"] = artifact_counts
         if self.item is not None:
             record["checkpoint"] = self.item
         emit("PUBLIC_GHIDRA_GUI_STAGE", record)
@@ -48,8 +48,8 @@ class Diagnostic(rehearse.Diagnostic):
             self.emit("failed", reason)
         elif isinstance(error, ForegroundLauncherExit):
             self.emit("failed", "foreground_launcher_nonzero", launcher_exit_status=error.status)
-        elif isinstance(error, SavedDatabaseCount):
-            self.emit("failed", "saved_database_count", artifact_counts=error.counts)
+        elif isinstance(error, IndexedStorageError):
+            self.emit("failed", str(error))
         else:
             super().fail(error)
 
@@ -58,22 +58,6 @@ class ForegroundLauncherExit(RuntimeError):
     def __init__(self, status):
         super().__init__("Foreground Ghidra did not exit cleanly")
         self.status = status & 0xffffffff
-
-
-class SavedDatabaseCount(RuntimeError):
-    def __init__(self, projects, database_count):
-        super().__init__("Expected two saved GUI program databases")
-        shapes = {
-            "project_files": ("*.gpr", Path.is_file),
-            "repositories": ("*.rep", Path.is_dir),
-            "program_store_roots": ("*.rep/idata", Path.is_dir),
-            "program_item_records": ("*.rep/idata/**/*.prp", Path.is_file),
-            "program_database_dirs": ("*.rep/idata/**/*.db", Path.is_dir),
-            "user_database_files": ("*.rep/user/**/*.gbf", Path.is_file),
-        }
-        self.counts = {name: min(99, sum(check(path) for path in projects.glob(pattern)))
-                       for name, (pattern, check) in shapes.items()}
-        self.counts["program_database_files"] = min(database_count, 99)
 
 
 class GuiDriverFailure(RuntimeError):
@@ -107,11 +91,7 @@ def require(condition, message):
 
 
 def saved_databases(projects):
-    saved = {path.relative_to(projects): rehearse.digest(path) for path in projects.glob("*.rep/idata/**/*.gbf")}
-    if len(saved) != 2:
-        raise SavedDatabaseCount(projects, len(saved))
-    return saved
-
+    return saved_programs(projects, PROJECT, FIXTURES)
 
 def program_command(support, agent, control, project=None):
     args = [str(support), "fg", "jdk", "Ghidra", "2G",
@@ -296,7 +276,7 @@ def main():
         require(all(re.fullmatch(r"[0-9a-f]{64}", state[key]) for key in pin_fields), "Invalid release receipt pin")
         result = {"schema": 1, "platform": host, "new_foreground_consoles": 2,
                   "desktop_pixels_and_input": True, "forced_headless_refused": True, "fresh_gui_process": True,
-                  "installed_files": installed, "same_saved_database_sha256": sorted(before.values()),
+                  "installed_files": installed, "same_saved_database_sha256": sorted(before.files.values()),
                   "fixtures": fixtures, "extension_sha256": [item[3] for item in rehearse.pins["extensions"]],
                   **{key: state[key] for key in pin_fields}}
         (output / "GUI-RECEIPT.json").write_text(json.dumps(result, indent=2) + "\n")
