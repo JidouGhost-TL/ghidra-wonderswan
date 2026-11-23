@@ -111,6 +111,21 @@ with CS=4400, and another runs some with CS=4300. This spec therefore tracks the
   `PcodeThread.overrideContext`. The PC register is the 16-bit `IP` (fixed in the pspec). The
   emulator's counter is a full linear address, so do not round-trip the counter through `IP`.
 
+### Checking segmented addresses in decompiled C
+
+The [stock Ghidra 12.1.3 C printer](https://github.com/NationalSecurityAgency/ghidra/blob/8b4c91d4d5bd1549622bfbade0df199585b98365/Ghidra/Features/Decompiler/src/decompile/cpp/printc.cc#L1164-L1173)
+prints the offset operand of a surviving `SEGMENTOP` by itself. Two loads with the same offset
+can therefore look identical in C even when their segment values select different bytes. An
+indirect far call can look like a call through the offset word alone.
+
+For a memory access, use the listing or raw p-code to identify which segment register and
+offset the instruction uses. For an indirect far call, locate the pointer in the listing, then
+identify its offset word and segment word separately in raw p-code. Verify the applicable
+register context before using either expression as a CPU address. If that address falls in a
+switchable ROM window, also verify the selected bank for that access before assigning a
+physical ROM offset. Keep the source or target unresolved when the live segment or bank
+remains unknown.
+
 ## I/O ports: the `io` space
 
 `define space io type=ram_space size=2 wordsize=1`. IN, OUT, INS and OUTS are plain loads and

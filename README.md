@@ -103,6 +103,9 @@ distributed, so they are not part of this repository.
 
 ## Limitations
 
+- Ghidra's stock C view can omit the segment of a memory access or indirect far call. Use the
+  [segmented-address checks](v30mz/README.md#checking-segmented-addresses-in-decompiled-c) when identifying
+  a ROM source or a call target.
 - The emulator is a probe for code discovery, not a cycle-exact console. By default frames are
   instruction-count based; the optional cycle-timed mode (`cyc=1`) charges V30MZ cycles and runs lines,
   timers, sound DMA transfers and general-DMA CPU stalls by cycles, but it is not validated as
