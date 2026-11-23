@@ -158,11 +158,12 @@ def phase_run(phase, output, ghidra, agent, projects, env, session, diagnostic):
             verify_foreground_console(child, control, env, output / (phase + "-console.log"), session)
             diagnostic.begin("gui_import_save" if phase == "import" else "gui_readonly_reopen")
             try:
-                rehearse.run([sys.executable, "-B", here / "exercise.py", phase, control, proof,
-                              "--chooser-row",
-                              "--fixture-dir", output / "roms", "--project-dir", projects,
-                              "--report", output / "observed.jsonl"],
-                             env, output / (phase + "-driver.log"), timeout=600)
+                driver = [sys.executable, "-B", here / "exercise.py", phase, control, proof,
+                          "--chooser-row", "--fixture-dir", output / "roms", "--project-dir", projects,
+                          "--report", output / "observed.jsonl"]
+                if phase == "import":
+                    driver.append("--guarded-analysis-options")
+                rehearse.run(driver, env, output / (phase + "-driver.log"), timeout=600)
             except subprocess.CalledProcessError as error:
                 diagnostic.item = read_checkpoint(control, phase)
                 raise GuiDriverFailure(error.returncode) from error

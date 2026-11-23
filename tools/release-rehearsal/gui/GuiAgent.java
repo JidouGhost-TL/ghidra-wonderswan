@@ -11,6 +11,7 @@ import java.awt.Robot;
 import java.awt.Toolkit;
 import java.awt.Window;
 import java.awt.datatransfer.StringSelection;
+import java.awt.event.ActionListener;
 import java.awt.event.InputEvent;
 import java.awt.event.KeyEvent;
 import java.io.ByteArrayOutputStream;
@@ -46,10 +47,13 @@ import javax.swing.tree.TreePath;
 public class GuiAgent {
     private static final String IMPORT_CHOOSER = "Select File to Import";
     private static final String IMPORT_SUMMARY = "Import Results Summary";
+    private static final String ANALYSIS_OPTIONS = "Analysis Options";
     private static Window preferredWindow;
     private static JButton watchedButton;
     private static Window watchedWindow;
     private static int buttonActions;
+    private static ActionListener watchedListener;
+    private static String watchedAnalyzeFixture;
     public static void premain(String argument) {
         Thread worker = new Thread(() -> work(Path.of(argument)), "gui-rehearsal");
         worker.setDaemon(true);
@@ -161,6 +165,7 @@ public class GuiAgent {
                 label = "(empty)";
             }
         } else if (component instanceof JTable table) {
+            collectAnalyzerRows(table, owner, rows);
             for (int i = 0; i < Math.min(30, table.getRowCount()); i++) {
                 for (int j = 0; j < table.getColumnCount(); j++) {
                     Rectangle cell = table.getCellRect(i, j, true);
@@ -343,11 +348,24 @@ public class GuiAgent {
             && KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner() == watchedButton;
     }
 
-    private static void watchButton(Control control, String title) {
+    private static boolean analyzePromptMatches(Window owner, String fixture) {
+        if (!(owner instanceof Dialog dialog) || !"Analyze?".equals(dialog.getTitle()) || !dialog.isActive()) {
+            return false;
+        }
+        String expected = fixture + " has not been analyzed. Would you like to analyze it now?";
+        var rows = new ArrayList<Control>();
+        collect(owner, rows, owner);
+        return rows.stream().filter(row -> row.point != null && expected.equals(row.name)).count() == 1;
+    }
+
+    private static void watchButton(Control control, String title, String fixture) {
         if (!(control.component instanceof JButton button) || !(control.owner instanceof Dialog dialog)
                 || !title.equals(dialog.getTitle()) || !dialog.isActive() || !button.isEnabled()
-                || !button.isShowing() || watchedButton != null) {
+                || !button.isShowing() || (watchedWindow != null && watchedWindow.isShowing())) {
             throw new IllegalStateException("Expected the active wizard's enabled button");
+        }
+        if (fixture != null && !analyzePromptMatches(dialog, fixture)) {
+            throw new IllegalStateException("Active Analyze? prompt does not match the expected fixture");
         }
         var inputs = button.getInputMap(JComponent.WHEN_FOCUSED);
         for (boolean release : new boolean[] {false, true}) {
@@ -356,10 +374,134 @@ public class GuiAgent {
                 throw new IllegalStateException("The wizard button has no focused Space binding");
             }
         }
+        if (watchedButton != null) {
+            watchedButton.removeActionListener(watchedListener);
+        }
         watchedButton = button;
         watchedWindow = dialog;
-        button.addActionListener(event -> buttonActions++);
+        watchedAnalyzeFixture = fixture;
+        buttonActions = 0;
+        watchedListener = event -> buttonActions++;
+        button.addActionListener(watchedListener);
         button.requestFocusInWindow();
+    }
+
+    private static int column(JTable table, String name) {
+        for (int i = 0; i < table.getColumnCount(); i++) {
+            if (name.equals(table.getColumnName(i))) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static boolean isAnalyzerTable(JTable table, Window owner) {
+        if (!(owner instanceof Dialog dialog) || !ANALYSIS_OPTIONS.equals(dialog.getTitle())
+                || column(table, "Analyzer") < 0 || column(table, "Enabled") < 0) {
+            return false;
+        }
+        for (Component parent = table.getParent(); parent != null && parent != owner; parent = parent.getParent()) {
+            if ("ghidra.app.plugin.core.analysis.AnalysisPanel".equals(parent.getClass().getName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void collectAnalyzerRows(JTable table, Window owner, List<Control> rows) {
+        if (!owner.isActive() || !isAnalyzerTable(table, owner)) {
+            return;
+        }
+        Rectangle view = table.getVisibleRect();
+        int analyzer = column(table, "Analyzer");
+        int enabled = column(table, "Enabled");
+        if (!view.isEmpty()) {
+            rows.add(new Control("analysis-table", "Analyzer", center(table, view), view, owner, table));
+        }
+        for (int row = 0; row < table.getRowCount(); row++) {
+            Rectangle bounds = table.getCellRect(row, analyzer, false);
+            if (!view.contains(bounds)) {
+                continue;
+            }
+            String name = String.valueOf(table.getValueAt(row, analyzer));
+            if (table.getFontMetrics(table.getFont()).stringWidth(name) + 8 > bounds.width) {
+                continue;
+            }
+            Point point = center(table, bounds);
+            rows.add(new Control("analysis-analyzer", name, point, bounds, owner, table));
+            if (table.isRowSelected(row)) {
+                rows.add(new Control("analysis-selected", name, point, bounds, owner, table));
+                Rectangle enablement = table.getCellRect(row, enabled, false);
+                if (view.contains(enablement)) {
+                    rows.add(new Control("analysis-selected-enabled", name + "=" + table.getValueAt(row, enabled),
+                        center(table, enablement), enablement, owner, table));
+                }
+            }
+        }
+    }
+
+    private static boolean isForegroundAnalyzer(Control control, String name) {
+        if (!(control.component instanceof JTable table) || !control.owner.isActive()
+                || !table.isShowing() || !isAnalyzerTable(table, control.owner)) {
+            return false;
+        }
+        Point point = new Point(control.point);
+        SwingUtilities.convertPointFromScreen(point, table);
+        int row = table.rowAtPoint(point);
+        int analyzer = column(table, "Analyzer");
+        return row >= 0 && table.columnAtPoint(point) == analyzer
+            && table.getVisibleRect().contains(table.getCellRect(row, analyzer, false))
+            && name.equals(table.getValueAt(row, analyzer));
+    }
+
+    private record AnalyzerViewport(Rectangle visible, Rectangle target, Point wheelPoint) {}
+
+    private static AnalyzerViewport analyzerViewport(Control control, String name) {
+        if (!(control.component instanceof JTable table) || !control.owner.isActive()
+                || !table.isShowing() || !isAnalyzerTable(table, control.owner)) {
+            throw new IllegalStateException("Expected an active analysis-options analyzer table");
+        }
+        int analyzer = column(table, "Analyzer");
+        Rectangle target = null;
+        for (int row = 0; row < table.getRowCount(); row++) {
+            if (name.equals(table.getValueAt(row, analyzer))) {
+                if (target != null) {
+                    throw new IllegalStateException("Analyzer name is ambiguous");
+                }
+                target = table.getCellRect(row, analyzer, false);
+            }
+        }
+        if (target == null) {
+            throw new IllegalStateException("Expected analyzer is absent");
+        }
+        Rectangle visible = table.getVisibleRect();
+        if (visible.isEmpty() || target.x < visible.x || target.x + target.width > visible.x + visible.width) {
+            throw new IllegalStateException("Analyzer column is outside the visible table");
+        }
+        return new AnalyzerViewport(visible, target, center(table, visible));
+    }
+
+    private static String revealAnalyzer(Robot robot, Control control, String name) throws Exception {
+        AnalyzerViewport current = edt(() -> analyzerViewport(control, name));
+        for (int wheelSteps = 0; wheelSteps <= 18; wheelSteps++) {
+            if (current.visible.contains(current.target)) {
+                return wheelSteps == 0 ? "viewport-unchanged" : "viewport-moved";
+            }
+            if (wheelSteps == 18) {
+                break;
+            }
+            int direction = current.target.y < current.visible.y ? -1 : 1;
+            robot.mouseMove(current.wheelPoint.x, current.wheelPoint.y);
+            robot.mouseWheel(direction);
+            robot.waitForIdle();
+            robot.delay(100);
+            AnalyzerViewport next = edt(() -> analyzerViewport(control, name));
+            if (Integer.signum(next.visible.y - current.visible.y) != direction) {
+                throw new IllegalStateException("Analyzer wheel did not move the active table toward the target");
+            }
+            current = next;
+        }
+        throw new IllegalStateException("Analyzer row stayed outside the bounded viewport reveal");
     }
 
     private static boolean matchingImportSummary(Control active, String digest) {
@@ -550,6 +692,28 @@ public class GuiAgent {
                 collect(owner, rows, owner);
                 return String.join("\n", rows.stream().map(Control::describe).toList());
             });
+            case "click-analysis-button" -> {
+                Control button = find("JButton:enabled", Pattern.quote(parts[1]));
+                if (!edt(() -> button.component instanceof JButton control && control.isShowing()
+                        && control.isEnabled() && button.owner instanceof Dialog dialog
+                        && ANALYSIS_OPTIONS.equals(dialog.getTitle()) && dialog.isActive())) {
+                    throw new IllegalStateException("Expected enabled button in the active Analysis Options");
+                }
+                click(robot, button.point, 1, InputEvent.BUTTON1_DOWN_MASK);
+                yield button.describe();
+            }
+            case "select-analyzer" -> {
+                Control row = find("analysis-analyzer", Pattern.quote(parts[1]));
+                if (!edt(() -> isForegroundAnalyzer(row, parts[1]))) {
+                    throw new IllegalStateException("Expected the exact row in active Analysis Options");
+                }
+                click(robot, row.point, 1, InputEvent.BUTTON1_DOWN_MASK);
+                yield row.describe();
+            }
+            case "reveal-analyzer" -> {
+                Control table = find("analysis-table", "Analyzer");
+                yield revealAnalyzer(robot, table, parts[1]);
+            }
             case "open-project-file" -> {
                 Control row = find("project-file-row", Pattern.quote(parts[2]));
                 if (!edt(() -> isForegroundProjectFile(row, parts[1], parts[2]))) {
@@ -624,15 +788,29 @@ public class GuiAgent {
             case "watch-button" -> {
                 Control button = find("JButton:enabled", Pattern.quote(parts[2]));
                 edt(() -> {
-                    watchButton(button, parts[1]);
+                    watchButton(button, parts[1], null);
+                    return null;
+                });
+                yield "";
+            }
+            case "watch-analysis-yes" -> {
+                Control button = find("JButton:enabled", "Yes");
+                edt(() -> {
+                    watchButton(button, "Analyze?", parts[1]);
                     return null;
                 });
                 yield "";
             }
             case "press-watched-space" -> {
-                if (!edt(GuiAgent::watchedButtonFocused)) {
-                    throw new IllegalStateException("The watched button lacks active keyboard focus");
-                }
+                edt(() -> {
+                    if (!watchedButtonFocused()) {
+                        throw new IllegalStateException("The watched button lacks active keyboard focus");
+                    }
+                    if (watchedAnalyzeFixture != null && !analyzePromptMatches(watchedWindow, watchedAnalyzeFixture)) {
+                        throw new IllegalStateException("Watched Analyze? prompt does not match the expected fixture");
+                    }
+                    return null;
+                });
                 chord(robot, "SPACE");
                 yield "";
             }

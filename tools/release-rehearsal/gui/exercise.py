@@ -47,7 +47,13 @@ FIXTURE_CHECKPOINTS = {
                "open_program", "await_prior_import_summary_dismissal", "activate_project_tree",
                "verify_project_file_row", "open_project_file_row", "await_fresh_codebrowser",
                "dismiss_optional_plugin_prompt", "await_fresh_analyze_prompt", "verify_fresh_analyze_prompt",
-               "configure_analysis", "wait_for_analysis", "save_program", "set_read_only"},
+               "configure_analysis", "focus_analyze_yes", "submit_analyze_yes", "observe_analyze_yes",
+               "await_analyze_prompt_dismissal", "await_analysis_options", "activate_analysis_options",
+               "verify_analyzer_table", "reveal_evidence_analyzer", "select_evidence_analyzer",
+               "verify_evidence_analyzer_selected", "verify_run_wsmachine", "set_evidence_report",
+               "verify_evidence_report", "apply_analysis_options", "verify_applied_analysis_options",
+               "submit_analysis_options", "await_analysis_options_dismissal",
+               "wait_for_analysis", "save_program", "set_read_only"},
     "reopen": {"open_read_only_program", "open_references", "inspect_references", "inspect_decompiler",
                "close_program"},
 }
@@ -171,6 +177,80 @@ class GhidraGui(Session):
         message_row = r"^[^\t\n]*\t" + literal(message) + r"\t-?[0-9]+,-?[0-9]+$"
         if not re.search(message_row, view, flags=re.M) or not re.search(r"^JButton:enabled\tYes\t", view, flags=re.M):
             raise RuntimeError("Active analysis prompt does not identify the expected fixture")
+
+    def confirm_visible_analyze(self, name):
+        self.verify_fresh_analyze_prompt(name)
+        self.checkpoint("focus_analyze_yes", name)
+        self.call("watch-analysis-yes", name)
+        self.wait(r"^button-focus\tYes=true\t")
+        self.wait(r"^button-action\tYes=0\t")
+        self.checkpoint("submit_analyze_yes", name)
+        self.call("press-watched-space")
+        self.checkpoint("observe_analyze_yes", name)
+        self.wait(r"^button-action\tYes=1\t")
+        self.checkpoint("await_analyze_prompt_dismissal", name)
+        self.wait(r"^(?:WINDOW|ACTIVE)\tAnalyze\?\t", present=False)
+
+    def scoped_analysis_option(self, label, role):
+        view = self.call("snapshot-active-window", literal("Analysis Options"))
+        labels = [line.split("\t") for line in view.splitlines() if line.startswith("GDLabel\t" + label + "\t")]
+        if len(labels) != 1:
+            raise RuntimeError("Expected exactly one option label in the active Analysis Options")
+        y = labels[0][-1].split(",")[-1]
+        editors = [line.split("\t") for line in view.splitlines() if
+                   line.startswith(role + "\t") and line.endswith("," + y)]
+        if len(editors) != 1:
+            raise RuntimeError("Expected exactly one matching editor in the active Analysis Options")
+        return editors[0][1], editors[0][-1].split(",")
+
+    def configure_visible_analysis(self, file, report_path):
+        options = literal("Analysis Options")
+        self.checkpoint("await_analysis_options", file)
+        self.wait(r"^(?:WINDOW|ACTIVE)\t" + options + r"\t")
+        self.checkpoint("activate_analysis_options", file)
+        self.call("front", options)
+        self.wait(r"^ACTIVE\t" + options + r"\t")
+        self.checkpoint("verify_analyzer_table", file)
+        self.wait(r"^analysis-table\tAnalyzer\t")
+        analyzer = "WonderSwan Execution Evidence"
+        self.checkpoint("reveal_evidence_analyzer", file)
+        self.call("reveal-analyzer", analyzer)
+        self.wait(r"^analysis-analyzer\t" + literal(analyzer) + r"\t")
+        self.checkpoint("select_evidence_analyzer", file)
+        self.call("select-analyzer", analyzer)
+        self.checkpoint("verify_evidence_analyzer_selected", file)
+        self.wait(r"^analysis-selected-enabled\t" + literal(analyzer) + r"=true\t")
+        self.checkpoint("verify_run_wsmachine", file)
+        state, point = self.scoped_analysis_option("Run WSMachine", "PropertyBoolean:checked")
+        if not state.endswith("=true"):
+            raise RuntimeError("Expected the default execution evidence setting")
+        if file == "bank-fe.ws":
+            label = "Evidence report file (JSON lines; empty = none)"
+            self.checkpoint("set_evidence_report", file)
+            _, point = self.scoped_analysis_option(label, "PropertyText")
+            self.call("point", *point)
+            self.enter_text(report_path)
+            self.checkpoint("verify_evidence_report", file)
+            value, _ = self.scoped_analysis_option(label, "PropertyText")
+            if value != report_path:
+                raise RuntimeError("Evidence report editor did not retain the expected path")
+        else:
+            self.call("point", *point)
+            state, _ = self.scoped_analysis_option("Run WSMachine", "PropertyBoolean:checked")
+            if not state.endswith("=false"):
+                raise RuntimeError("Static analysis requires the execution evidence option off")
+
+    def verify_applied_analysis_values(self, file, report_path):
+        self.wait(r"^ACTIVE\tAnalysis Options\t")
+        self.wait(r"^analysis-selected-enabled\tWonderSwan Execution Evidence=true\t")
+        observed = file == "bank-fe.ws"
+        state, _ = self.scoped_analysis_option("Run WSMachine", "PropertyBoolean:checked")
+        if not state.endswith("=true" if observed else "=false"):
+            raise RuntimeError("Applied analysis options changed the expected execution evidence state")
+        if observed:
+            report, _ = self.scoped_analysis_option("Evidence report file (JSON lines; empty = none)", "PropertyText")
+            if report != report_path:
+                raise RuntimeError("Applied analysis options changed the expected evidence report")
 
     def analysis_option(self, label, role):
         view = self.wait(rf"^GDLabel\t{literal(label)}\t")
@@ -299,7 +379,7 @@ def confirm_second_windows_import(ui, import_dialog, fixture, digest):
 
 
 def stage_import(ui, fixture_dir, project_dir, report_path, chooser_row=False, finish_with_space=False,
-                 project_row_open=False):
+                 project_row_open=False, guarded_analysis_options=False):
     ui.wait(r"^(?:ACTIVE|WINDOW)\t")
     start = time.monotonic()
     while time.monotonic() - start < 60:
@@ -367,27 +447,42 @@ def stage_import(ui, fixture_dir, project_dir, report_path, chooser_row=False, f
         title = ui.open_fresh_project_file(file) if project_row_open else ui.open_program(file)
         ui.call("fit", literal(title))
         ui.call("front", literal("Analyze?"))
-        if project_row_open:
-            ui.verify_fresh_analyze_prompt(file)
-        ui.button("Yes")
-        ui.checkpoint("configure_analysis", file)
-        ui.wait(r"^ACTIVE\tAnalysis Options\t")
-        ui.call("front", literal("Analysis Options"))
-        ui.click("table:Analyzer", "Aggressive Instruction Finder (Prototype)")
-        ui.call("key", "END")
-        ui.click("table:Analyzer", "WonderSwan Execution Evidence")
-        if file == "bank-fe.ws":
-            ui.analysis_option("Evidence report file (JSON lines; empty = none)", "PropertyText")
-            ui.enter_text(report_path)
+        if guarded_analysis_options:
+            ui.confirm_visible_analyze(file)
+            ui.configure_visible_analysis(file, report_path)
         else:
-            state = ui.analysis_option("Run WSMachine", "PropertyBoolean:checked")
-            if not state.endswith("=true"):
-                raise RuntimeError(f"Unexpected default Run WSMachine state: {state}")
-            ui.wait(r"^PropertyBoolean:checked\t.*Run the WSMachine.*=false\t")
+            if project_row_open:
+                ui.verify_fresh_analyze_prompt(file)
+            ui.button("Yes")
+            ui.checkpoint("configure_analysis", file)
+            ui.wait(r"^ACTIVE\tAnalysis Options\t")
+            ui.call("front", literal("Analysis Options"))
+            ui.click("table:Analyzer", "Aggressive Instruction Finder (Prototype)")
+            ui.call("key", "END")
+            ui.click("table:Analyzer", "WonderSwan Execution Evidence")
+            if file == "bank-fe.ws":
+                ui.analysis_option("Evidence report file (JSON lines; empty = none)", "PropertyText")
+                ui.enter_text(report_path)
+            else:
+                state = ui.analysis_option("Run WSMachine", "PropertyBoolean:checked")
+                if not state.endswith("=true"):
+                    raise RuntimeError(f"Unexpected default Run WSMachine state: {state}")
+                ui.wait(r"^PropertyBoolean:checked\t.*Run the WSMachine.*=false\t")
         summary[file]["analysis_mode"] = "observed" if file == "bank-fe.ws" else "static"
         summary[file]["analyzer_options_capture"] = ui.call("capture", literal("Analysis Options"))
-        ui.button("Apply")
-        ui.button("Analyze")
+        if guarded_analysis_options:
+            options = literal("Analysis Options")
+            ui.checkpoint("apply_analysis_options", file)
+            ui.call("click-analysis-button", "Apply")
+            ui.checkpoint("verify_applied_analysis_options", file)
+            ui.verify_applied_analysis_values(file, report_path)
+            ui.checkpoint("submit_analysis_options", file)
+            ui.call("click-analysis-button", "Analyze")
+            ui.checkpoint("await_analysis_options_dismissal", file)
+            ui.wait(r"^(?:WINDOW|ACTIVE)\t" + options + r"\t", present=False)
+        else:
+            ui.button("Apply")
+            ui.button("Analyze")
         ui.checkpoint("wait_for_analysis", file)
         ui.wait(r"^ACTIVE\tAuto Analysis Summary\t", timeout=120)
         ui.button("OK")
@@ -479,6 +574,7 @@ def main():
     parser.add_argument("--chooser-row", action="store_true")
     parser.add_argument("--wizard-finish-with-space", action="store_true")
     parser.add_argument("--project-row-open", action="store_true")
+    parser.add_argument("--guarded-analysis-options", action="store_true")
     args = parser.parse_args()
     ui = GhidraGui(args.control)
     deadline = time.monotonic() + 90
@@ -491,7 +587,7 @@ def main():
     ui.checkpoint("startup")
     if args.phase == "import":
         data = stage_import(ui, args.fixture_dir, args.project_dir, args.report, args.chooser_row,
-                            args.wizard_finish_with_space, args.project_row_open)
+                            args.wizard_finish_with_space, args.project_row_open, args.guarded_analysis_options)
     else:
         data = stage_reopen(ui)
     args.output.write_text(json.dumps({"gui_jvm_pid": pid, "cases": data}, indent=2) + "\n")
