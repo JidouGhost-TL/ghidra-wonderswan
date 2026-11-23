@@ -29,6 +29,7 @@ Package `jidoughost.wonderswan`. Requires the `v30mz` extension (language `V30MZ
 | `WSMerge` | Rules M1/T1: merge split routines back together (post-script `WSMergeRoutines`) |
 | `WSBranchContext` | Rule D2: preserve near-branch contexts across address-display segment boundaries (phase 2) |
 | `WSReturns` | Rule R1: register return values from caller/callee evidence (phase 2) |
+| `WSAsmAxLiveThrough` | Rule R1c: preserve incoming AX across a proved ES-input near leaf (phase 2 and final pass) |
 | `WSVolatile` | Rule V1: interrupt-written poll flags are volatile (phase 2) |
 | `WSAssets` | Headless asset core: tile / tilemap / palette / sprite decode, screen compose (via `WSRender`), PNG export |
 | `WSSnapshot` | Display-state snapshot (RAM, ports, per-line ports, hardware model) for the asset core |
@@ -214,7 +215,8 @@ still needs it.
 | A2 | 2 + finish | Function bodies keep decoded graph components and never join through undecodable bytes; speculative growth is bounded after 256 consecutive bytes without execution evidence; independently executed components are split into their own functions (`EXECUTED_COMPONENT_SPLIT`); user bodies stay. Runs in phase 2 and again in `WSJumpTableFinish`; fencing never expands an instruction across the original body into another function |
 | A3 | finish | Decompiler boundaries (`WSJumpTableFinish`, after merges and J1 locks): independently executed exterior entries become their own functions, direct jumps between the resulting functions are marked as tail transfers, and unresolved weak tables are locked to executed targets. No ROM bytes or user overrides change; an independently executed re-entry may loop back to the preserved original entry through a tail transfer; weak byte-index stops and unplayed automatic weak sites without proved cases remain opaque tail transfers, avoiding unconstrained native table scans while retaining the computed destination |
 | J1v | finish | Switch overrides whose site or function no longer matches the current listing are removed (`STALE_OVERRIDE_REMOVED`) before the final locks |
-| R1b | 2 + finish | Registers and status flags become results when direct callers consume them before redefinition and every returning callee path supplies them. Two consuming callers are required, or one when only one decoded direct caller exists; ignored results are neutral. Entry values, saved/restored values and unproved sources veto a result. Byte halves are proved separately, several outputs share a structured result, and inputs follow use-before-definition and settle transitively before save; explicit signatures, other compiler conventions and thunks stay |
+| R1b | 2 + finish | Registers and status flags become results when decoded direct call sites consume them before redefinition and every returning callee path supplies them. Two consuming sites are required, or one if there is only one decoded direct call site. Ignored results are neutral. Entry values, saved/restored values and unproved sources veto a result. Byte halves are proved separately, several outputs share a structured result, and inputs follow use before definition and settle transitively before save. The rule skips explicit signatures, thunks, and conventions other than the default register convention or an unset convention. |
+| R1c | 2 + finish | A proved near leaf under `__wsasm` gets one word input in ES and a void return. Its caller retains the incoming AX, including AL and AH. See the proof bounds below. |
 | V1 | 2 | A RAM address stored on an interrupt handler's flow and loaded (never stored) in a backward-conditional-branch loop elsewhere is split out of the RAM block into a tiny volatile block, so spin-wait loops decompile as loops |
 | E5 | 2 | Executed code left outside every function: connected pieces by flow, each piece entry becomes a function (default address space only; work RAM skipped, rule H1) — `WSExecutedFunctions` |
 | D1 | 2 | A single observed DS or SS can override entry context. A zero override requires matching original bytes and a unique physical ROM image for that entry. |
@@ -240,6 +242,41 @@ J1 and F1-F4 alternate until neither adds code; G1/U1 run once both are stable (
 "unreferenced"), and the three repeat until nothing changes. A `phase2` line with the summary closes the report.
 
 J1, F1-F4, G1/U1 and C1 have analysis options (on by default).
+
+### Register return and live-through checks
+
+R1b scans up to 12 decoded instructions after a call. It can follow an unconditional direct
+`JMP` inside the same caller body and address space when the encoded and effective targets agree
+and the jump has neither a flow override nor a fall-through. When a result reaches the vote
+threshold only by following a jump, the callee must be a closed leaf with either no stack
+operations or entry register saves paired with inverse restores immediately before a plain
+return. Raw p-code checks exclude other stack use, including implicit stack-segment accesses.
+A failed additional check produces `VETO_CONTINUATION_INPUTS` for those proposed results.
+
+R1c considers a contiguous body of at most 96 bytes in one initialized, executable, nonwritable
+block. The body starts at the function entry and ends in a plain one-byte near `RET`. At least
+one decoded direct near call must reach the entry. All recorded incoming flow must agree with
+the encoded near calls, and an instruction falling through to the entry disqualifies the body.
+Existing result inference runs first. Recognized explicit signatures and already assigned
+storage take precedence.
+
+The raw p-code proof requires an ES read before definition as the sole explicit register
+input. Reads of CS, DS and DF are treated as architectural context. Outside the final
+`RET`, any AX access, including AL or AH, excludes the body. Stack and frame accesses,
+writes to ES or to the tracked architectural context, calls, interrupts, computed control
+flow, flow overrides, and user operations other than segment address construction also
+exclude it. A repeat byte or word copy may loop to itself or exit at its fall-through.
+The proof treats its register writes as optional because the repeat count can be zero.
+
+The resulting `__wsasm_near_ax_preserved` convention models the two-byte near return frame.
+It declares AX, SP, DS, CS, SS and DF unaffected and still treats BX and CX as clobbered.
+Other registers and arithmetic flags retain the generic model. The evidence
+report records R1c `SET` with the callee, ES input, AX preservation and matching call sites.
+It records `REVERT` when a later pass withdraws the analysis-owned specialization.
+
+Use the updated language and platform modules and run fresh analysis before evaluating this
+interface. Opening a saved project alone only shows its existing analysis. The rule runs in
+phase 2 with execution evidence and in the final pass of the staged analysis workflow.
 
 ### Slow switch analysis on Ghidra 12.1.3
 
