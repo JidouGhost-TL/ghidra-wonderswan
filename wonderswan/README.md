@@ -187,7 +187,7 @@ still needs it.
 | E1R | 2 | Re-seed executed code later analysis removed |
 | J1 | 2 | CS-relative jump/call tables: backward slice for base + index bound (mask = upper bound, CMP/JA), stop rules EXECUTED_CODE / TABLE_BOUNDARY / OUT_OF_ROM / MID_INSTRUCTION / DEFINED_DATA / SELF; observed targets must be a subset (missing ones added and reported); overlay sites resolve within their overlay; J1o skips slots targeting the last overlay byte and deletes unproven computed references there |
 | D0 | 2 | Title DS default: if one DS ≠ 0 covers ≥ 50 % of executed addresses that ran with a single DS, it replaces the loader's DS = 0 default over the ROM (LSI C-86 titles run with DS = 1000, SRAM) — `WSCompilerRules` |
-| P1 | 2 | Functions whose entry has no bytes (phantoms) removed, reported with their creating references |
+| P1 | 2 | Functions whose entry has no current instruction image are preserved. The report records the unresolved entry and its creating references. |
 | F1 | 2 | Far code-pointer variables: a word pair (M, M+2) whose contents are transferred to by `CALLF/JMPF [M]` or the push-return dispatch `PUSH [M+2]; PUSH [M]; RETF` (directly or through a register), and the interrupt vector table (0000:0000-03FF); near variables: `CALL/JMP word ptr [M]` (not CS) or `PUSH [M]; RET`. Found by a forward constant tracker over every fall-through chain (reset at flow joins, registers unknown after calls; DS from the context after a reset or call) |
 | F2 | 2 | A constant offset stored to M with a constant segment stored to M+2 in the same chain (far), or a constant stored to a near variable, is a code pointer: disassembled with `csval` = the stored segment, made a function, bookmarked; targets that are offcut, in data, undecodable, in a bank window or RAM are reported (`0000:0000` = `NULL_POINTER`, a cleared variable) |
 | F3 | 2 | Setter functions: a function whose entry chain stores two of its input registers into M and M+2 of a far variable (or one into a near one); the constant register values at each call to it are code pointers (F2) |
@@ -217,12 +217,13 @@ still needs it.
 | R1b | 2 + finish | Registers and status flags become results when direct callers consume them before redefinition and every returning callee path supplies them. Two consuming callers are required, or one when only one decoded direct caller exists; ignored results are neutral. Entry values, saved/restored values and unproved sources veto a result. Byte halves are proved separately, several outputs share a structured result, and inputs follow use-before-definition and settle transitively before save; explicit signatures, other compiler conventions and thunks stay |
 | V1 | 2 | A RAM address stored on an interrupt handler's flow and loaded (never stored) in a backward-conditional-branch loop elsewhere is split out of the RAM block into a tiny volatile block, so spin-wait loops decompile as loops |
 | E5 | 2 | Executed code left outside every function: connected pieces by flow, each piece entry becomes a function (default address space only; work RAM skipped, rule H1) — `WSExecutedFunctions` |
-| D1 | 2 | DS context at entries with one non-zero observed DS |
+| D1 | 2 | A single observed DS or SS can override entry context. A zero override requires matching original bytes and a unique physical ROM image for that entry. |
 | D2 | 2 | Address-display segments do not establish architectural CS. Near branches crossing a rendered segment boundary keep their existing context, instruction and references; unknown-CS decodes remain hypotheses with a `branch-context` bookmark. Executed branches and RAM code retain their safeguards. No context repair is inferred from address presentation |
 | D3 | 2 | Preserve existing CS-register context and unknown symbolic CS inputs. Address-display segments provide no architectural CS evidence and supply no defaults. `MOV reg,CS` reads regular CS; `PUSH CS` uses decode context `csval` — `WSCompilerRules` |
-| A1 | 2 | Unexecuted fall-through runs ending in a bad decode: decode cleared, bytes kept, bookmarked; the walk stops before kept jump-table targets (proven code) |
+| A1 | 2 | Unexecuted fall-through runs ending in a bad decode are tagged as unresolved hypotheses. Instructions, functions and references are preserved. |
 | K1 | 2 | Compiler family from the program's own code (`WSCompilerRules`): LSI C-86 when functions with its frame save order (`PUSH BP; MOV BP,SP [; SUB SP,n]; PUSH CX/DX…`) are ≥ 10 % of ROM functions and stack-argument functions (`[BP+4..0x3f]`) ≤ 20 % (calibrated on the licensed library: 28/29 LSI titles, 0 false positives) |
 | C1 | 2 | Functions without a user/imported signature get `__lsic86` when K1 says LSI C-86, else the compiler spec's default (`__wsasm`) |
+| C1b | 2 | A proven far register-copy leaf with only exact direct far entries can use a convention that returns a word in AX and preserves BX. Implicit fall-through into the leaf or a user/imported signature prevents specialization. |
 
 Rules M1 and T1 live in the `WSMergeRoutines` script, not in the repair analyzer, and the script
 runs in its own `-noanalysis` process after the analysis process exits: merges performed inside
@@ -239,6 +240,15 @@ J1 and F1-F4 alternate until neither adds code; G1/U1 run once both are stable (
 "unreferenced"), and the three repeat until nothing changes. A `phase2` line with the summary closes the report.
 
 J1, F1-F4, G1/U1 and C1 have analysis options (on by default).
+
+### Slow switch analysis on Ghidra 12.1.3
+
+If initial analysis exhausts memory in **Decompiler Switch Analysis**, retry from a fresh import.
+In the Analyze options, keep that analyzer enabled and set **Analysis Decompiler Timeout (sec)**
+to `5` for the retry. This bounds each native switch-analysis request. Save and reopen the project
+after analysis succeeds. The shorter timeout can leave computed targets unresolved. Check important
+dispatch sites against their original instructions and any available execution evidence before
+relying on the recovered switch cases.
 
 ## WSMachine
 
