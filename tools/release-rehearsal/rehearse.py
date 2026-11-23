@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 """Consume pinned public inputs in a new disposable directory."""
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 from urllib.parse import quote, urlsplit
+from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, build_opener
 import zipfile
 
@@ -28,6 +30,76 @@ examples = {
     "ConfigureBankEvidence.java": "4c084c94d3ad1deb3de4cb14d1564e7101baf4a9420b668a223184bf8cd1dcfb",
     "VerifyBankedCall.java": "9dddfc620a863e865a9ff97c652cda21ba28f60e79489fb316425f628a1a7839",
 }
+
+
+def gradle_failure(log):
+    """Interpret a bounded tail; only a fixed category can leave the runner."""
+    if log is None or not log.is_file():
+        return "gradle_other"
+    try:
+        with log.open("rb") as stream:
+            stream.seek(max(0, log.stat().st_size - 64 * 1024))
+            tail = stream.read(64 * 1024).decode("utf-8", errors="replace").lower()
+    except OSError:
+        return "gradle_other"
+    for reason, flags in (
+        ("disk_full", ("no space left on device",)),
+        ("gradle_checksum", ("verification of gradle distribution failed", "checksum verification failed")),
+        ("gradle_download", ("could not install gradle distribution", "filenotfoundexception: https://",
+                              "could not download gradle", "download timed out")),
+        ("gradle_task", ("cannot locate tasks that match", "task 'buildnatives' not found")),
+        ("gradle_toolchain", ("no tool chain is available", "no toolchain is available",
+                               "no compatible toolchains", "xcrun: error:")),
+        ("gradle_link", ("linker command failed", "undefined symbols for architecture",
+                         "ld: library not found", "failed while linking")),
+        ("gradle_compile", ("compilation failed", "failed while compiling", "fatal error:")),
+    ):
+        if any(flag in tail for flag in flags):
+            return reason
+    return "gradle_other"
+
+
+class Diagnostic:
+    def __init__(self, platform_name):
+        self.platform = platform_name
+        self.stage = "preflight"
+        self.item = None
+        self.log = None
+
+    def emit(self, status, reason=None):
+        record = {"platform": self.platform, "stage": self.stage, "status": status}
+        if self.item is not None:
+            record["item"] = self.item
+        if reason is not None:
+            record["reason"] = reason
+        print("PUBLIC_GHIDRA_STAGE " + json.dumps(record, separators=(",", ":")), flush=True)
+
+    def begin(self, stage, item=None, log=None):
+        self.stage, self.item, self.log = stage, item, log
+        self.emit("begin")
+
+    def fail(self, error):
+        if isinstance(error, subprocess.TimeoutExpired):
+            reason = "process_timeout"
+        elif isinstance(error, TimeoutError):
+            reason = "io_timeout"
+        elif isinstance(error, HTTPError):
+            reason = "http_error"
+        elif isinstance(error, URLError):
+            reason = "network_error"
+        elif isinstance(error, FileNotFoundError):
+            reason = "missing_file"
+        elif isinstance(error, (zipfile.BadZipFile, tarfile.TarError)):
+            reason = "archive_format"
+        elif isinstance(error, OSError) and error.errno == errno.ENOSPC:
+            reason = "disk_full"
+        elif isinstance(error, subprocess.CalledProcessError):
+            reason = gradle_failure(self.log) if self.stage.startswith("gradle_") else "process_exit"
+        elif isinstance(error, (RuntimeError, ValueError)):
+            reason = "checked_invariant"
+        else:
+            reason = "other_error"
+        self.emit("failed", reason)
 
 
 def require(condition, reason):
@@ -133,23 +205,30 @@ def require_mach_executable(description, host):
             "Wrong native decompiler executable architecture")
 
 
-def prepare(output, host, cache):
+def prepare(output, host, cache, diagnostic):
+    diagnostic.begin("fresh_directory")
     output.mkdir()
     downloads = output/"downloads"
     downloads.mkdir()
+    diagnostic.begin("fetch_ghidra")
     ghidra = download(pins["ghidra"], downloads, cache)
+    diagnostic.begin("fetch_extensions")
     extensions = [download(spec, downloads, cache) for spec in pins["extensions"]]
     release_checksums = download(pins["extension_manifest"], downloads, cache)
     expected = {name: sha for _, _, name, sha in pins["extensions"]}
     require(dict((name, sha) for sha, name in (line.split() for line in
             release_checksums.read_text().splitlines())) == expected, "Published manifest disagrees")
+    diagnostic.begin("fetch_jdk")
     jdk = download(["adoptium/temurin21-binaries", "jdk-21.0.13.1+2", *pins["jdk"][host]], downloads, cache)
+    diagnostic.begin("unpack_ghidra")
     unzip(ghidra, output)
+    diagnostic.begin("unpack_jdk")
     if jdk.suffix == ".zip":
         unzip(jdk, output/"jdk")
     else:
         with tarfile.open(jdk) as archive:
             archive.extractall(output/"jdk", filter="data")
+    diagnostic.begin("public_fixture")
     scripts = output/"example"
     scripts.mkdir()
     for name, sha in examples.items():
@@ -160,12 +239,14 @@ def prepare(output, host, cache):
     run([sys.executable, scripts/"make_cartridges.py", output/"roms"], os.environ, output/"fixture.log")
     require({item.name:digest(item) for item in (output/"roms").glob("*.ws")} == pins["fixtures"],
             "The public synthetic cartridges changed")
+    diagnostic.begin("java_version")
     ghidra, java, home, env = paths(output, host)
     version = run([java, "-XshowSettings:properties", "-version"], env, output/"java.log")
     arches = ("aarch64",) if host.endswith("arm64") else ("amd64","x86_64")
     require("21.0.13.1+2" in version and any(f"os.arch = {arch}\n" in version for arch in arches),
             "Wrong native JDK")
     if host.startswith("Darwin"):
+        diagnostic.begin("mac_toolchain")
         gradle = ghidra/"support/gradle"
         wrapper = gradle/"gradle-wrapper.properties"
         text = wrapper.read_text()
@@ -181,8 +262,13 @@ def prepare(output, host, cache):
             developer = developer / "Contents/Developer"
         if (developer / "usr/bin/xcodebuild").is_file():
             run(["/usr/bin/xcodebuild", "-version"], env, output/"xcode.log")
-        run([gradle/"gradlew", "--no-daemon", "buildNatives"], env, output/"native-build.log",
-            gradle, timeout=1800)
+        bootstrap_log = output/"gradle-bootstrap.log"
+        diagnostic.begin("gradle_bootstrap", log=bootstrap_log)
+        run([gradle/"gradlew", "--no-daemon", "--version"], env, bootstrap_log, gradle, timeout=300)
+        native_log = output/"native-build.log"
+        diagnostic.begin("gradle_native_build", log=native_log)
+        run([gradle/"gradlew", "--no-daemon", "buildNatives"], env, native_log, gradle, timeout=1800)
+    diagnostic.begin("native_executable")
     ids = {"Linux-x64":"linux_x86_64", "Windows-x64":"win_x86_64",
            "Darwin-arm64":"mac_arm_64", "Darwin-x64":"mac_x86_64"}
     decompiler = ghidra/"Ghidra/Features/Decompiler"
@@ -224,7 +310,8 @@ def verify_install(output):
     return len(got)
 
 
-def headless(output, host, extensions, wrapper):
+def headless(output, host, extensions, wrapper, diagnostic):
+    diagnostic.begin("install_extensions")
     ghidra, java, home, env = paths(output, host)
     for archive in extensions:
         unzip(archive, extension_tree(output))
@@ -239,12 +326,14 @@ def headless(output, host, extensions, wrapper):
         original = output/"roms"/f"{sample}.ws"
         receipt = output/f"{name}.txt"
         common = [launcher, projects, name, "-max-cpu", "1", "-scriptPath", output/"example"]
+        diagnostic.begin("fixture_import", name)
         imported = run([*common, "-import", original, "-preScript", "ConfigureBankEvidence.java",
                         output/f"{name}.jsonl", mode], env, output/f"{name}-import.log")
         require("Analysis succeeded" in imported and "Save succeeded" in imported, f"Import failed: {name}")
         saved = list((projects/f"{name}.rep").rglob("db.*.gbf"))
         require(len(saved) == 1, f"Expected one saved program database for {name}")
         before = digest(saved[0])
+        diagnostic.begin("fixture_reopen", name)
         run([*common, "-process", original.name, "-noanalysis", "-readOnly", "-postScript",
              "VerifyBankedCall.java", original, receipt, mode], env, output/f"{name}-reopen.log")
         text = receipt.read_text()
@@ -278,28 +367,35 @@ def main():
     args = parser.parse_args()
     output = args.directory.resolve()
     host = platforms.get((platform.system(), platform.machine()))
-    require(host is not None and (args.expected_host is None or host == args.expected_host), "Unexpected native host")
-    if args.mode in ("headless","stage-gui"):
-        extensions = prepare(output, host, args.cache)
-        if args.mode == "headless":
-            headless(output, host, extensions, args.local_wrapper)
-    elif args.mode == "verify-gui-install":
-        print(f"{verify_install(output)} installed files match the approved ZIPs")
-    else:
-        ghidra, java, home, env = paths(output, host)
-        if args.mode == "gui-probe":
-            run([java, here/"DesktopProbe.java"], env, output/"desktop.log", timeout=30)
-            require("DESKTOP_PROBE_PASS" in (output/"desktop.log").read_text(), "Desktop probe lacked positive evidence")
-            print("PUBLIC_GHIDRA_DESKTOP_CAPABLE " + host)
+    diagnostic = Diagnostic(host or "unsupported")
+    try:
+        require(host is not None and (args.expected_host is None or host == args.expected_host), "Unexpected native host")
+        if args.mode in ("headless","stage-gui"):
+            extensions = prepare(output, host, args.cache, diagnostic)
+            if args.mode == "headless":
+                headless(output, host, extensions, args.local_wrapper, diagnostic)
+        elif args.mode == "verify-gui-install":
+            diagnostic.begin("gui_install_verification")
+            print(f"{verify_install(output)} installed files match the approved ZIPs")
         else:
-            launcher = ghidra/"support"/("launch.bat" if host == "Windows-x64" else "launch.sh")
-            command = [launcher, "fg", "jdk", "Ghidra", "2G", "", "ghidra.GhidraRun"]
-            if args.project:
-                project = args.project.resolve()
-                require(project.is_relative_to(output) and project.suffix == ".gpr", "Expected isolated .gpr")
-                command.append(project)
-            index = len(list(output.glob("gui-launch-*.log")))
-            run(command, env, output/f"gui-launch-{index}.log", timeout=7200)
+            diagnostic.begin("desktop_probe" if args.mode == "gui-probe" else "foreground_gui")
+            ghidra, java, home, env = paths(output, host)
+            if args.mode == "gui-probe":
+                run([java, here/"DesktopProbe.java"], env, output/"desktop.log", timeout=30)
+                require("DESKTOP_PROBE_PASS" in (output/"desktop.log").read_text(), "Desktop probe lacked positive evidence")
+                print("PUBLIC_GHIDRA_DESKTOP_CAPABLE " + host)
+            else:
+                launcher = ghidra/"support"/("launch.bat" if host == "Windows-x64" else "launch.sh")
+                command = [launcher, "fg", "jdk", "Ghidra", "2G", "", "ghidra.GhidraRun"]
+                if args.project:
+                    project = args.project.resolve()
+                    require(project.is_relative_to(output) and project.suffix == ".gpr", "Expected isolated .gpr")
+                    command.append(project)
+                index = len(list(output.glob("gui-launch-*.log")))
+                run(command, env, output/f"gui-launch-{index}.log", timeout=7200)
+    except Exception as error:
+        diagnostic.fail(error)
+        raise
 
 
 if __name__ == "__main__":
