@@ -159,6 +159,7 @@ def phase_run(phase, output, ghidra, agent, projects, env, session, diagnostic):
             diagnostic.begin("gui_import_save" if phase == "import" else "gui_readonly_reopen")
             try:
                 rehearse.run([sys.executable, "-B", here / "exercise.py", phase, control, proof,
+                              "--chooser-row",
                               "--fixture-dir", output / "roms", "--project-dir", projects,
                               "--report", output / "observed.jsonl"],
                              env, output / (phase + "-driver.log"), timeout=600)

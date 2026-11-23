@@ -31,6 +31,7 @@ CHECKPOINTS = {
 }
 FIXTURE_CHECKPOINTS = {
     "import": {"open_import_chooser", "activate_import_chooser", "verify_import_chooser_path",
+               "submit_import_path_field", "verify_import_file_row", "open_import_file_row",
                "dismiss_import_chooser", "open_import_options", "activate_import_options",
                "verify_import_language", "verify_import_loader", "inspect_import_summary",
                "open_program", "configure_analysis", "wait_for_analysis", "save_program", "set_read_only"},
@@ -159,7 +160,7 @@ def create_project(ui, project_dir):
     ui.wait(r"^(?:WINDOW|ACTIVE)\t" + literal(MANAGER) + r"\t")
 
 
-def stage_import(ui, fixture_dir, project_dir, report_path):
+def stage_import(ui, fixture_dir, project_dir, report_path, chooser_row=False):
     ui.wait(r"^(?:ACTIVE|WINDOW)\t")
     start = time.monotonic()
     while time.monotonic() - start < 60:
@@ -183,12 +184,22 @@ def stage_import(ui, fixture_dir, project_dir, report_path):
         ui.wait(r"^ACTIVE\t" + chooser + r"\t")
         ui.checkpoint("verify_import_chooser_path", file)
         fixture_path = str(Path(fixture_dir) / file)
-        ui.direct("click", "DropDownSelectionTextField", ".*")
+        path_field = "chooser-path" if chooser_row else "DropDownSelectionTextField"
+        ui.direct("click", path_field, ".*")
         ui.enter_text(fixture_path)
-        ui.wait(r"^DropDownSelectionTextField\t" + literal(fixture_path) + r"\t")
+        ui.wait(r"^" + path_field + r"\t" + literal(fixture_path) + r"\t")
         ui.wait(r"^ACTIVE\t" + chooser + r"\t")
+        if chooser_row:
+            ui.checkpoint("submit_import_path_field", file)
+            ui.call("chooser-path-enter")
+            ui.checkpoint("verify_import_file_row", file)
+            ui.wait(r"^chooser-file\t" + literal(fixture_path) + r"\t")
+            ui.wait(r"^DropDownSelectionTextField\t" + literal(file) + r"\t")
+            ui.checkpoint("open_import_file_row", file)
+            ui.call("chooser-open-file", literal(fixture_path))
         ui.checkpoint("dismiss_import_chooser", file)
-        ui.call("key", "ENTER")
+        if not chooser_row:
+            ui.call("key", "ENTER")
         ui.wait(chooser_visible, present=False)
         ui.checkpoint("open_import_options", file)
         import_dialog = r"Import .*[\\/]" + literal(file)
@@ -320,6 +331,7 @@ def main():
     parser.add_argument("--fixture-dir")
     parser.add_argument("--project-dir")
     parser.add_argument("--report")
+    parser.add_argument("--chooser-row", action="store_true")
     args = parser.parse_args()
     ui = GhidraGui(args.control)
     deadline = time.monotonic() + 90
@@ -331,7 +343,7 @@ def main():
     pid = int(ready.read_text())
     ui.checkpoint("startup")
     if args.phase == "import":
-        data = stage_import(ui, args.fixture_dir, args.project_dir, args.report)
+        data = stage_import(ui, args.fixture_dir, args.project_dir, args.report, args.chooser_row)
     else:
         data = stage_reopen(ui)
     args.output.write_text(json.dumps({"gui_jvm_pid": pid, "cases": data}, indent=2) + "\n")

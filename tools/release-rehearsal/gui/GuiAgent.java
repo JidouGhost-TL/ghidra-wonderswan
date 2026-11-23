@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import java.awt.Component;
 import java.awt.Container;
+import java.awt.Dialog;
 import java.awt.GraphicsEnvironment;
 import java.awt.Frame;
+import java.awt.KeyboardFocusManager;
 import java.awt.Point;
 import java.awt.Rectangle;
 import java.awt.Robot;
@@ -12,6 +14,7 @@ import java.awt.datatransfer.StringSelection;
 import java.awt.event.InputEvent;
 import java.awt.event.KeyEvent;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -36,6 +39,7 @@ import javax.swing.SwingUtilities;
 import javax.swing.text.JTextComponent;
 
 public class GuiAgent {
+    private static final String IMPORT_CHOOSER = "Select File to Import";
     private static Window preferredWindow;
     public static void premain(String argument) {
         Thread worker = new Thread(() -> work(Path.of(argument)), "gui-rehearsal");
@@ -113,6 +117,7 @@ public class GuiAgent {
             return;
         }
         String type = component.getClass().getSimpleName();
+        boolean importChooser = owner instanceof Dialog dialog && IMPORT_CHOOSER.equals(dialog.getTitle());
         String label = null;
         if (component instanceof AbstractButton button && button.isEnabled()) {
             label = button.getText();
@@ -129,6 +134,9 @@ public class GuiAgent {
         } else if (component instanceof JComboBox<?> combo) {
             label = String.valueOf(combo.getSelectedItem());
         } else if (component instanceof JTextComponent text) {
+            if (importChooser && "Path".equals(text.getName())) {
+                type = "chooser-path";
+            }
             label = text.getText();
             if (label.isBlank()) {
                 label = "(empty)";
@@ -139,8 +147,9 @@ public class GuiAgent {
                     Rectangle cell = table.getCellRect(i, j, true);
                     Object value = table.getValueAt(i, j);
                     if (value != null && table.getVisibleRect().intersects(cell)) {
-                        rows.add(new Control("table:" + table.getColumnName(j), value.toString(),
-                            center(table, cell), cell, owner));
+                        String role = importChooser && "TABLE".equals(table.getName()) && value instanceof File
+                            ? "chooser-file" : "table:" + table.getColumnName(j);
+                        rows.add(new Control(role, value.toString(), center(table, cell), cell, owner));
                     }
                 }
             }
@@ -156,8 +165,10 @@ public class GuiAgent {
             for (int i = 0; i < Math.min(100, list.getModel().getSize()); i++) {
                 Rectangle cell = list.getCellBounds(i, i);
                 if (cell != null && list.getVisibleRect().intersects(cell)) {
-                    rows.add(new Control("list", list.getModel().getElementAt(i).toString(),
-                        center(list, cell), cell, owner));
+                    Object value = list.getModel().getElementAt(i);
+                    String role = importChooser && "LIST".equals(list.getName()) && value instanceof File
+                        ? "chooser-file" : "list";
+                    rows.add(new Control(role, value.toString(), center(list, cell), cell, owner));
                 }
             }
         } else if (component instanceof JProgressBar progress) {
@@ -347,6 +358,27 @@ public class GuiAgent {
             });
             case "key" -> {
                 chord(robot, parts[1]);
+                yield "";
+            }
+            case "chooser-path-enter" -> {
+                boolean focused = edt(() -> {
+                    Window chooser = window(IMPORT_CHOOSER);
+                    Component field = KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner();
+                    return chooser.isActive() && field instanceof JTextComponent &&
+                        "Path".equals(field.getName()) && SwingUtilities.getWindowAncestor(field) == chooser;
+                });
+                if (!focused) {
+                    throw new IllegalStateException("Import chooser path field lacks foreground focus");
+                }
+                chord(robot, "ENTER");
+                yield "";
+            }
+            case "chooser-open-file" -> {
+                Control file = find("chooser-file", parts[1]);
+                if (!edt(file.owner::isActive)) {
+                    throw new IllegalStateException("Import chooser lost foreground focus before selection");
+                }
+                click(robot, file.point, 2, InputEvent.BUTTON1_DOWN_MASK);
                 yield "";
             }
             case "select-all" -> {
