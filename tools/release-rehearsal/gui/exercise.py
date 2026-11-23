@@ -36,6 +36,9 @@ FIXTURE_CHECKPOINTS = {
                "submit_import_path_field", "verify_import_file_row", "open_import_file_row",
                "dismiss_import_chooser", "open_import_options", "activate_import_options",
                "verify_import_language", "verify_import_loader", "inspect_import_summary",
+               "focus_import_confirmation", "deliver_import_confirmation", "dismiss_import_options",
+               "show_import_summary", "activate_import_summary", "verify_import_summary_sha",
+               "verify_import_summary_metadata", "capture_import_summary", "import_error_dialog",
                "open_program", "configure_analysis", "wait_for_analysis", "save_program", "set_read_only"},
     "reopen": {"open_read_only_program", "open_references", "inspect_references", "inspect_decompiler",
                "close_program"},
@@ -52,16 +55,29 @@ def literal(text):
     return re.escape(text)
 
 
+def active_dialog_contents(view, title):
+    match = re.search(r"^ACTIVE\t" + literal(title) + r"\t\n(.*?)(?=^(?:ACTIVE|WINDOW)\t|\Z)",
+                      view, flags=re.M | re.S)
+    return match.group(1) if match else ""
+
+
 class GhidraGui(Session):
     def checkpoint(self, step, fixture=None):
         value = step if fixture is None else f"{step} {fixture}"
         (self.directory / CHECKPOINT_FILE).write_text(value, encoding="ascii")
 
-    def wait(self, pattern, timeout=45, *, present=True):
+    def wait(self, pattern, timeout=45, *, present=True, active_dialog=None, import_fixture=None):
         start = time.monotonic()
         while True:
             view = self.call("snapshot")
-            if bool(re.search(pattern, view, flags=re.M | re.I)) == present:
+            if import_fixture is not None and re.search(
+                r"^(?:ACTIVE|WINDOW)\t(?:Error Importing File|Unexpected exception closing byte provider\.)\t",
+                view, flags=re.M,
+            ):
+                self.checkpoint("import_error_dialog", import_fixture)
+                raise RuntimeError("Ghidra displayed a stock import error dialog")
+            observed = active_dialog_contents(view, active_dialog) if active_dialog is not None else view
+            if bool(re.search(pattern, observed, flags=re.M | re.I)) == present:
                 return view
             if time.monotonic() - start > timeout:
                 expectation = "present" if present else "absent"
@@ -198,6 +214,34 @@ def finish_project_with_space(ui, wizard, project_dir):
     ui.wait(r"^tree\t" + literal(PROJECT) + r"\t")
 
 
+def confirm_second_windows_import(ui, import_dialog, fixture, digest):
+    ui.checkpoint("focus_import_confirmation", fixture)
+    active = r"^ACTIVE\t(" + import_dialog + r")\t"
+    view = ui.wait(active, import_fixture=fixture)
+    title = re.search(active, view, flags=re.M | re.I).group(1)
+    ui.call("watch-button", title, "OK")
+    ui.wait(r"^button-focus\tOK=true\t", import_fixture=fixture)
+    ui.wait(r"^button-action\tOK=0\t", import_fixture=fixture)
+    ui.checkpoint("deliver_import_confirmation", fixture)
+    ui.call("press-watched-space")
+    ui.wait(r"^button-action\tOK=1\t", import_fixture=fixture)
+    ui.checkpoint("dismiss_import_options", fixture)
+    ui.wait(r"^(?:ACTIVE|WINDOW)\t" + import_dialog + r"\t", present=False, import_fixture=fixture)
+    ui.checkpoint("show_import_summary", fixture)
+    summary = "Import Results Summary"
+    ui.wait(r"^(?:ACTIVE|WINDOW)\t" + literal(summary) + r"\t", import_fixture=fixture)
+    ui.checkpoint("activate_import_summary", fixture)
+    ui.call("front", literal(summary))
+    ui.wait(r"^ACTIVE\t" + literal(summary) + r"\t", import_fixture=fixture)
+    ui.checkpoint("verify_import_summary_sha", fixture)
+    ui.wait(r"^JTextField\t" + digest + r"\t", active_dialog=summary, import_fixture=fixture)
+    ui.checkpoint("verify_import_summary_metadata", fixture)
+    fields = rf"(?s)\A(?=.*^JTextField\t{digest}\t)(?=.*^JTextField\tWonderSwan Cartridge\t)"
+    ui.wait(fields, active_dialog=summary, import_fixture=fixture)
+    ui.checkpoint("capture_import_summary", fixture)
+    return ui.call("capture-import-summary", digest)
+
+
 def stage_import(ui, fixture_dir, project_dir, report_path, chooser_row=False, finish_with_space=False):
     ui.wait(r"^(?:ACTIVE|WINDOW)\t")
     start = time.monotonic()
@@ -249,13 +293,17 @@ def stage_import(ui, fixture_dir, project_dir, report_path, chooser_row=False, f
         ui.wait(r"^JTextField\tV30MZ:LE:16:default:default\t")
         ui.checkpoint("verify_import_loader", file)
         ui.wait(r"^GhidraComboBox\t.*WonderSwanLoader")
-        ui.button("OK")
-        ui.checkpoint("inspect_import_summary", file)
-        ui.wait(r"^JTextField\t" + sha + r"\t")
-        ui.wait(r"^JTextField\tWonderSwan Cartridge\t")
-        ui.call("front", literal("Import Results Summary"))
-        ui.wait(r"^ACTIVE\tImport Results Summary\t")
-        summary[file] = {"import_sha256": sha, "import_visible_capture": ui.call("capture", literal("Import Results Summary"))}
+        if chooser_row and file == "bank-unknown.ws":
+            capture = confirm_second_windows_import(ui, import_dialog, file, sha)
+        else:
+            ui.button("OK")
+            ui.checkpoint("inspect_import_summary", file)
+            ui.wait(r"^JTextField\t" + sha + r"\t")
+            ui.wait(r"^JTextField\tWonderSwan Cartridge\t")
+            ui.call("front", literal("Import Results Summary"))
+            ui.wait(r"^ACTIVE\tImport Results Summary\t")
+            capture = ui.call("capture", literal("Import Results Summary"))
+        summary[file] = {"import_sha256": sha, "import_visible_capture": capture}
         ui.button("OK")
     for file in FIXTURES:
         ui.checkpoint("open_program", file)

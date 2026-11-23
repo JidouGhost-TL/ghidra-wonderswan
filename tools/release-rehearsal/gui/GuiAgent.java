@@ -42,6 +42,7 @@ import javax.swing.text.JTextComponent;
 
 public class GuiAgent {
     private static final String IMPORT_CHOOSER = "Select File to Import";
+    private static final String IMPORT_SUMMARY = "Import Results Summary";
     private static Window preferredWindow;
     private static JButton watchedButton;
     private static Window watchedWindow;
@@ -352,6 +353,18 @@ public class GuiAgent {
         button.requestFocusInWindow();
     }
 
+    private static boolean matchingImportSummary(Control active, String digest) {
+        if (!(active.owner instanceof Dialog dialog) || !IMPORT_SUMMARY.equals(dialog.getTitle()) ||
+            !dialog.isShowing() || !dialog.isActive() || !active.bounds.equals(dialog.getBounds())) {
+            return false;
+        }
+        var controls = new ArrayList<Control>();
+        collect(active.owner, controls, active.owner);
+        var fields = controls.stream().filter(control -> "JTextField".equals(control.role))
+            .map(Control::name).toList();
+        return fields.contains(digest) && fields.contains("WonderSwan Cartridge");
+    }
+
     private static String command(Robot robot, String request) throws Exception {
         String[] parts = request.split("\t", 3);
         String editModifier = Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx() == InputEvent.META_DOWN_MASK
@@ -445,15 +458,25 @@ public class GuiAgent {
                 chord(robot, editModifier + "+V");
                 yield "";
             }
-            case "capture" -> {
-                Control active = find("ACTIVE", parts[1]);
+            case "capture", "capture-import-summary" -> {
+                boolean importSummary = parts[0].equals("capture-import-summary");
+                if (importSummary && !parts[1].matches("[0-9a-f]{64}")) {
+                    throw new IllegalArgumentException("Expected a pinned summary digest");
+                }
+                Control active = find("ACTIVE", importSummary ? IMPORT_SUMMARY : parts[1]);
                 robot.waitForIdle();
+                if (importSummary && !edt(() -> matchingImportSummary(active, parts[1]))) {
+                    throw new IllegalStateException("Expected active import summary fields before capture");
+                }
                 Rectangle desktop = GraphicsEnvironment.getLocalGraphicsEnvironment()
                     .getDefaultScreenDevice().getDefaultConfiguration().getBounds();
                 if (!desktop.contains(active.bounds)) {
                     throw new IllegalStateException("Active GUI is clipped by the desktop");
                 }
                 var image = robot.createScreenCapture(active.bounds);
+                if (importSummary && !edt(() -> matchingImportSummary(active, parts[1]))) {
+                    throw new IllegalStateException("Active import summary changed during capture");
+                }
                 var colors = new java.util.HashSet<Integer>();
                 for (int y = 3; y < image.getHeight(); y += 7) {
                     for (int x = 3; x < image.getWidth(); x += 7) {
