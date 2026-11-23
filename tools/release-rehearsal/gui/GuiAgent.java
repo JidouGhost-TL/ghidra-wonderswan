@@ -28,6 +28,7 @@ import java.util.concurrent.FutureTask;
 import java.util.regex.Pattern;
 import javax.imageio.ImageIO;
 import javax.swing.AbstractButton;
+import javax.swing.JButton;
 import javax.swing.JComponent;
 import javax.swing.JComboBox;
 import javax.swing.JLabel;
@@ -35,12 +36,16 @@ import javax.swing.JList;
 import javax.swing.JProgressBar;
 import javax.swing.JTable;
 import javax.swing.JTree;
+import javax.swing.KeyStroke;
 import javax.swing.SwingUtilities;
 import javax.swing.text.JTextComponent;
 
 public class GuiAgent {
     private static final String IMPORT_CHOOSER = "Select File to Import";
     private static Window preferredWindow;
+    private static JButton watchedButton;
+    private static Window watchedWindow;
+    private static int buttonActions;
     public static void premain(String argument) {
         Thread worker = new Thread(() -> work(Path.of(argument)), "gui-rehearsal");
         worker.setDaemon(true);
@@ -90,7 +95,11 @@ public class GuiAgent {
         return job.get();
     }
 
-    record Control(String role, String name, Point point, Rectangle bounds, Window owner) {
+    record Control(String role, String name, Point point, Rectangle bounds, Window owner, Component component) {
+        Control(String role, String name, Point point, Rectangle bounds, Window owner) {
+            this(role, name, point, bounds, owner, null);
+        }
+
         String describe() {
             return role + "\t" + name.replace("\n", "\\n").replace("\t", " ") + "\t"
                 + (point == null ? "" : point.x + "," + point.y);
@@ -108,6 +117,12 @@ public class GuiAgent {
             controls.add(new Control(window.isActive() ? "ACTIVE" : "WINDOW",
                 label == null ? window.getClass().getSimpleName() : label, null, bounds, window));
             collect(window, controls, window);
+        }
+        if (watchedButton != null) {
+            String name = watchedButton.getText();
+            Rectangle bounds = watchedWindow.getBounds();
+            controls.add(new Control("button-focus", name + "=" + watchedButtonFocused(), null, bounds, watchedWindow));
+            controls.add(new Control("button-action", name + "=" + buttonActions, null, bounds, watchedWindow));
         }
         return controls;
     }
@@ -188,7 +203,7 @@ public class GuiAgent {
                     rows.add(new Control(type + ":value:" + text.getName(), label, point, bounds, owner));
                 }
                 if (component instanceof AbstractButton button && button.isEnabled()) {
-                    rows.add(new Control(type + ":enabled", label, point, bounds, owner));
+                    rows.add(new Control(type + ":enabled", label, point, bounds, owner, component));
                 }
             }
         }
@@ -312,6 +327,31 @@ public class GuiAgent {
         }
     }
 
+    private static boolean watchedButtonFocused() {
+        return watchedButton != null && watchedWindow.isActive() && watchedButton.isShowing()
+            && watchedButton.isEnabled()
+            && KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner() == watchedButton;
+    }
+
+    private static void watchButton(Control control, String title) {
+        if (!(control.component instanceof JButton button) || !(control.owner instanceof Dialog dialog)
+                || !title.equals(dialog.getTitle()) || !dialog.isActive() || !button.isEnabled()
+                || !button.isShowing() || watchedButton != null) {
+            throw new IllegalStateException("Expected the active wizard's enabled button");
+        }
+        var inputs = button.getInputMap(JComponent.WHEN_FOCUSED);
+        for (boolean release : new boolean[] {false, true}) {
+            Object binding = inputs.get(KeyStroke.getKeyStroke(KeyEvent.VK_SPACE, 0, release));
+            if (binding == null || button.getActionMap().get(binding) == null) {
+                throw new IllegalStateException("The wizard button has no focused Space binding");
+            }
+        }
+        watchedButton = button;
+        watchedWindow = dialog;
+        button.addActionListener(event -> buttonActions++);
+        button.requestFocusInWindow();
+    }
+
     private static String command(Robot robot, String request) throws Exception {
         String[] parts = request.split("\t", 3);
         String editModifier = Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx() == InputEvent.META_DOWN_MASK
@@ -379,6 +419,21 @@ public class GuiAgent {
                     throw new IllegalStateException("Import chooser lost foreground focus before selection");
                 }
                 click(robot, file.point, 2, InputEvent.BUTTON1_DOWN_MASK);
+                yield "";
+            }
+            case "watch-button" -> {
+                Control button = find("JButton:enabled", Pattern.quote(parts[2]));
+                edt(() -> {
+                    watchButton(button, parts[1]);
+                    return null;
+                });
+                yield "";
+            }
+            case "press-watched-space" -> {
+                if (!edt(GuiAgent::watchedButtonFocused)) {
+                    throw new IllegalStateException("The watched button lacks active keyboard focus");
+                }
+                chord(robot, "SPACE");
                 yield "";
             }
             case "select-all" -> {

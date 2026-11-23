@@ -128,7 +128,7 @@ def foreground_pid(child, control):
     return pid
 
 
-def phase_run(phase, output, ghidra, agent, projects, env, diagnostic):
+def phase_run(phase, output, ghidra, agent, projects, env, diagnostic, *, finish_with_space=False):
     control = output / (phase + "-control")
     proof = output / (phase + ".json")
     project = projects / (PROJECT + ".gpr") if phase == "reopen" else None
@@ -141,10 +141,12 @@ def phase_run(phase, output, ghidra, agent, projects, env, diagnostic):
             gui = foreground_pid(child, control)
             diagnostic.begin("gui_import_save" if phase == "import" else "gui_readonly_reopen")
             try:
-                rehearse.run([sys.executable, "-B", here / "exercise.py", phase, control, proof,
-                              "--fixture-dir", output / "roms", "--project-dir", projects,
-                              "--report", output / "observed.jsonl"],
-                             env, output / (phase + "-driver.log"), timeout=600)
+                driver = [sys.executable, "-B", here / "exercise.py", phase, control, proof,
+                          "--fixture-dir", output / "roms", "--project-dir", projects,
+                          "--report", output / "observed.jsonl"]
+                if phase == "import" and finish_with_space:
+                    driver.append("--wizard-finish-with-space")
+                rehearse.run(driver, env, output / (phase + "-driver.log"), timeout=600)
             except subprocess.CalledProcessError as error:
                 diagnostic.item = read_checkpoint(control, phase)
                 raise GuiDriverFailure(error.returncode) from error
@@ -189,7 +191,8 @@ def main():
         agent = build_driver(output, java, env)
         projects = output / "projects"
         projects.mkdir()
-        imported = phase_run("import", output, ghidra, agent, projects, env, diagnostic)
+        imported = phase_run("import", output, ghidra, agent, projects, env, diagnostic,
+                             finish_with_space=host == "Darwin-arm64")
         before = saved_databases(projects)
         reopened = phase_run("reopen", output, ghidra, agent, projects, env, diagnostic)
         diagnostic.begin("verify_gui_receipt")

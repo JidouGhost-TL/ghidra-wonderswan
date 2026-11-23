@@ -26,6 +26,8 @@ CHECKPOINTS = {
     "import": {"startup", "create_project", "activate_empty_project_manager", "open_project_file_menu",
                "open_project_wizard", "activate_project_wizard", "select_project_type",
                "enter_project_directory", "enter_project_name", "submit_project_wizard",
+               "focus_project_finish", "observe_project_finish_action", "await_project_wizard_dismissal",
+               "verify_project_storage", "project_creation_error_dialog", "verify_project_activation",
                "verify_project_created", "save_project", "exit_ghidra"},
     "reopen": {"startup", "open_saved_project", "exit_ghidra"},
 }
@@ -129,7 +131,7 @@ class GhidraGui(Session):
         self.call("key", "ENTER")
 
 
-def create_project(ui, project_dir):
+def create_project(ui, project_dir, finish_with_space=False):
     ui.checkpoint("activate_empty_project_manager")
     ui.call("front", literal(EMPTY_MANAGER))
     ui.wait(r"^ACTIVE\t" + literal(EMPTY_MANAGER) + r"\t")
@@ -154,13 +156,49 @@ def create_project(ui, project_dir):
     ui.enter_text(PROJECT)
     ui.wait(r"^JTextField:value:Project Name\t" + literal(PROJECT) + r"\t")
     ui.checkpoint("submit_project_wizard")
-    ui.click("JButton:enabled", "Finish")
-    ui.checkpoint("verify_project_created")
-    ui.wait(window, present=False)
+    if finish_with_space:
+        ui.wait(r"^JButton:enabled\tFinish\t")
+        finish_project_with_space(ui, window, project_dir)
+    else:
+        ui.click("JButton:enabled", "Finish")
+        ui.checkpoint("verify_project_created")
+        ui.wait(window, present=False)
+        ui.wait(r"^(?:WINDOW|ACTIVE)\t" + literal(MANAGER) + r"\t")
+
+
+def finish_project_with_space(ui, wizard, project_dir):
+    ui.checkpoint("focus_project_finish")
+    ui.call("watch-button", PROJECT_WIZARD, "Finish")
+    ui.wait(r"^button-focus\tFinish=true\t")
+    ui.wait(r"^button-action\tFinish=0\t")
+    ui.checkpoint("submit_project_wizard")
+    ui.call("press-watched-space")
+    ui.checkpoint("observe_project_finish_action")
+    ui.wait(r"^button-action\tFinish=1\t")
+    ui.checkpoint("await_project_wizard_dismissal")
+    ui.wait(wizard, present=False)
+    ui.checkpoint("verify_project_storage")
+    folder = Path(project_dir)
+    marker, store = folder / f"{PROJECT}.gpr", folder / f"{PROJECT}.rep"
+    limit = time.monotonic() + 45
+    while True:
+        visible = ui.call("snapshot")
+        if re.search(r"^(?:ACTIVE|WINDOW)\tCreate Project Failed\t", visible, flags=re.M):
+            ui.checkpoint("project_creation_error_dialog")
+            raise RuntimeError("Ghidra reported a project creation error")
+        if marker.is_file() and store.is_dir():
+            break
+        if time.monotonic() >= limit:
+            raise VisibleEvidenceTimeout("Expected both project storage files")
+        time.sleep(0.25)
+    ui.checkpoint("verify_project_activation")
     ui.wait(r"^(?:WINDOW|ACTIVE)\t" + literal(MANAGER) + r"\t")
+    ui.call("front", literal(MANAGER))
+    ui.wait(r"^ACTIVE\t" + literal(MANAGER) + r"\t")
+    ui.wait(r"^tree\t" + literal(PROJECT) + r"\t")
 
 
-def stage_import(ui, fixture_dir, project_dir, report_path, chooser_row=False):
+def stage_import(ui, fixture_dir, project_dir, report_path, chooser_row=False, finish_with_space=False):
     ui.wait(r"^(?:ACTIVE|WINDOW)\t")
     start = time.monotonic()
     while time.monotonic() - start < 60:
@@ -170,7 +208,7 @@ def stage_import(ui, fixture_dir, project_dir, report_path, chooser_row=False):
         if EMPTY_MANAGER in view:
             break
         time.sleep(0.3)
-    create_project(ui, project_dir)
+    create_project(ui, project_dir, finish_with_space)
     summary = {}
     for file, sha in FIXTURES.items():
         ui.checkpoint("open_import_chooser", file)
@@ -332,6 +370,7 @@ def main():
     parser.add_argument("--project-dir")
     parser.add_argument("--report")
     parser.add_argument("--chooser-row", action="store_true")
+    parser.add_argument("--wizard-finish-with-space", action="store_true")
     args = parser.parse_args()
     ui = GhidraGui(args.control)
     deadline = time.monotonic() + 90
@@ -343,7 +382,7 @@ def main():
     pid = int(ready.read_text())
     ui.checkpoint("startup")
     if args.phase == "import":
-        data = stage_import(ui, args.fixture_dir, args.project_dir, args.report, args.chooser_row)
+        data = stage_import(ui, args.fixture_dir, args.project_dir, args.report, args.chooser_row, args.wizard_finish_with_space)
     else:
         data = stage_reopen(ui)
     args.output.write_text(json.dumps({"gui_jvm_pid": pid, "cases": data}, indent=2) + "\n")
