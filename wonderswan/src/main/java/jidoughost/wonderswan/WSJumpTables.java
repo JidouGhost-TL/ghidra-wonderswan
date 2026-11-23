@@ -89,6 +89,15 @@ import ghidra.util.task.TaskMonitor;
  *   return, every body range starts at a target), RET-terminated spans are kept as functions and JMP-terminated
  *   spans are demoted to case-blocks of the switch parent (stock switch-namespace labels stripped, the site
  *   re-locked to its proven targets). Anything else stays as it is.
+ * J1u (analyzer WSSwitchOrderAnalyzer, just before stock Decompiler Switch Analysis): a JMP site with an unguarded
+ *   byte-width index (J1c bound, no CMP guard, no AND mask) gets J1 as soon as it is decoded. Stock switch recovery
+ *   bounds such an index only by its width, reads 128 or 256 slots of handler bytes as targets and can grow the
+ *   native decompiler without limit. Stock analysis skips a computed jump that already has computed references,
+ *   and a stored lock (when a function contains the site) keeps every later decompile on the proven table. Same
+ *   recovery and stop rules; a site J1 cannot prove yet is left for the later passes.
+ * Rule C (end of phase 2): an unguarded byte-index JMP site still unresolved for lack of a proven end gets a
+ *   WARNING bookmark (WSJumpTableHazard), a log entry and a report line. Its code is preserved and no table
+ *   end is invented.
  * Index scaling by ADD r,r counts as SHL r,1.
  * J1d: a 0000 slot is empty (not a target, not a stop) inside a table whose end is proven.
  * Stop rules: EXECUTED_CODE (entry slot executed), TABLE_BOUNDARY (next recovered table), OWN_TARGET (J1j), OUT_OF_ROM,
@@ -369,22 +378,7 @@ public final class WSJumpTables {
             seen.add(ins.getAddress());
             recs.put(ins, recover(ins));
         }
-        for (Rec ra : recs.values()) for (Rec rb : recs.values()) {
-            if (ra == null || rb == null || ra == rb || ra.targets.isEmpty() || rb.targets.isEmpty()) continue;
-            // CS-relative offsets from separate recoveries are not spatial addresses.
-            // Retain overlay identity and resolve segment bases before comparing table extents.
-            if (ra.tableAddress == null || rb.tableAddress == null ||
-                    !ra.tableAddress.getAddressSpace().equals(rb.tableAddress.getAddressSpace())) continue;
-            long distance = rb.tableAddress.subtract(ra.tableAddress);
-            if (distance > 0 && distance < 2L * ra.slots) {
-                // keep only targets read from slots before the next table
-                int lim = (int) (distance / 2);
-                ra.slots = lim;
-                ra.targets = trimToSlots(ra, lim);
-                ra.empty = (int) ra.emptySlots.stream().filter(k -> k < lim).count();
-                ra.stop = "TABLE_BOUNDARY";
-            }
-        }
+        trimToNextTable(recs.values());
         for (Map.Entry<Instruction, Rec> e : recs.entrySet()) {
             monitor.checkCancelled();
             try {
@@ -406,6 +400,127 @@ public final class WSJumpTables {
             }
         }
     }
+
+    /** TABLE_BOUNDARY: a recovered table ends where the next recovered table of the same space starts. */
+    void trimToNextTable(Collection<Rec> recs) {
+        for (Rec ra : recs) for (Rec rb : recs) {
+            if (ra == null || rb == null || ra == rb || ra.targets.isEmpty() || rb.targets.isEmpty()) continue;
+            // CS-relative offsets from separate recoveries are not spatial addresses.
+            // Retain overlay identity and resolve segment bases before comparing table extents.
+            if (ra.tableAddress == null || rb.tableAddress == null ||
+                    !ra.tableAddress.getAddressSpace().equals(rb.tableAddress.getAddressSpace())) continue;
+            long distance = rb.tableAddress.subtract(ra.tableAddress);
+            if (distance > 0 && distance < 2L * ra.slots) {
+                // keep only targets read from slots before the next table
+                int lim = (int) (distance / 2);
+                ra.slots = lim;
+                ra.targets = trimToSlots(ra, lim);
+                ra.empty = (int) ra.emptySlots.stream().filter(k -> k < lim).count();
+                ra.stop = "TABLE_BOUNDARY";
+            }
+        }
+    }
+
+    /** Rule J1u: instructions with a CS-relative operand decoded so far (J1f bases, kept across calls). */
+    final Set<Address> csOperands = new HashSet<>();
+    int beforeSwitch, beforeSwitchSites;
+
+    /** J1u scope: a byte-width index with no CMP guard and no AND mask, and no conditional branch on the
+     *  fall-through slice into the site (a guard on another register, e.g. CMP AL,n before MOV BL,AL, or a
+     *  guarded path joining the slice, bounds it for the stock recovery). Without a guard the stock switch
+     *  recovery can bound the index only by its width (128 or 256 slots), so it reads past the real table. */
+    boolean unguardedByteIndex(Instruction site, Rec r) {
+        if (r == null || !r.byteBound || r.maskOffsets != null) return false;
+        List<Instruction> slice = new ArrayList<>(predecessors(site, 16));
+        slice.add(0, site);
+        for (Instruction q : slice) {
+            if (q != site && q.getFlowType().isConditional()) return false;
+            for (Reference ref : p.getReferenceManager().getReferencesTo(q.getAddress()))
+                if (ref.getReferenceType().isConditional()) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Rule J1u: apply J1 to the unguarded byte-index JMP sites among newly decoded instructions before
+     * stock Decompiler Switch Analysis reaches them. The site gets J1's computed references (the stock
+     * analyzer skips a computed jump that already has computed references) and, when a function contains
+     * it, J1's jump-table lock. Same recovery and stop rules as {@link #applyPass}; a site J1 cannot
+     * prove yet is left untouched for the later passes. Guarded and masked sites are left to stock
+     * recovery as before.
+     */
+    int applyBeforeSwitchAnalysis(AddressSetView set, TaskMonitor monitor) throws Exception {
+        List<Instruction> sites = new ArrayList<>();
+        for (Instruction ins : listing.getInstructions(set, true)) {
+            monitor.checkCancelled();
+            if (ins.toString().contains("CS:[")) csOperands.add(ins.getAddress());
+            if (!ins.getFlowType().isJump() || !ins.getFlowType().isComputed()) continue;
+            if (!ins.getMnemonicString().equalsIgnoreCase("JMP") || done.contains(ins.getAddress())) continue;
+            sites.add(ins);
+        }
+        if (sites.isEmpty()) return 0;
+        // J1f over every CS-relative operand decoded so far (incrementally collected; removed code drops out)
+        tableBases.clear();
+        for (Iterator<Address> it = csOperands.iterator(); it.hasNext(); ) {
+            monitor.checkCancelled();
+            Instruction ins = listing.getInstructionAt(it.next());
+            if (ins == null || !addTableBase(ins)) it.remove();
+        }
+        Map<Instruction, Rec> recs = new LinkedHashMap<>();
+        for (Instruction ins : sites) {
+            Rec r = recover(ins);
+            if (!unguardedByteIndex(ins, r) || r.targets.isEmpty()) continue;
+            beforeSwitchSites++;
+            recs.put(ins, r);
+        }
+        trimToNextTable(recs.values());
+        int applied = 0;
+        for (Map.Entry<Instruction, Rec> e : recs.entrySet()) {
+            monitor.checkCancelled();
+            try {
+                if (!applySite(e.getKey(), e.getValue(), monitor)) continue;
+            }
+            catch (ghidra.util.exception.CancelledException c) { throw c; }
+            catch (Exception x) {
+                // reported, and the site stays open for the later J1 passes
+                errors++;
+                emit.accept(String.format("{\"rule\":\"J1\",\"site\":\"%s\",\"outcome\":\"ERROR\",\"error\":\"%s\"}", e.getKey().getAddress(), String.valueOf(x).replace('"', '\'')));
+                ghidra.util.Msg.error(this, "J1u failed at " + e.getKey().getAddress() + ": " + x, x);
+                continue;
+            }
+            done.add(e.getKey().getAddress());
+            applied++;
+        }
+        beforeSwitch += applied;
+        return applied;
+    }
+
+    /**
+     * Rule C (hazard tag): a JMP site J1 left unresolved whose byte-width index has no CMP guard, no AND
+     * mask and no proven table end. Stock switch recovery bounds such an index only by its width and
+     * reads handler bytes as further slots. The code is preserved (H2) and no table end is invented: the
+     * site gets a WARNING bookmark, a log entry and a report line.
+     */
+    String tagHazards(java.util.function.Consumer<String> log) {
+        int tagged = 0;
+        for (Address site : new TreeSet<>(reported)) {
+            Instruction ins = listing.getInstructionAt(site);
+            if (ins == null || !ins.getMnemonicString().equalsIgnoreCase("JMP")) continue;
+            Rec r = recover(ins);
+            if (!unguardedByteIndex(ins, r) || !r.shape.contains("BYTE_INDEX_WEAK_STOP")) continue;
+            String note = String.format("Rule C: unguarded byte-index CS jump table at %s (%s) has no range guard and "
+                + "no proven end (scan stopped on %s after %d slots); J1 left it unresolved. Stock switch recovery "
+                + "reads all %d index slots here.", r.tableAddress, r.bound, r.stop, r.slots, r.cap);
+            p.getBookmarkManager().setBookmark(site, BookmarkType.WARNING, "WSJumpTableHazard", note);
+            emit.accept(String.format("{\"rule\":\"C\",\"site\":\"%s\",\"insn\":\"%s\",\"outcome\":\"HAZARD_TAGGED\",\"table\":\"%s\",\"stop\":\"%s\",\"slots\":%d,\"cap\":%d}",
+                site, ins, r.tableAddress, r.stop, r.slots, r.cap));
+            log.accept(site + ": " + note);
+            tagged++;
+        }
+        hazards = tagged;
+        return "C unguarded byte-index hazards tagged " + tagged;
+    }
+    int hazards;
 
     /** An unrecovered site: quarantine (J1l) when its guesses look conflicted, else reject. Quarantined
      *  sites stay out of `done' so every later pass re-attempts them with the guessed references removed. */
@@ -1471,34 +1586,41 @@ public final class WSJumpTables {
         tableBases.clear();
         for (Instruction ins : listing.getInstructions(true)) {
             monitor.checkCancelled();
-            String txt = ins.toString();
-            if (!txt.contains("CS:[")) continue;
-            Matcher m = CSMEM.matcher(txt);
-            if (!m.find()) continue;
-            siteSpace = ins.getAddress().getAddressSpace();
-            int cs = csOf(ins.getAddress());
-            if (m.group(4) != null) { tableBases.add(seg(cs, Integer.parseInt(m.group(4), 16))); continue; }
-            String reg = m.group(1).toUpperCase();
-            int disp = m.group(3) == null ? 0 : Integer.parseInt(m.group(3), 16) * (m.group(2).equals("-") ? -1 : 1), base = 0;
-            boolean found = false;
-            List<Instruction> back = predecessors(ins, 16);
-            for (int qi = 0; qi < back.size(); qi++) {
-                Instruction q = back.get(qi);
-                String t = q.toString().toUpperCase().replace(" ", "");
-                Matcher am = ADDREG.matcher(t);
-                if (am.matches() && am.group(1).equals(reg) && !am.group(2).equals(reg)) {
-                    Integer c = constBefore(back, qi, am.group(2), new String[1]);   // J1i register base
-                    if (c != null) { base += c; found = true; }
-                    continue;
-                }
-                if (t.startsWith("MOV" + reg + ",0X")) { base += hex(t); found = true; break; }
-                if (t.startsWith("LEA" + reg + ",[0X")) { base += Integer.parseInt(t.substring(t.indexOf("0X") + 2, t.indexOf(']')), 16); found = true; break; }
-                if (t.startsWith("ADD" + reg + ",0X")) { base += hex(t); continue; }
-                if (t.matches("ADD" + reg + ",(AX|BX|CX|DX|SI|DI|BP)")) continue;   // index added to the base register
-                if (writes(t, reg)) break;
-            }
-            if (found || disp != 0) tableBases.add(seg(cs, (base + disp) & 0xFFFF));
+            addTableBase(ins);
         }
+    }
+
+    /** J1f for one instruction: adds its constant CS-relative table base, if it has one; true when the
+     *  instruction has a CS-relative memory operand at all. */
+    boolean addTableBase(Instruction ins) {
+        String txt = ins.toString();
+        if (!txt.contains("CS:[")) return false;
+        Matcher m = CSMEM.matcher(txt);
+        if (!m.find()) return false;
+        siteSpace = ins.getAddress().getAddressSpace();
+        int cs = csOf(ins.getAddress());
+        if (m.group(4) != null) { tableBases.add(seg(cs, Integer.parseInt(m.group(4), 16))); return true; }
+        String reg = m.group(1).toUpperCase();
+        int disp = m.group(3) == null ? 0 : Integer.parseInt(m.group(3), 16) * (m.group(2).equals("-") ? -1 : 1), base = 0;
+        boolean found = false;
+        List<Instruction> back = predecessors(ins, 16);
+        for (int qi = 0; qi < back.size(); qi++) {
+            Instruction q = back.get(qi);
+            String t = q.toString().toUpperCase().replace(" ", "");
+            Matcher am = ADDREG.matcher(t);
+            if (am.matches() && am.group(1).equals(reg) && !am.group(2).equals(reg)) {
+                Integer c = constBefore(back, qi, am.group(2), new String[1]);   // J1i register base
+                if (c != null) { base += c; found = true; }
+                continue;
+            }
+            if (t.startsWith("MOV" + reg + ",0X")) { base += hex(t); found = true; break; }
+            if (t.startsWith("LEA" + reg + ",[0X")) { base += Integer.parseInt(t.substring(t.indexOf("0X") + 2, t.indexOf(']')), 16); found = true; break; }
+            if (t.startsWith("ADD" + reg + ",0X")) { base += hex(t); continue; }
+            if (t.matches("ADD" + reg + ",(AX|BX|CX|DX|SI|DI|BP)")) continue;   // index added to the base register
+            if (writes(t, reg)) break;
+        }
+        if (found || disp != 0) tableBases.add(seg(cs, (base + disp) & 0xFFFF));
+        return true;
     }
 
     static final Pattern ADDREG = Pattern.compile("ADD(AX|BX|CX|DX|SI|DI|BP),(AX|BX|CX|DX|SI|DI|BP)");

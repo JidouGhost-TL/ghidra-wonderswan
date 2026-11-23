@@ -296,6 +296,7 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
             tables.apply(monitor);
             tables.restoreClearedSites(monitor);
             tables.finish();
+            tables.tagHazards(line -> ghidra.util.Msg.warn(WSEvidenceAnalyzer.class, line));
             WSDecodeRepair.align(program, ev, line -> s.emit("%s", line), monitor);
             s.classifyArtefacts(tables.keptTargets);
             WSExecutedFunctions functions = new WSExecutedFunctions(program, ev, line -> s.emit("%s", line), monitor);

@@ -24,7 +24,9 @@ import ghidra.util.task.TaskMonitor;
  *   N1  clear "does not return" where a call's fall-through executed, restore the cut-off code (a J4 saved-yield
  *       helper is kept: its caller's next instruction runs through the saved continuation, not by return);
  *   E1R re-seed executed addresses that later analysis removed;
- *   J1  CS-relative jump/call tables by rule ({@link WSJumpTables}), checked against observed targets;
+ *   J1  CS-relative jump/call tables by rule ({@link WSJumpTables}), checked against observed targets
+ *       (unguarded byte-index sites already get J1 before stock switch analysis, {@link WSSwitchOrderAnalyzer});
+ *   C   tag unguarded byte-index JMP tables J1 leaves without a proven end (WARNING bookmark, log entry);
  *   D1  DS/SS context at function entries; A1 preserve and tag unresolved decode hypotheses;
  *   P1  preserve functions without a current memory image and record the unresolved hypothesis;
  *   D0  title DS/SS defaults from execution evidence ({@link WSCompilerRules}), before D1;
@@ -116,6 +118,10 @@ public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
             rule("J3", s, program, log, failed, () -> parts.add(WSInlineTables.apply(program, line -> s.emit("%s", line), monitor)));
             if (j != null) rule("J1r", s, program, log, failed, () -> j.restoreClearedSites(monitor));
             if (j != null) rule("J1l-finish", s, program, log, failed, () -> j.finish());
+            if (j != null) rule("C", s, program, log, failed, () -> parts.add(j.tagHazards(line -> {
+                log.appendMsg(NAME + ": " + line);
+                Msg.warn(this, NAME + ": " + line);
+            })));
             if (j != null) parts.add(j.summary());
             if (cp != null) parts.add(cp.summary());
             if (gc != null) parts.add(gc.summary());
