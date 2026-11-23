@@ -12,6 +12,14 @@ task compileSleigh(type: Exec) {
 	inputs.files fileTree(dir: 'data/languages', include: ['*.slaspec', '*.sinc'])
 	outputs.files fileTree(dir: 'data/languages', include: '*.sla')
 	workingDir 'data/languages'
-	commandLine sleighExe, '-a', '.'
+	if (File.separator == '\\') {
+		def batch = sleighExe + '.bat'
+		if (batch =~ /[%!&|<>^()"\r\n]/) {
+			throw new GradleException('Unsafe Windows Ghidra install path for the Sleigh launcher')
+		}
+		commandLine 'cmd.exe', '/d', '/e:on', '/v:off', '/c', 'call', batch, '-a', '.'
+	} else {
+		commandLine sleighExe, '-a', '.'
+	}
 }
 buildExtension.dependsOn compileSleigh
