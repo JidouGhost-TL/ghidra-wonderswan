@@ -51,7 +51,8 @@ FIXTURE_CHECKPOINTS = {
                "await_analyze_prompt_dismissal", "await_analysis_options", "activate_analysis_options",
                "verify_analyzer_table", "reveal_evidence_analyzer", "select_evidence_analyzer",
                "verify_evidence_analyzer_selected", "verify_run_wsmachine", "set_evidence_report",
-               "verify_default_run_wsmachine", "toggle_static_wsmachine", "await_static_wsmachine_off",
+               "verify_default_run_wsmachine", "focus_static_wsmachine", "toggle_static_wsmachine",
+               "await_static_wsmachine_off",
                "verify_evidence_report", "apply_analysis_options", "verify_applied_analysis_options",
                "submit_analysis_options", "await_analysis_options_dismissal",
                "wait_for_analysis", "save_program", "set_read_only"},
@@ -273,7 +274,7 @@ class GhidraGui(Session):
             if not state.endswith("=true"):
                 raise RuntimeError("Static WSMachine editor did not report a boolean state")
             if time.monotonic() >= deadline:
-                raise VisibleEvidenceTimeout("The active WSMachine editor stayed enabled after a single click")
+                raise VisibleEvidenceTimeout("The active WSMachine editor stayed enabled after one input")
             time.sleep(0.25)
 
     def configure_visible_analysis(self, file, report_path, analyzer_page_keys=False):
@@ -316,18 +317,28 @@ class GhidraGui(Session):
             if value != report_path:
                 raise RuntimeError("Evidence report editor did not retain the expected path")
         else:
+            if analyzer_page_keys:
+                self.checkpoint("focus_static_wsmachine", file)
+                self.call("focus-static-wsmachine")
             self.checkpoint("toggle_static_wsmachine", file)
-            self.call("point", *point)
+            if analyzer_page_keys:
+                self.call("press-static-wsmachine-space")
+            else:
+                self.call("point", *point)
             self.checkpoint("await_static_wsmachine_off", file)
             self.await_static_wsmachine_off()
+            if analyzer_page_keys and self.call("read-static-wsmachine") != "false":
+                raise RuntimeError("The focused Run WSMachine checkbox did not turn off")
 
-    def verify_applied_analysis_values(self, file, report_path):
+    def verify_applied_analysis_values(self, file, report_path, analyzer_page_keys=False):
         self.wait(r"^ACTIVE\tAnalysis Options\t")
         self.wait(r"^analysis-selected-enabled\tWonderSwan Execution Evidence=true\t")
         observed = file == "bank-fe.ws"
         state, _ = self.scoped_analysis_option("Run WSMachine", "PropertyBoolean:checked")
         if not state.endswith("=true" if observed else "=false"):
             raise RuntimeError("Applied analysis options changed the expected execution evidence state")
+        if not observed and analyzer_page_keys and self.call("read-static-wsmachine") != "false":
+            raise RuntimeError("Apply changed the focused Run WSMachine checkbox")
         if observed:
             report, _ = self.scoped_analysis_option("Evidence report file (JSON lines; empty = none)", "PropertyText")
             if report != report_path:
@@ -603,7 +614,7 @@ def stage_import(ui, fixture_dir, project_dir, report_path, chooser_row=False, f
             ui.checkpoint("apply_analysis_options", file)
             ui.call("click-analysis-button", "Apply")
             ui.checkpoint("verify_applied_analysis_options", file)
-            ui.verify_applied_analysis_values(file, report_path)
+            ui.verify_applied_analysis_values(file, report_path, analyzer_page_keys)
             ui.checkpoint("submit_analysis_options", file)
             ui.call("click-analysis-button", "Analyze")
             ui.checkpoint("await_analysis_options_dismissal", file)

@@ -30,6 +30,7 @@ import java.util.regex.Pattern;
 import javax.imageio.ImageIO;
 import javax.swing.AbstractButton;
 import javax.swing.JButton;
+import javax.swing.JCheckBox;
 import javax.swing.JComponent;
 import javax.swing.JComboBox;
 import javax.swing.JLabel;
@@ -48,12 +49,17 @@ public class GuiAgent {
     private static final String IMPORT_CHOOSER = "Select File to Import";
     private static final String IMPORT_SUMMARY = "Import Results Summary";
     private static final String ANALYSIS_OPTIONS = "Analysis Options";
+    private static final String EVIDENCE_ANALYZER = "WonderSwan Execution Evidence";
+    private static final String STATIC_OPTION = "Run WSMachine";
+    private static final String REPORT_OPTION = "Evidence report file (JSON lines; empty = none)";
     private static Window preferredWindow;
     private static JButton watchedButton;
     private static Window watchedWindow;
     private static int buttonActions;
     private static ActionListener watchedListener;
     private static String watchedAnalyzeFixture;
+    private static Control staticMachineControl;
+    private static boolean staticMachineSpaceSent;
     public static void premain(String argument) {
         Thread worker = new Thread(() -> work(Path.of(argument)), "gui-rehearsal");
         worker.setDaemon(true);
@@ -235,7 +241,7 @@ public class GuiAgent {
             if (optionLabel instanceof JLabel text && optionEditor != null) {
                 Rectangle area = new Rectangle(0, 0, optionEditor.getWidth(), optionEditor.getHeight());
                 rows.add(new Control(optionEditor.getClass().getSimpleName() + ":option", text.getText(),
-                    center(optionEditor, area), area, owner));
+                    center(optionEditor, area), area, owner, optionEditor));
             }
             for (Component child : parent.getComponents()) {
                 collect(child, rows, owner);
@@ -588,6 +594,130 @@ public class GuiAgent {
             }
         }
         throw new IllegalStateException("No visible analyzer cell to focus within the active desktop");
+    }
+
+    private static Control activeAnalysisOption(String role, String name) throws Exception {
+        Window owner = window(Pattern.quote(ANALYSIS_OPTIONS));
+        var keyboard = KeyboardFocusManager.getCurrentKeyboardFocusManager();
+        if (!(owner instanceof Dialog) || !owner.isActive() || keyboard.getActiveWindow() != owner) {
+            throw new IllegalStateException("Analysis Options does not own the active keyboard window");
+        }
+        var options = new ArrayList<Control>();
+        collect(owner, options, owner);
+        if (options.stream().filter(row -> "analysis-selected-enabled".equals(row.role)
+                && (EVIDENCE_ANALYZER + "=true").equals(row.name)).count() != 1) {
+            throw new IllegalStateException("The active Analysis Options lacks the selected execution evidence analyzer");
+        }
+        var matching = options.stream().filter(row -> role.equals(row.role) && name.equals(row.name)).toList();
+        if (matching.size() != 1 || !(matching.getFirst().component instanceof JComponent widget)
+                || !widget.isEnabled() || !widget.isFocusable() || widget.getVisibleRect().isEmpty()
+                || !name.equals(widget.getAccessibleContext().getAccessibleName())
+                || !"docking.options.editor.DefaultOptionComponent".equals(widget.getParent().getClass().getName())) {
+            throw new IllegalStateException("Expected the exact active analysis option editor");
+        }
+        return matching.getFirst();
+    }
+
+    private static Control activeStaticMachineControl() throws Exception {
+        Control control = activeAnalysisOption("PropertyBoolean:option", STATIC_OPTION);
+        if (!(control.component instanceof JCheckBox)
+                || !"ghidra.framework.options.PropertyBoolean".equals(control.component.getClass().getName())) {
+            throw new IllegalStateException("Expected the stock Run WSMachine checkbox");
+        }
+        return control;
+    }
+
+    private static JCheckBox sameStaticMachineControl(Control previous) throws Exception {
+        Control current = activeStaticMachineControl();
+        if (previous == null || current.owner != previous.owner || current.component != previous.component) {
+            throw new IllegalStateException("The focused Run WSMachine checkbox was replaced");
+        }
+        return (JCheckBox) current.component;
+    }
+
+    private static void requireOwnedFocus(Control control, Component expected) {
+        var keyboard = KeyboardFocusManager.getCurrentKeyboardFocusManager();
+        Component focused = keyboard.getFocusOwner();
+        if (!control.owner.isActive() || focused == null || focused != expected
+                || SwingUtilities.getWindowAncestor(focused) != control.owner) {
+            throw new IllegalStateException("The exact analysis option lacks foreground keyboard focus");
+        }
+    }
+
+    private static int focusStaticMachineControl(Robot robot) throws Exception {
+        Control checkbox = edt(() -> {
+            Control current = activeStaticMachineControl();
+            if (staticMachineControl != null || !((JCheckBox) current.component).isSelected()) {
+                throw new IllegalStateException("Expected the default enabled static checkbox before focus");
+            }
+            return current;
+        });
+        Control anchor = edt(() -> activeAnalysisOption("PropertyText:option", REPORT_OPTION));
+        Point point = edt(() -> {
+            if (!(anchor.component instanceof JTextField text) || anchor.owner != checkbox.owner) {
+                throw new IllegalStateException("Expected the stock report editor as the focus starting point");
+            }
+            Point target = center(text, text.getVisibleRect());
+            if (!anchor.owner.getBounds().contains(target)
+                    || !anchor.owner.getGraphicsConfiguration().getBounds().contains(target)) {
+                throw new IllegalStateException("The report editor focus point is outside the active desktop");
+            }
+            return target;
+        });
+        click(robot, point, 1, InputEvent.BUTTON1_DOWN_MASK);
+        robot.waitForIdle();
+        edt(() -> {
+            requireOwnedFocus(checkbox, anchor.component);
+            return null;
+        });
+        for (int tabs = 0; tabs <= 12; tabs++) {
+            boolean done = edt(() -> {
+                JCheckBox target = sameStaticMachineControl(checkbox);
+                if (!target.isSelected()) {
+                    throw new IllegalStateException("Focus traversal changed the checkbox value");
+                }
+                Component focused = KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner();
+                requireOwnedFocus(checkbox, focused);
+                if (focused == target) {
+                    staticMachineControl = checkbox;
+                    return true;
+                }
+                if (!focused.getFocusTraversalKeys(KeyboardFocusManager.FORWARD_TRAVERSAL_KEYS)
+                        .contains(KeyStroke.getKeyStroke(KeyEvent.VK_TAB, 0))) {
+                    throw new IllegalStateException("The owned focused editor lacks stock Tab traversal");
+                }
+                return false;
+            });
+            if (done) {
+                return tabs;
+            }
+            if (tabs < 12) {
+                chord(robot, "TAB");
+                robot.waitForIdle();
+            }
+        }
+        throw new IllegalStateException("Tab traversal did not reach the exact Run WSMachine checkbox");
+    }
+
+    private static void pressStaticMachineSpace(Robot robot) throws Exception {
+        edt(() -> {
+            JCheckBox checkbox = sameStaticMachineControl(staticMachineControl);
+            requireOwnedFocus(staticMachineControl, checkbox);
+            if (staticMachineSpaceSent || !checkbox.isSelected()) {
+                throw new IllegalStateException("Expected one Space on the enabled Run WSMachine checkbox");
+            }
+            for (boolean release : new boolean[] {false, true}) {
+                var stroke = KeyStroke.getKeyStroke(KeyEvent.VK_SPACE, 0, release);
+                Object binding = checkbox.getInputMap(JComponent.WHEN_FOCUSED).get(stroke);
+                var action = binding == null ? null : checkbox.getActionMap().get(binding);
+                if (action == null || !action.isEnabled()) {
+                    throw new IllegalStateException("The focused Run WSMachine checkbox lacks a Space binding");
+                }
+            }
+            staticMachineSpaceSent = true;
+            return null;
+        });
+        chord(robot, "SPACE");
     }
 
     private static void requireAnalyzerPageKey(Control control, int key, int direction) {
@@ -964,6 +1094,17 @@ public class GuiAgent {
                 chord(robot, parts[1]);
                 yield "";
             }
+            case "focus-static-wsmachine" -> Integer.toString(focusStaticMachineControl(robot));
+            case "press-static-wsmachine-space" -> {
+                pressStaticMachineSpace(robot);
+                yield "";
+            }
+            case "read-static-wsmachine" -> edt(() -> {
+                if (!staticMachineSpaceSent) {
+                    throw new IllegalStateException("No verified Space was sent to Run WSMachine");
+                }
+                return Boolean.toString(sameStaticMachineControl(staticMachineControl).isSelected());
+            });
             case "chooser-path-enter" -> {
                 boolean focused = edt(() -> {
                     Window chooser = window(IMPORT_CHOOSER);
