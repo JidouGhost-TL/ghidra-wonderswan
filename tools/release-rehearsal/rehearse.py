@@ -22,6 +22,11 @@ import zipfile
 here = Path(__file__).resolve().parent
 example = here.parents[1] / "examples/banked-call"
 pins = json.loads((here / "inputs.json").read_text())
+candidate_commit = "e1ebe4beb2d46889ddcd68c5b9f6bef58edf4160"
+candidate_sha256 = {
+    "v30mz": "a13834a0c8c19a6e8189d7e16496eec577ed6db8c3020d0a5fe4ea4bd0fbf2c9",
+    "wonderswan": "c25db5e56e0555c371f034d125d0c1d40ba22affb4777ecf2b4e657c019254e7",
+}
 platforms = {("Linux", "x86_64"): "Linux-x64", ("Windows", "AMD64"): "Windows-x64",
              ("Darwin", "arm64"): "Darwin-arm64", ("Darwin", "x86_64"): "Darwin-x64"}
 redirect_hosts = {"github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"}
@@ -216,21 +221,84 @@ def require_mach_executable(description, host):
             "Wrong native decompiler executable architecture")
 
 
-def prepare(output, host, cache, diagnostic):
+def pin_gradle(gradle):
+    wrapper = gradle / "gradle-wrapper.properties"
+    text = wrapper.read_text()
+    require("gradle-9.6.1-bin.zip" in text and "distributionSha256Sum=" not in text, "Gradle pin drift")
+    wrapper.write_text(text + f'\ndistributionSha256Sum={pins["gradle_sha256"]}\n')
+
+
+def stage_candidate_source(output, checkout, diagnostic):
+    diagnostic.begin("candidate_source")
+    readback = run(["git", "-C", checkout, "rev-parse", "HEAD"], os.environ, output / "candidate-source.log")
+    require(readback.strip() == candidate_commit, "Unexpected candidate source commit")
+    archive = output / "candidate-source.zip"
+    run(["git", "-C", checkout, "archive", "--format=zip", "-o", archive, candidate_commit],
+        os.environ, output / "candidate-source-archive.log")
+    source = output / "candidate-source"
+    unzip(archive, source)
+    return source
+
+
+def candidate_archive_pins():
+    return {f"{module}-candidate.zip": sha for module, sha in candidate_sha256.items()}
+
+
+def build_candidate(output, source, host, ghidra, env, diagnostic):
+    gradle = ghidra / "support" / "gradle"
+    build_env = dict(env)
+    for key in ("JAVA_OPTS", "GRADLE_OPTS"):
+        build_env.pop(key, None)
+    args = []
+    if host == "Windows-x64":
+        # This immutable source predates the platform-aware compileSleigh task.
+        # Compile with the equivalent stock batch entry point before packaging.
+        log = output / "candidate-sleigh.log"
+        diagnostic.begin("candidate_sleigh", log=log)
+        run([ghidra / "support" / "sleigh.bat", "-a", "."], build_env, log,
+            cwd=source / "v30mz" / "data" / "languages", timeout=180)
+        require((source / "v30mz" / "data" / "languages" / "v30mz.sla").is_file(),
+                "Candidate Sleigh compilation produced no language")
+        args = ["--exclude-task", ":v30mz:compileSleigh"]
+
+    wrapper = gradle / ("gradlew.bat" if host == "Windows-x64" else "gradlew")
+    log = output / "candidate-extension-build.log"
+    diagnostic.begin("gradle_candidate_build", log=log)
+    run([wrapper, "--no-daemon", "--offline", "--project-dir", source, "buildExtension", *args],
+        build_env, log, timeout=600)
+    diagnostic.begin("candidate_archive_digests")
+    verified = []
+    for module, sha in candidate_sha256.items():
+        matches = list((source / module / "dist").glob(f"ghidra_12.1.3_PUBLIC_*_{module}.zip"))
+        require(len(matches) == 1 and digest(matches[0]) == sha, "Candidate archive SHA-256 differs")
+        verified.append((module, matches[0]))
+    extensions = []
+    for module, archive in verified:
+        dest = output / "downloads" / f"{module}-candidate.zip"
+        archive.rename(dest)
+        extensions.append(dest)
+    return extensions
+
+
+def prepare(output, host, cache, diagnostic, *, candidate_checkout=None):
     diagnostic.begin("validate_release_pins")
     validate_pins()
     diagnostic.begin("fresh_directory")
     output.mkdir()
     downloads = output/"downloads"
     downloads.mkdir()
+    source = stage_candidate_source(output, candidate_checkout, diagnostic) if candidate_checkout is not None else None
     diagnostic.begin("fetch_ghidra")
     ghidra = download(pins["ghidra"], downloads, cache)
-    diagnostic.begin("fetch_extensions")
-    extensions = [download(spec, downloads, cache) for spec in pins["extensions"]]
-    release_checksums = download(pins["extension_manifest"], downloads, cache)
-    expected = {name: sha for _, _, name, sha in pins["extensions"]}
-    require(dict((name, sha) for sha, name in (line.split() for line in
-            release_checksums.read_text().splitlines())) == expected, "Published manifest disagrees")
+    if source is None:
+        diagnostic.begin("fetch_extensions")
+        extensions = [download(spec, downloads, cache) for spec in pins["extensions"]]
+        release_checksums = download(pins["extension_manifest"], downloads, cache)
+        expected = {name: sha for _, _, name, sha in pins["extensions"]}
+        require(dict((name, sha) for sha, name in (line.split() for line in
+                release_checksums.read_text().splitlines())) == expected, "Published manifest disagrees")
+    else:
+        expected = candidate_archive_pins()
     diagnostic.begin("fetch_jdk")
     jdk = download(["adoptium/temurin21-binaries", "jdk-21.0.13.1+2", *pins["jdk"][host]], downloads, cache)
     diagnostic.begin("unpack_ghidra")
@@ -258,13 +326,10 @@ def prepare(output, host, cache, diagnostic):
     arches = ("aarch64",) if host.endswith("arm64") else ("amd64","x86_64")
     require("21.0.13.1+2" in version and any(f"os.arch = {arch}\n" in version for arch in arches),
             "Wrong native JDK")
+    gradle = ghidra / "support" / "gradle"
     if host.startswith("Darwin"):
         diagnostic.begin("mac_toolchain")
-        gradle = ghidra/"support/gradle"
-        wrapper = gradle/"gradle-wrapper.properties"
-        text = wrapper.read_text()
-        require("gradle-9.6.1-bin.zip" in text and "distributionSha256Sum=" not in text, "Gradle pin drift")
-        wrapper.write_text(text + f'\ndistributionSha256Sum={pins["gradle_sha256"]}\n')
+        pin_gradle(gradle)
         run(["/usr/bin/xcrun", "--find", "clang"], env, output/"clang-path.log")
         run(["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path"], env, output/"macos-sdk.log")
         developer = env.get("DEVELOPER_DIR")
@@ -295,15 +360,22 @@ def prepare(output, host, cache, diagnostic):
     state = {"platform":host, "ghidra_sha256":pins["ghidra"][3], "jdk_sha256":pins["jdk"][host][1],
              "extensions":expected, "native_sha256":digest(native),
              "runner_image":os.environ.get("ImageVersion"), "os":platform.release()}
+    if source is not None:
+        if not host.startswith("Darwin"):
+            diagnostic.begin("candidate_gradle_pin")
+            pin_gradle(gradle)
+        extensions = build_candidate(output, source, host, ghidra, env, diagnostic)
+        state["source_commit"] = candidate_commit
     (output/"setup.json").write_text(json.dumps(state, indent=2) + "\n")
     return extensions
 
 
-def expected_files(output):
+def expected_files(output, *, candidate=False):
     files = {}
-    for spec in pins["extensions"]:
-        archive = output/"downloads"/spec[2]
-        require(digest(archive) == spec[3], "Extension archive changed")
+    archive_pins = candidate_archive_pins() if candidate else {name: sha for _, _, name, sha in pins["extensions"]}
+    for name, sha in archive_pins.items():
+        archive = output / "downloads" / name
+        require(digest(archive) == sha, "Extension archive changed")
         with zipfile.ZipFile(archive) as z:
             for entry in z.infolist():
                 if not entry.is_dir():
@@ -315,20 +387,21 @@ def extension_tree(output):
     return output/"home/settings/ghidra/ghidra_12.1.3_PUBLIC/Extensions"
 
 
-def verify_install(output):
+def verify_install(output, *, candidate=False):
     prefix = extension_tree(output)
-    expected = expected_files(output)
+    expected = expected_files(output, candidate=candidate)
     got = {path.relative_to(prefix):digest(path) for path in prefix.rglob("*") if path.is_file()}
-    require(got == expected and len(got) == 44, "Installed extension files differ from the public ZIPs")
+    require(got == expected and len(got) == (60 if candidate else 44),
+            "Installed extension files differ from the approved ZIPs")
     return len(got)
 
 
-def headless(output, host, extensions, wrapper, diagnostic):
+def headless(output, host, extensions, wrapper, diagnostic, *, candidate=False):
     diagnostic.begin("install_extensions")
     ghidra, java, home, env = paths(output, host)
     for archive in extensions:
         unzip(archive, extension_tree(output))
-    installed = verify_install(output)
+    installed = verify_install(output, candidate=candidate)
     launcher = wrapper or ghidra/"support"/("analyzeHeadless.bat" if host == "Windows-x64" else "analyzeHeadless")
     projects = output/"projects"
     projects.mkdir()
@@ -365,8 +438,11 @@ def headless(output, host, extensions, wrapper, diagnostic):
     for key in ("ghidra_sha256", "jdk_sha256", "native_sha256"):
         require(re.fullmatch(r"[0-9a-f]{64}", state[key]), f"Invalid {key}")
         result[key] = state[key]
-    result["extension_sha256"] = [spec[3] for spec in pins["extensions"]]
-    print("PUBLIC_GHIDRA_HEADLESS_PASS " + json.dumps(result, separators=(",", ":")))
+    if candidate:
+        result["source_commit"] = candidate_commit
+    result["extension_sha256"] = list(state["extensions"].values())
+    tag = "PUBLIC_GHIDRA_CANDIDATE_HEADLESS_PASS" if candidate else "PUBLIC_GHIDRA_HEADLESS_PASS"
+    print(tag + " " + json.dumps(result, separators=(",", ":")))
 
 
 def main():
@@ -374,6 +450,7 @@ def main():
     parser.add_argument("mode", choices=("headless","stage-gui","gui-probe","launch-gui","verify-gui-install"))
     parser.add_argument("directory", type=Path)
     parser.add_argument("--cache", type=Path)
+    parser.add_argument("--candidate-checkout", type=Path)
     parser.add_argument("--local-wrapper", type=Path)
     parser.add_argument("--project", type=Path)
     parser.add_argument("--expected-host", choices=platforms.values())
@@ -383,10 +460,12 @@ def main():
     diagnostic = Diagnostic(host or "unsupported")
     try:
         require(host is not None and (args.expected_host is None or host == args.expected_host), "Unexpected native host")
+        candidate = args.candidate_checkout is not None
+        require(not candidate or args.mode in ("headless", "stage-gui"), "Unexpected candidate mode")
         if args.mode in ("headless","stage-gui"):
-            extensions = prepare(output, host, args.cache, diagnostic)
+            extensions = prepare(output, host, args.cache, diagnostic, candidate_checkout=args.candidate_checkout)
             if args.mode == "headless":
-                headless(output, host, extensions, args.local_wrapper, diagnostic)
+                headless(output, host, extensions, args.local_wrapper, diagnostic, candidate=candidate)
         elif args.mode == "verify-gui-install":
             diagnostic.begin("gui_install_verification")
             print(f"{verify_install(output)} installed files match the approved ZIPs")

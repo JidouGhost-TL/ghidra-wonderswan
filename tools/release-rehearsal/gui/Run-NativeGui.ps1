@@ -3,7 +3,8 @@
 param(
     [Parameter(Mandatory = $true)]
     [string] $Output,
-    [string] $Python = 'python'
+    [string] $Python = 'python',
+    [string] $CandidateCheckout
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,5 +16,9 @@ if (-not $IsWindows -or [System.Diagnostics.Process]::GetCurrentProcess().Sessio
 # The Python launcher creates a new Windows console and uses Ghidra's foreground
 # mode. This PowerShell step can have redirected standard streams.
 $driver = Join-Path $PSScriptRoot 'run_windows.py'
-& $Python -B $driver $Output
+$driverArgs = @($Output)
+if ($CandidateCheckout) {
+    $driverArgs += @('--candidate-checkout', $CandidateCheckout)
+}
+& $Python -B $driver @driverArgs
 exit $LASTEXITCODE

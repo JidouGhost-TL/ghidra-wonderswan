@@ -179,6 +179,7 @@ def cold_reopen_environment(env):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=Path)
+    parser.add_argument("--candidate-checkout", type=Path)
     parser.add_argument("--expected-host", required=True, choices=hosts.values())
     args = parser.parse_args()
     host = args.expected_host
@@ -190,13 +191,14 @@ def main():
         require_gui_session()
         output = args.output.resolve()
         require(not output.exists() and not re.search(r"[\s=]", str(output)), "Expected a fresh GUI scratch path")
-        extensions = rehearse.prepare(output, host, None, diagnostic)
+        candidate = args.candidate_checkout is not None
+        extensions = rehearse.prepare(output, host, None, diagnostic, candidate_checkout=args.candidate_checkout)
         ghidra, java, _, env = rehearse.paths(output, host)
         desktop_checks(output, java, env, diagnostic)
         diagnostic.begin("install_extensions")
         for archive in extensions:
             rehearse.unzip(archive, rehearse.extension_tree(output))
-        installed = rehearse.verify_install(output)
+        installed = rehearse.verify_install(output, candidate=candidate)
         diagnostic.begin("build_driver")
         agent = build_driver(output, java, env)
         projects = output / "projects"
@@ -220,10 +222,13 @@ def main():
                   "desktop_pixels_and_input": True, "forced_headless_refused": True, "fresh_gui_process": True,
                   "cold_reopen_startup_tip": "disabled",
                   "installed_files": installed, "same_saved_database_sha256": sorted(before.files.values()),
-                  "fixtures": fixtures, "extension_sha256": [item[3] for item in rehearse.pins["extensions"]],
+                  "fixtures": fixtures, "extension_sha256": list(state["extensions"].values()),
                   **{key: state[key] for key in pin_fields}}
+        if candidate:
+            result["source_commit"] = state["source_commit"]
         (output / "GUI-RECEIPT.json").write_text(json.dumps(result, indent=2) + "\n")
-        emit("PUBLIC_GHIDRA_GUI_PASS", result)
+        tag = "PUBLIC_GHIDRA_CANDIDATE_GUI_PASS" if candidate else "PUBLIC_GHIDRA_GUI_PASS"
+        emit(tag, result)
         return 0
     except Exception as error:
         diagnostic.fail(error)
