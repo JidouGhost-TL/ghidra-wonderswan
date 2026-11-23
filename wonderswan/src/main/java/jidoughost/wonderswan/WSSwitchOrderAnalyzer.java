@@ -15,7 +15,7 @@ import ghidra.util.exception.CancelledException;
 import ghidra.util.task.TaskMonitor;
 
 /**
- * Rule J1u: J1 for unguarded byte-index JMP tables, run on newly decoded instructions just before stock
+ * Rule J1u: J1 for unguarded byte-index and masked JMP tables, run on newly decoded instructions just before stock
  * Decompiler Switch Analysis ({@code AnalysisPriority.CODE_ANALYSIS}) sees them.
  *
  * <p>Ordering, from the stock analyzer: it is an instruction analyzer at CODE_ANALYSIS and collects every
@@ -23,9 +23,9 @@ import ghidra.util.task.TaskMonitor;
  * reference before it decompiles anything. The function it decompiles reads the jump table from a stored
  * override when one exists. Phase 2 J1 runs at LOW_PRIORITY, after stock switch analysis has already
  * decompiled every site, so for a byte-index site without a guard the stock decompiler bounded the index
- * only by its width and read handler bytes as slots. This analyzer runs one step earlier on the same
+ *  only by its width (or mask) and read handler bytes as slots. This analyzer runs one step earlier on the same
  * instructions: a proven table gets J1's references and, inside a function, J1's lock. Everything else
- * (sites J1 cannot prove, guarded or masked tables, computed calls) reaches stock switch analysis as
+ * (sites J1 cannot prove, guarded tables, computed calls) reaches stock switch analysis as
  * before. Phase 2 J1 still re-derives every site from the final listing.
  *
  * <p>Needs the phase-1 execution evidence (EXECUTED_CODE stops, observed targets): without it, or with
@@ -39,7 +39,7 @@ public class WSSwitchOrderAnalyzer extends AbstractAnalyzer {
     private static final Map<Program, WSJumpTables> STATE = Collections.synchronizedMap(new WeakHashMap<>());
 
     public WSSwitchOrderAnalyzer() {
-        super(NAME, "Applies proven CS-relative jump tables with an unguarded byte index (rule J1u) before "
+        super(NAME, "Applies proven CS-relative jump tables with an unguarded byte or masked index (rule J1u) before "
             + "Decompiler Switch Analysis, which would otherwise read every byte-index slot.",
             AnalyzerType.INSTRUCTION_ANALYZER);
         setPriority(AnalysisPriority.CODE_ANALYSIS.before());
@@ -72,7 +72,7 @@ public class WSSwitchOrderAnalyzer extends AbstractAnalyzer {
         try {
             int applied = j.applyBeforeSwitchAnalysis(set, monitor);
             if (applied > 0) {
-                String msg = NAME + ": J1u applied " + applied + " unguarded byte-index tables (total "
+                String msg = NAME + ": J1u applied " + applied + " unguarded byte-index or masked tables (total "
                     + j.beforeSwitch + ")";
                 log.appendMsg(msg);
                 Msg.info(this, msg);

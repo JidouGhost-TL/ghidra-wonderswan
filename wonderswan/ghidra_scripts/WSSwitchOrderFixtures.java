@@ -21,6 +21,8 @@ import jidoughost.wonderswan.WonderSwanLoader;
  *             the handler bytes as 121 more slots.
  * unprovable: the same dispatcher, but the word after the 7 slots points at erased bytes (a weak stop): J1 cannot
  *             prove an end; the site is tagged (rule C) and preserved, and no table end is invented.
+ * masked:     IN AL,0B5h; MOV BL,AL; MOV BH,0; AND BX,0FEh; ADD BX,tbl; JMP CS:[BX]: the mask allows 128 slots, the
+ *             table has 7 followed by its handler; same expectations as proven.
  * guarded:    CMP AL,6; JA out before the scaling: stock switch recovery bounds it itself and keeps it (unchanged).
  *
  * Usage: headless post script on any program (it imports its own cartridges into a temporary project).
@@ -44,7 +46,7 @@ public class WSSwitchOrderFixtures extends GhidraScript {
 
     static String word(int v) { return String.format("%02x%02x", v & 0xff, (v >> 8) & 0xff); }
 
-    static final int SITE_PROVEN = 0x50, TABLE = 0x60, SITE_GUARDED = 0x54;
+    static final int SITE_PROVEN = 0x50, TABLE = 0x60, SITE_GUARDED = 0x54, SITE_MASKED = 0x4e;
     static final int[] ADJACENT = {0x6e, 0x75, 0x7c, 0x83, 0x8a, 0x91, 0x98};
     static final int[] DETACHED = {0x100, 0x107, 0x10e, 0x115, 0x11c, 0x123, 0x12a};
 
@@ -55,7 +57,10 @@ public class WSSwitchOrderFixtures extends GhidraScript {
         // reset: CLI; XOR AX,AX; MOV DS,AX; MOV AL,[0100h]; CMP AL,5Ah; JNZ spin; CALL 0040h; spin: JMP spin
         put(rom, 0x00, "fa31c08ed8a000013c5a7503e83100ebfe");
         int[] handlers = variant.equals("unprovable") ? DETACHED : ADJACENT;
-        if (variant.equals("guarded")) {
+        if (variant.equals("masked")) {
+            // IN AL,0B5h; MOV BL,AL; MOV BH,0; AND BX,00FEh; ADD BX,0060h; JMP CS:[BX]
+            put(rom, 0x40, "e4b588c3b70081e3fe0081c360002eff27");
+        } else if (variant.equals("guarded")) {
             // IN AL,0B5h; NOP x4; CMP AL,6; JA 0057h; SHL AL,1; MOV BL,AL; MOV BH,0; ADD BX,0060h;
             // JMP CS:[BX]; RET
             put(rom, 0x40, "e4b5909090903c06770dd0e088c3b70081c360002eff27c3");
@@ -125,7 +130,7 @@ public class WSSwitchOrderFixtures extends GhidraScript {
             try { analyzeAll(p); } finally { p.endTransaction(tx, true); }
             long seconds = (System.nanoTime() - t0) / 1_000_000_000L;
             check(variant, seconds < 120, "analysis finished in " + seconds + " s");
-            Address site = at(p, variant.equals("guarded") ? SITE_GUARDED : SITE_PROVEN);
+            Address site = at(p, variant.equals("guarded") ? SITE_GUARDED : variant.equals("masked") ? SITE_MASKED : SITE_PROVEN);
             Instruction ins = p.getListing().getInstructionAt(site);
             check(variant, ins != null && ins.toString().startsWith("JMP"), "dispatch site decoded: " + ins);
             if (ins == null) return;
@@ -160,7 +165,7 @@ public class WSSwitchOrderFixtures extends GhidraScript {
             check(variant, stray.isEmpty(), "no code decoded from handler bytes read as slots: " + stray);
             check(variant, errors == 0, "no ERROR bookmarks (" + errors + ")");
             boolean stock = has(p, site, "switchD", SourceType.ANALYSIS);
-            if (variant.equals("proven"))
+            if (!variant.equals("guarded"))
                 check(variant, !stock, "stock switch recovery did not reach the site (no switchD label)");
             else
                 check(variant, stock, "stock switch recovery still recovers the guarded table (switchD label)");
@@ -177,7 +182,7 @@ public class WSSwitchOrderFixtures extends GhidraScript {
     public void run() throws Exception {
         File dir = Files.createTempDirectory("ws-switch-order").toFile();
         String[] args = getScriptArgs();
-        List<String> variants = args.length > 0 ? List.of(args) : List.of("proven", "unprovable", "guarded");
+        List<String> variants = args.length > 0 ? List.of(args) : List.of("proven", "masked", "unprovable", "guarded");
         for (String v : variants) {
             try { fixture(dir, v); }
             catch (Exception e) { check(v, false, "fixture raised " + e); }

@@ -20,7 +20,7 @@ Package `jidoughost.wonderswan`. Requires the `v30mz` extension (language `V30MZ
 | `WSEvidenceAnalyzer` | Auto-analysis phase 1: runs `WSMachine` (or loads WSEmulate output) and seeds code from execution evidence |
 | `WSEvidenceRepairAnalyzer` | Auto-analysis phase 2: checks Ghidra's results against the same evidence; jump tables; calling convention |
 | `WSJumpTables` | Rule J1 (used by phase 2 and by `WSSwitchOrderAnalyzer`) |
-| `WSSwitchOrderAnalyzer` | Rule J1u: proven unguarded byte-index jump tables, applied just before Decompiler Switch Analysis |
+| `WSSwitchOrderAnalyzer` | Rule J1u: proven unguarded byte-index or masked jump tables, applied just before Decompiler Switch Analysis |
 | `WSCodeContext` | Rule C0: a default code segment for undecoded ROM bytes before flow (loader, phases 1 and 2) |
 | `WSRamCode` | Rule H2: RAM/SRAM code without a captured image is kept and tagged as an unresolved hypothesis (phase 2) |
 | `WSExecutedFunctions` | Rule E5: executed code outside every function gets a function (phase 2) |
@@ -188,7 +188,7 @@ still needs it.
 | N1 | 2 | Clear "does not return" where a call's fall-through executed |
 | E1R | 2 | Re-seed executed code later analysis removed |
 | J1 | 2 | CS-relative jump/call tables: backward slice for base + index bound (mask = upper bound, CMP/JA), stop rules EXECUTED_CODE / TABLE_BOUNDARY / OUT_OF_ROM / MID_INSTRUCTION / DEFINED_DATA / SELF; observed targets must be a subset (missing ones added and reported); overlay sites resolve within their overlay; J1o skips slots targeting the last overlay byte and deletes unproven computed references there |
-| J1u | before switch analysis | A `JMP` table with an unguarded byte index (no `CMP` guard, no `AND` mask, no conditional branch on the slice into the site) gets J1 as soon as it is decoded, before **Decompiler Switch Analysis** reaches it. Stock switch recovery can bound such an index only by its width, so it reads 128 or 256 slots and follows handler bytes as targets. With J1's references in place the stock analyzer skips the site, and a lock inside a function keeps later decompiles on the proven table. Sites J1 cannot prove yet, guarded or masked tables and computed calls reach stock switch analysis as before |
+| J1u | before switch analysis | A `JMP` table whose index is bounded only by its byte width or an `AND` mask (no `CMP` guard, no conditional branch or join after the index is loaded or masked) gets J1 as soon as it is decoded, before **Decompiler Switch Analysis** reaches it. Stock switch recovery can bound such an index only by that width or mask, so it reads up to 128 or 256 slots and follows handler bytes as targets. With J1's references in place the stock analyzer skips the site, and a lock inside a function keeps later decompiles on the proven table. Sites J1 cannot prove yet, guarded tables and computed calls reach stock switch analysis as before |
 | C | 2 | An unguarded byte-index `JMP` table that J1 leaves without a proven end gets a WARNING bookmark (category `WSJumpTableHazard`) and a log entry naming the site. The code is kept and no table end is invented |
 | D0 | 2 | Title DS default: if one DS ≠ 0 covers ≥ 50 % of executed addresses that ran with a single DS, it replaces the loader's DS = 0 default over the ROM (LSI C-86 titles run with DS = 1000, SRAM) — `WSCompilerRules` |
 | P1 | 2 | Functions whose entry has no current instruction image are preserved. The report records the unresolved entry and its creating references. |

@@ -89,10 +89,11 @@ import ghidra.util.task.TaskMonitor;
  *   return, every body range starts at a target), RET-terminated spans are kept as functions and JMP-terminated
  *   spans are demoted to case-blocks of the switch parent (stock switch-namespace labels stripped, the site
  *   re-locked to its proven targets). Anything else stays as it is.
- * J1u (analyzer WSSwitchOrderAnalyzer, just before stock Decompiler Switch Analysis): a JMP site with an unguarded
- *   byte-width index (J1c bound, no CMP guard, no AND mask) gets J1 as soon as it is decoded. Stock switch recovery
- *   bounds such an index only by its width, reads 128 or 256 slots of handler bytes as targets and can grow the
- *   native decompiler without limit. Stock analysis skips a computed jump that already has computed references,
+ * J1u (analyzer WSSwitchOrderAnalyzer, just before stock Decompiler Switch Analysis): a JMP site whose index is
+ *   bounded only by its byte width (J1c) or an AND mask, with no CMP guard and no conditional branch or join after
+ *   the index is loaded (or masked), gets J1 as soon as it is decoded. Stock switch recovery bounds such an index
+ *   only by that width or mask, reads up to 128 or 256 slots of handler bytes as targets and can grow the native
+ *   decompiler without limit. Stock analysis skips a computed jump that already has computed references,
  *   and a stored lock (when a function contains the site) keeps every later decompile on the proven table. Same
  *   recovery and stop rules; a site J1 cannot prove yet is left for the later passes.
  * Rule C (end of phase 2): an unguarded byte-index JMP site still unresolved for lack of a proven end gets a
@@ -425,15 +426,28 @@ public final class WSJumpTables {
     final Set<Address> csOperands = new HashSet<>();
     int beforeSwitch, beforeSwitchSites;
 
-    /** J1u scope: a byte-width index with no CMP guard and no AND mask, and no conditional branch on the
-     *  fall-through slice into the site (a guard on another register, e.g. CMP AL,n before MOV BL,AL, or a
-     *  guarded path joining the slice, bounds it for the stock recovery). Without a guard the stock switch
-     *  recovery can bound the index only by its width (128 or 256 slots), so it reads past the real table. */
+    /** J1u scope: an index bounded only by its byte width (J1c) or by an AND mask, with no CMP guard and no
+     *  conditional branch or join between the instruction that loads the index byte from memory and the site.
+     *  Stock switch recovery can then bound the index only by that width or mask (128 or 256 slots for a byte),
+     *  so it reads past the real table. A branch or join after the load may guard the value for the stock
+     *  recovery (e.g. CMP AL,n; JA before MOV BL,AL), so such sites stay with it; a join at or before the load
+     *  (or before the AND) cannot constrain the value it produces. An index copied from another byte register
+     *  is followed back to its own load. */
     boolean unguardedByteIndex(Instruction site, Rec r) {
-        if (r == null || !r.byteBound || r.maskOffsets != null) return false;
+        if (r == null || !r.byteBound && r.maskOffsets == null) return false;
+        String lo = r.idx == null ? null : (r.scaledBy == null ? r.idx : r.scaledBy);
+        lo = lo != null && lo.length() == 2 && (lo.charAt(1) == 'X' || lo.charAt(1) == 'L') ? lo.charAt(0) + "L" : null;
         List<Instruction> slice = new ArrayList<>(predecessors(site, 16));
         slice.add(0, site);
         for (Instruction q : slice) {
+            String t = q.toString().toUpperCase().replace(" ", "");
+            // a mask bounds whatever reached it: only branches and joins after the AND can guard
+            if (r.maskOffsets != null && t.startsWith("AND") && t.contains(",0X")) return true;
+            if (lo != null && t.startsWith("MOV" + lo + ",")) {
+                String src = t.substring(t.indexOf(',') + 1);
+                if (src.contains("[")) return true;                          // loaded from memory here
+                if (src.matches("[ABCD][LH]")) lo = src;                     // copied: follow the source byte
+            }
             if (q != site && q.getFlowType().isConditional()) return false;
             for (Reference ref : p.getReferenceManager().getReferencesTo(q.getAddress()))
                 if (ref.getReferenceType().isConditional()) return false;
@@ -442,12 +456,12 @@ public final class WSJumpTables {
     }
 
     /**
-     * Rule J1u: apply J1 to the unguarded byte-index JMP sites among newly decoded instructions before
+     * Rule J1u: apply J1 to the unguarded byte-index and masked JMP sites among newly decoded instructions before
      * stock Decompiler Switch Analysis reaches them. The site gets J1's computed references (the stock
      * analyzer skips a computed jump that already has computed references) and, when a function contains
      * it, J1's jump-table lock. Same recovery and stop rules as {@link #applyPass}; a site J1 cannot
-     * prove yet is left untouched for the later passes. Guarded and masked sites are left to stock
-     * recovery as before.
+     * prove yet is left untouched for the later passes (with a report line). Guarded sites are left to
+     * stock recovery as before.
      */
     int applyBeforeSwitchAnalysis(AddressSetView set, TaskMonitor monitor) throws Exception {
         List<Instruction> sites = new ArrayList<>();
@@ -469,7 +483,15 @@ public final class WSJumpTables {
         Map<Instruction, Rec> recs = new LinkedHashMap<>();
         for (Instruction ins : sites) {
             Rec r = recover(ins);
-            if (!unguardedByteIndex(ins, r) || r.targets.isEmpty()) continue;
+            if (r == null) continue;
+            String skip = !r.byteBound && r.maskOffsets == null ? null : !unguardedByteIndex(ins, r) ? "GUARDED"
+                : r.targets.isEmpty() ? "NOT_PROVEN" : null;
+            if (skip != null || r.targets.isEmpty() || !unguardedByteIndex(ins, r)) {
+                if (skip != null)
+                    emit.accept(String.format("{\"rule\":\"J1u\",\"site\":\"%s\",\"insn\":\"%s\",\"outcome\":\"LEFT_TO_LATER_PASSES\",\"why\":\"%s\",\"shape\":\"%s\",\"stop\":\"%s\",\"slots\":%d}",
+                        ins.getAddress(), ins, skip, r.shape, r.stop, r.slots));
+                continue;
+            }
             beforeSwitchSites++;
             recs.put(ins, r);
         }
@@ -507,7 +529,7 @@ public final class WSJumpTables {
             Instruction ins = listing.getInstructionAt(site);
             if (ins == null || !ins.getMnemonicString().equalsIgnoreCase("JMP")) continue;
             Rec r = recover(ins);
-            if (!unguardedByteIndex(ins, r) || !r.shape.contains("BYTE_INDEX_WEAK_STOP")) continue;
+            if (!r.byteBound || !unguardedByteIndex(ins, r) || !r.shape.contains("BYTE_INDEX_WEAK_STOP")) continue;
             String note = String.format("Rule C: unguarded byte-index CS jump table at %s (%s) has no range guard and "
                 + "no proven end (scan stopped on %s after %d slots); J1 left it unresolved. Stock switch recovery "
                 + "reads all %d index slots here.", r.tableAddress, r.bound, r.stop, r.slots, r.cap);
