@@ -126,6 +126,13 @@ def paths(output, host):
     return ghidra, java[0], home, env
 
 
+def require_mach_executable(description, host):
+    arch = "arm64" if host == "Darwin-arm64" else "x86_64"
+    prefix = re.escape(f"Mach-O 64-bit executable {arch}")
+    require(re.match(prefix + r"(?=$|[\s,])", description.strip()),
+            "Wrong native decompiler executable architecture")
+
+
 def prepare(output, host, cache):
     output.mkdir()
     downloads = output/"downloads"
@@ -184,9 +191,8 @@ def prepare(output, host, cache):
     native = base/"os"/ids[host]/basename
     require(native.is_file(), "Expected native decompiler is missing")
     if host.startswith("Darwin"):
-        identity = run(["/usr/bin/file", native], env, output/"native-format.log")
-        require("Mach-O" in identity and ("arm64" if host.endswith("arm64") else "x86_64") in identity,
-                "Wrong native decompiler architecture")
+        identity = run(["/usr/bin/file", "-b", native], env, output/"native-format.log")
+        require_mach_executable(identity, host)
     state = {"platform":host, "ghidra_sha256":pins["ghidra"][3], "jdk_sha256":pins["jdk"][host][1],
              "extensions":expected, "native_sha256":digest(native),
              "runner_image":os.environ.get("ImageVersion"), "os":platform.release()}
