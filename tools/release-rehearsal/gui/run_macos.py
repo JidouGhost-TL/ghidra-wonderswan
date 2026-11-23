@@ -171,6 +171,11 @@ def phase_run(phase, output, ghidra, agent, projects, env, diagnostic, *, finish
     return result
 
 
+def cold_reopen_environment(env):
+    # The pinned stock preference reads this JVM property before the profile file.
+    return dict(env, JAVA_TOOL_OPTIONS=env["JAVA_TOOL_OPTIONS"] + " -DSHOW_TIPS=false")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=Path)
@@ -200,7 +205,8 @@ def main():
                              finish_with_space=host == "Darwin-arm64")
         diagnostic.begin("gui_inventory_before_reopen")
         before = saved_databases(projects)
-        reopened = phase_run("reopen", output, ghidra, agent, projects, env, diagnostic)
+        reopened = phase_run("reopen", output, ghidra, agent, projects,
+                             cold_reopen_environment(env), diagnostic)
         diagnostic.begin("gui_inventory_after_reopen")
         after = saved_databases(projects)
         diagnostic.begin("verify_gui_receipt")
@@ -212,6 +218,7 @@ def main():
                 "Invalid native release receipt")
         result = {"schema": 1, "platform": host, "owned_foreground_process_groups": 2,
                   "desktop_pixels_and_input": True, "forced_headless_refused": True, "fresh_gui_process": True,
+                  "cold_reopen_startup_tip": "disabled",
                   "installed_files": installed, "same_saved_database_sha256": sorted(before.files.values()),
                   "fixtures": fixtures, "extension_sha256": [item[3] for item in rehearse.pins["extensions"]],
                   **{key: state[key] for key in pin_fields}}

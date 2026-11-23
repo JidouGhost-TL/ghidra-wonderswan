@@ -27,3 +27,5 @@ python3 -B tools/release-rehearsal/gui/run_macos.py /path/to/fresh-rehearsal --e
 Use `Darwin-x64` on Intel. The runner verifies the login GUI session and requires the foreground pixel and Robot input probe before creating the GUI project. The session must permit AWT screen observation and input. Each foreground JVM stays in an owned process group within the existing desktop session. The same strict visible evidence and read-only database checks apply to both architectures.
 
 The macOS failure log uses the same bounded checkpoints and timeout categories as Windows.
+
+The disposable macOS cold-reopen JVM starts with Ghidra's stock startup-tip preference disabled through `-DSHOW_TIPS=false`. The import JVM keeps the normal Ghidra startup behavior. The harness still refuses competing dialogs before reference input. [Stock preference](https://github.com/NationalSecurityAgency/ghidra/blob/Ghidra_12.1.3_build/Ghidra/Features/Base/src/main/java/ghidra/app/plugin/core/totd/TipOfTheDayPlugin.java#L91-L110)
