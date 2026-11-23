@@ -25,7 +25,9 @@ CHECKPOINTS = {
     "reopen": {"startup", "open_saved_project", "exit_ghidra"},
 }
 FIXTURE_CHECKPOINTS = {
-    "import": {"open_import_chooser", "select_import_file", "confirm_import_format", "inspect_import_summary",
+    "import": {"open_import_chooser", "activate_import_chooser", "verify_import_chooser_path",
+               "dismiss_import_chooser", "open_import_options", "activate_import_options",
+               "verify_import_language", "verify_import_loader", "inspect_import_summary",
                "open_program", "configure_analysis", "wait_for_analysis", "save_program", "set_read_only"},
     "reopen": {"open_read_only_program", "open_references", "inspect_references", "inspect_decompiler",
                "close_program"},
@@ -47,14 +49,15 @@ class GhidraGui(Session):
         value = step if fixture is None else f"{step} {fixture}"
         (self.directory / CHECKPOINT_FILE).write_text(value, encoding="ascii")
 
-    def wait(self, pattern, timeout=45):
+    def wait(self, pattern, timeout=45, *, present=True):
         start = time.monotonic()
         while True:
             view = self.call("snapshot")
-            if re.search(pattern, view, flags=re.M | re.I):
+            if bool(re.search(pattern, view, flags=re.M | re.I)) == present:
                 return view
             if time.monotonic() - start > timeout:
-                raise VisibleEvidenceTimeout(f"Expected visible GUI evidence: {pattern}")
+                expectation = "present" if present else "absent"
+                raise VisibleEvidenceTimeout(f"Expected GUI evidence to be {expectation}: {pattern}")
             time.sleep(0.25)
 
     def direct(self, operation, role, label):
@@ -145,16 +148,31 @@ def stage_import(ui, fixture_dir, project_dir, report_path):
         ui.checkpoint("open_import_chooser", file)
         ui.call("focus", literal(MANAGER))
         ui.choose("File", "Import File...")
-        ui.checkpoint("select_import_file", file)
+        chooser = literal("Select File to Import")
+        chooser_visible = r"^(?:ACTIVE|WINDOW)\t" + chooser + r"\t"
+        ui.checkpoint("activate_import_chooser", file)
+        ui.wait(chooser_visible)
+        ui.call("front", chooser)
+        ui.wait(r"^ACTIVE\t" + chooser + r"\t")
+        ui.checkpoint("verify_import_chooser_path", file)
+        fixture_path = str(Path(fixture_dir) / file)
         ui.direct("click", "DropDownSelectionTextField", ".*")
-        ui.enter_text(str(Path(fixture_dir) / file))
-        ui.button("Select File To Import")
-        ui.checkpoint("confirm_import_format", file)
-        ui.wait(r"^JTextField\tV30MZ:LE:16:default:default\t")
-        ui.wait(r"^GhidraComboBox\t.*WonderSwanLoader")
-        import_dialog = r"Import (?!Results Summary$).+"
+        ui.enter_text(fixture_path)
+        ui.wait(r"^DropDownSelectionTextField\t" + literal(fixture_path) + r"\t")
+        ui.wait(r"^ACTIVE\t" + chooser + r"\t")
+        ui.checkpoint("dismiss_import_chooser", file)
+        ui.call("key", "ENTER")
+        ui.wait(chooser_visible, present=False)
+        ui.checkpoint("open_import_options", file)
+        import_dialog = r"Import .*[\\/]" + literal(file)
+        ui.wait(r"^(?:ACTIVE|WINDOW)\t" + import_dialog + r"\t")
+        ui.checkpoint("activate_import_options", file)
         ui.call("front", import_dialog)
         ui.wait(r"^ACTIVE\t" + import_dialog + r"\t")
+        ui.checkpoint("verify_import_language", file)
+        ui.wait(r"^JTextField\tV30MZ:LE:16:default:default\t")
+        ui.checkpoint("verify_import_loader", file)
+        ui.wait(r"^GhidraComboBox\t.*WonderSwanLoader")
         ui.button("OK")
         ui.checkpoint("inspect_import_summary", file)
         ui.wait(r"^JTextField\t" + sha + r"\t")
