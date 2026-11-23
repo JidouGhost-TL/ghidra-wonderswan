@@ -7,6 +7,7 @@ import ghidra.program.model.address.Address;
 import ghidra.program.model.data.*;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.*;
+import ghidra.program.model.pcode.Varnode;
 import ghidra.program.model.symbol.*;
 import ghidra.util.task.TaskMonitor;
 
@@ -21,6 +22,8 @@ import ghidra.util.task.TaskMonitor;
 public final class WSReturns {
     static final List<String> UNITS = List.of("AL", "AH", "BL", "BH", "CL", "CH", "DL", "DH",
         "SI", "DI", "BP", "ES", "CF", "ZF", "SF", "OF", "PF", "AF");
+    private static final Set<String> SAVE_REGISTERS = Set.of("AX", "BX", "CX", "DX", "SI", "DI", "BP");
+    private static final Set<String> FRAME_REGISTERS = Set.of("SP", "BP", "SS");
     static final int WINDOW = 12, MAX_BODY = 4096, MAX_PATH = 400, MAX_WALK = MAX_BODY * 32;
     final Program p;
     final Listing listing;
@@ -95,36 +98,139 @@ public final class WSReturns {
             }
             if (calls.isEmpty()) continue;
             Map<String, List<String>> consumers = new LinkedHashMap<>();
-            for (Instruction call : calls) consumeAfter(call, consumers);
-            Set<String> outs = new LinkedHashSet<>();
+            Map<String, Integer> linearVotes = new HashMap<>();
+            for (Instruction call : calls) consumeAfter(call, consumers, linearVotes);
+            Set<String> outs = new LinkedHashSet<>(), jumpOutputs = new LinkedHashSet<>();
+            int required = calls.size() == 1 ? 1 : 2;
             for (String u : UNITS) {
                 int n = consumers.getOrDefault(u, List.of()).size();
-                if (n < (calls.size() == 1 ? 1 : 2)) continue;
+                if (n < required) continue;
                 int source = sources(f, u, new HashSet<>());
-                if (source == 1) outs.add(u);
+                if (source == 1) {
+                    if (linearVotes.getOrDefault(u, 0) >= required) outs.add(u);
+                    else jumpOutputs.add(u);
+                }
                 else emit.accept(String.format("{\"rule\":\"R1b\",\"function\":\"%s\",\"unit\":\"%s\",\"outcome\":\"VETO_SOURCE\",\"sources\":%d,\"consuming_callers\":%d,\"neutral_callers\":%d,\"reads\":\"%s\"}",
                     f.getEntryPoint(), u, source, n, calls.size() - n, consumers.get(u)));
+            }
+            if (!jumpOutputs.isEmpty()) {
+                if (continuationInputsCovered(g)) {
+                    outs.addAll(jumpOutputs);
+                } else {
+                    emit.accept(String.format("{\"rule\":\"R1b\",\"function\":\"%s\",\"outcome\":\"VETO_CONTINUATION_INPUTS\",\"units\":\"%s\"}",
+                        f.getEntryPoint(), jumpOutputs));
+                }
             }
             if (outs.isEmpty()) continue;
             Set<String> ins = inputs(g);
             setSignature(f, coalesce(outs), coalesce(ins), consumers, calls.size());
         }
     }
-    void consumeAfter(Instruction call, Map<String, List<String>> consumers) {
+    void consumeAfter(Instruction call, Map<String, List<String>> consumers, Map<String, Integer> linearVotes) {
         Set<String> seen = new HashSet<>(), killed = new HashSet<>();
+        Set<Address> visited = new HashSet<>();
+        Function caller = null;
+        boolean followedJump = false;
         Address a = call.getFallThrough();
-        for (int n = 0; n < WINDOW && a != null; n++) {
+        for (int n = 0; n < WINDOW && a != null && visited.add(a); n++) {
+            if (caller != null && !caller.getBody().contains(a)) break;
             Instruction i = listing.getInstructionAt(a); if (i == null) break;
             Set<String> read = reads(i);
             // A single PUSH is a real caller consumption; bulk saves are excluded.
             if (i.getMnemonicString().equalsIgnoreCase("PUSH")) read = mask(i.getInputObjects());
-            for (String u : read) if (!killed.contains(u) && seen.add(u))
+            for (String u : read) if (!killed.contains(u) && seen.add(u)) {
                 consumers.computeIfAbsent(u, k -> new ArrayList<>()).add(call.getAddress() + "->" + i.getAddress());
+                if (!followedJump) linearVotes.merge(u, 1, Integer::sum);
+            }
             killed.addAll(writes(i));
-            if (i.getFlowType().isCall() || i.getFlowType().isJump() || i.getFlowType().isTerminal()
+            if (i.getFlowType().isCall() || i.getFlowType().isTerminal()
                     || i.getMnemonicString().toUpperCase().startsWith("INT")) break;
-            a = i.getFallThrough();
+            if (i.getFlowType().isJump()) {
+                // A local direct JMP can join this call's continuation with another
+                // path. Follow only the instruction's own single, unchanged edge.
+                if (caller == null) caller = p.getFunctionManager().getFunctionContaining(call.getAddress());
+                Address[] flows = i.getFlows(), defaults = i.getDefaultFlows();
+                if (caller == null || !caller.getBody().contains(a) || i.getFlowOverride() != FlowOverride.NONE
+                        || !i.getMnemonicString().equals("JMP") || i.getFlowType().isComputed() || i.getFlowType().isConditional()
+                        || i.getFallThrough() != null
+                        || flows.length != 1 || defaults.length != 1 || !flows[0].equals(defaults[0])
+                        || !flows[0].getAddressSpace().equals(a.getAddressSpace())) break;
+                a = flows[0];
+                followedJump = true;
+            } else a = i.getFallThrough();
         }
+    }
+
+    /**
+     * Extending caller evidence can newly lock a callee's inputs. The usual input
+     * scan ignores pushes and treats pops as definitions. Require a closed leaf
+     * whose only stack operations are entry saves and matching terminal restores.
+     */
+    private boolean continuationInputsCovered(Graph g) {
+        Instruction next = g.code.get(g.f.getEntryPoint());
+        if (next == null) return false;
+        var saved = new ArrayList<String>();
+        var frame = new HashSet<Address>();
+        Address preceding = null;
+        String reg;
+        while ((reg = stackRegister(next, "PUSH")) != null) {
+            Set<Address> expected = preceding == null ? Set.of() : Set.of(preceding);
+            if (!g.pred.getOrDefault(next.getAddress(), Set.of()).equals(expected)
+                    || !frame.add(next.getAddress())) return false;
+            saved.add(reg);
+            preceding = next.getAddress();
+            next = g.code.get(next.getFallThrough());
+        }
+        if (next == null) return false;
+        if (!saved.isEmpty()) {
+            if (g.returns.size() != 1) return false;
+            next = g.returns.get(0);
+            for (String register : saved) {
+                Address previous = next.getFallFrom();
+                if (previous == null || !g.pred.getOrDefault(next.getAddress(), Set.of()).equals(Set.of(previous))) return false;
+                next = g.code.get(previous);
+                if (!register.equals(stackRegister(next, "POP")) || !frame.add(previous)) return false;
+            }
+        }
+        for (Instruction i : g.code.values()) {
+            if (frame.contains(i.getAddress())) continue;
+            String mnemonic = i.getMnemonicString();
+            if (i.getFlowOverride() != FlowOverride.NONE || i.isFallThroughOverridden()) return false;
+            if (mnemonic.equals("RET") || mnemonic.equals("RETF")) {
+                if (i.getLength() != 1) return false;
+                continue;
+            }
+            var flow = i.getFlowType();
+            if (mnemonic.startsWith("PUSH") || mnemonic.startsWith("POP") || mnemonic.startsWith("INT")
+                    || mnemonic.equals("ENTER") || mnemonic.equals("LEAVE")
+                    || flow.isCall() || flow.isComputed() || flow.isTerminal()) return false;
+            // Operand lists can omit the implicit stack segment of a memory access.
+            for (var op : i.getPcode()) {
+                if (frameRegister(op.getOutput())) return false;
+                for (var input : op.getInputs()) if (frameRegister(input)) return false;
+            }
+            if (i.getFallThrough() != null && !g.code.containsKey(i.getFallThrough())) return false;
+            if (flow.isJump()) {
+                Address[] targets = i.getFlows();
+                if (!Arrays.equals(targets, i.getDefaultFlows())
+                        || targets.length == 0 || Arrays.stream(targets).anyMatch(a -> !g.code.containsKey(a))) return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean frameRegister(Varnode storage) {
+        if (storage == null || !storage.isRegister()) return false;
+        Register register = p.getRegister(storage.getAddress(), storage.getSize());
+        return register != null && FRAME_REGISTERS.contains(register.getName());
+    }
+
+    private static String stackRegister(Instruction i, String mnemonic) {
+        if (i == null || i.getFlowOverride() != FlowOverride.NONE || i.isFallThroughOverridden()
+                || !i.getMnemonicString().equals(mnemonic) || i.getNumOperands() != 1 || i.getLength() != 1) return null;
+        Object[] operand = i.getOpObjects(0);
+        return operand.length == 1 && operand[0] instanceof Register r && SAVE_REGISTERS.contains(r.getName())
+            ? r.getName() : null;
     }
     final class Graph {
         final Function f;
