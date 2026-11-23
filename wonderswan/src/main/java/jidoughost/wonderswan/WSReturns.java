@@ -27,6 +27,7 @@ public final class WSReturns {
     static final int WINDOW = 12, MAX_BODY = 4096, MAX_PATH = 400, MAX_WALK = MAX_BODY * 32;
     final Program p;
     final Listing listing;
+    final boolean selectableLinearRom;
     final Consumer<String> emit;
     final TaskMonitor monitor;
     final Map<String, Register> units = new LinkedHashMap<>();
@@ -37,6 +38,10 @@ public final class WSReturns {
 
     WSReturns(Program p, Consumer<String> emit, TaskMonitor monitor) {
         this.p = p; this.emit = emit; this.monitor = monitor; listing = p.getListing();
+        long size = WSRom.size(p), effective = WSHardware.effectiveSize(size);
+        long firstLinear = (long) WSHardware.SEG_LINEAR_FIRST << 4;
+        selectableLinearRom = size <= 0 || WSHardware.linearToRom(firstLinear, 0, effective)
+            != WSHardware.linearToRom(firstLinear, 1, effective);
         for (String n : UNITS) { Register r = p.getRegister(n); if (r != null) units.put(n, r); }
     }
     public static String apply(Program p, Consumer<String> emit, TaskMonitor monitor) throws Exception {
@@ -108,11 +113,23 @@ public final class WSReturns {
                         && calls.stream().noneMatch(c -> c.getAddress().equals(call.getAddress()))) calls.add(call);
             }
             if (calls.isEmpty()) continue;
+            int required = calls.size() == 1 ? 1 : 2;
             Map<String, List<String>> consumers = new LinkedHashMap<>();
             Map<String, Integer> linearVotes = new HashMap<>();
-            for (Instruction call : calls) consumeAfter(call, consumers, linearVotes);
+            boolean selectable = false;
+            for (Instruction call : calls) {
+                selectable |= selectableInstruction(call)
+                    || Arrays.stream(call.getDefaultFlows()).anyMatch(this::selectableAddress);
+                selectable |= consumeAfter(call, consumers, linearVotes);
+            }
+            // A mapped caller or continuation keeps the full prior set and quorum.
+            if (!selectable && calls.removeIf(call -> !agreesWithDecodedTarget(call, f.getEntryPoint()))) {
+                if (calls.isEmpty()) continue;
+                consumers.clear();
+                linearVotes.clear();
+                for (Instruction call : calls) consumeAfter(call, consumers, linearVotes);
+            }
             Set<String> outs = new LinkedHashSet<>(), jumpOutputs = new LinkedHashSet<>();
-            int required = calls.size() == 1 ? 1 : 2;
             for (String u : UNITS) {
                 int n = consumers.getOrDefault(u, List.of()).size();
                 if (n < required) continue;
@@ -137,15 +154,39 @@ public final class WSReturns {
             setSignature(f, coalesce(outs), coalesce(ins), consumers, calls.size());
         }
     }
-    void consumeAfter(Instruction call, Map<String, List<String>> consumers, Map<String, Integer> linearVotes) {
+    private boolean selectableAddress(Address address) {
+        if (address.getAddressSpace().isOverlaySpace()) return true;
+        if (!address.isMemoryAddress()) return false;
+        long linear = address.getOffset();
+        return linear >= ((long) WSHardware.SEG_SRAM << 4)
+            && (linear < ((long) WSHardware.SEG_LINEAR_FIRST << 4) || selectableLinearRom);
+    }
+    private boolean selectableInstruction(Instruction instruction) {
+        return selectableAddress(instruction.getMinAddress()) || selectableAddress(instruction.getMaxAddress());
+    }
+    private static boolean agreesWithDecodedTarget(Instruction call, Address target) {
+        Address[] decoded = call.getDefaultFlows();
+        if (decoded.length != 1 || !decoded[0].equals(target)
+                || call.getFlowType().isConditional() || call.getFlowOverride() != FlowOverride.NONE
+                || call.isFallThroughOverridden()) return false;
+        for (Reference ref : call.getReferencesFrom()) {
+            var type = ref.getReferenceType();
+            if (ref.isPrimary() && type.isFlow() && !type.isFallthrough()
+                    && (!type.isCall() || type == RefType.CALL_OVERRIDE_UNCONDITIONAL
+                        || !target.equals(ref.getToAddress()))) return false;
+        }
+        return true;
+    }
+    boolean consumeAfter(Instruction call, Map<String, List<String>> consumers, Map<String, Integer> linearVotes) {
         Set<String> seen = new HashSet<>(), killed = new HashSet<>();
         Set<Address> visited = new HashSet<>();
         Function caller = null;
-        boolean followedJump = false;
+        boolean followedJump = false, selectable = false;
         Address a = call.getFallThrough();
         for (int n = 0; n < WINDOW && a != null && visited.add(a); n++) {
             if (caller != null && !caller.getBody().contains(a)) break;
             Instruction i = listing.getInstructionAt(a); if (i == null) break;
+            selectable |= selectableInstruction(i);
             Set<String> read = reads(i);
             // A single PUSH is a real caller consumption; bulk saves are excluded.
             if (i.getMnemonicString().equalsIgnoreCase("PUSH")) read = mask(i.getInputObjects());
@@ -170,6 +211,7 @@ public final class WSReturns {
                 followedJump = true;
             } else a = i.getFallThrough();
         }
+        return selectable;
     }
 
     /**
