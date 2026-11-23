@@ -1,0 +1,60 @@
+name: Public Ghidra release rehearsal
+
+on:
+  workflow_dispatch:
+    inputs:
+      desktop_probe:
+        description: Check whether the runner exposes a capturable desktop
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  headless:
+    name: Headless ${{ matrix.host }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            host: Linux-x64
+          - runner: windows-2025
+            host: Windows-x64
+          - runner: macos-15
+            host: Darwin-arm64
+          - runner: macos-15-intel
+            host: Darwin-x64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: "3.12"
+      - name: Verify published v0.1.0 in a fresh native process
+        shell: bash
+        env:
+          EXPECTED_HOST: ${{ matrix.host }}
+        run: |
+          python tools/release-rehearsal/rehearse.py headless "$RUNNER_TEMP/ghidra-rehearsal" \
+            --expected-host "$EXPECTED_HOST"
+      - name: Probe desktop capability only
+        if: inputs.desktop_probe
+        continue-on-error: true
+        shell: bash
+        run: |
+          python tools/release-rehearsal/rehearse.py gui-probe "$RUNNER_TEMP/ghidra-rehearsal"
+      - name: Preserve rehearsal evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: public-ghidra-rehearsal-${{ matrix.host }}
+          path: |
+            ${{ runner.temp }}/ghidra-rehearsal/*.log
+            ${{ runner.temp }}/ghidra-rehearsal/*.json
+            ${{ runner.temp }}/ghidra-rehearsal/*.txt
+          if-no-files-found: error

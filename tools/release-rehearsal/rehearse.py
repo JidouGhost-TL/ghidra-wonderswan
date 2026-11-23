@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
+"""Consume pinned public inputs in a new disposable directory."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+from urllib.parse import quote, urlsplit
+from urllib.request import HTTPRedirectHandler, build_opener
+import zipfile
+
+here = Path(__file__).resolve().parent
+example = here.parents[1] / "examples/banked-call"
+pins = json.loads((here / "inputs.json").read_text())
+platforms = {("Linux", "x86_64"): "Linux-x64", ("Windows", "AMD64"): "Windows-x64",
+             ("Darwin", "arm64"): "Darwin-arm64", ("Darwin", "x86_64"): "Darwin-x64"}
+redirect_hosts = {"github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"}
+examples = {
+    "make_cartridges.py": "ef2585d2342a6a259421897f0bb5363836a6b77a80feb2f5b676bbc765257bc0",
+    "ConfigureBankEvidence.java": "4c084c94d3ad1deb3de4cb14d1564e7101baf4a9420b668a223184bf8cd1dcfb",
+    "VerifyBankedCall.java": "9dddfc620a863e865a9ff97c652cda21ba28f60e79489fb316425f628a1a7839",
+}
+
+
+def require(condition, reason):
+    if not condition:
+        raise RuntimeError(reason)
+
+
+def digest(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+class PublicReleaseRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urlsplit(newurl)
+        require(target.scheme == "https" and target.netloc in redirect_hosts,
+                f"Unexpected binary download destination {target.scheme}://{target.netloc}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def download(spec, downloads, cache):
+    repository, tag, name, sha = spec
+    target = downloads / name
+    if cache and (cache / name).is_file():
+        shutil.copyfile(cache / name, target)
+    else:
+        url = f"https://github.com/{repository}/releases/download/{quote(tag, safe='')}/{name}"
+        with build_opener(PublicReleaseRedirect()).open(url, timeout=90) as src, target.open("xb") as dst:
+            shutil.copyfileobj(src, dst)
+    require(digest(target) == sha, f"Wrong SHA-256 for {name}")
+    return target
+
+
+def unzip(archive, dest):
+    with zipfile.ZipFile(archive) as z:
+        written = []
+        for entry in z.infolist():
+            relative = Path(entry.filename)
+            mode = entry.external_attr >> 16
+            require(not relative.is_absolute() and ".." not in relative.parts and "\\" not in entry.filename
+                    and not stat.S_ISLNK(mode), f"Unexpected ZIP member {entry.filename}")
+            target = dest / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if entry.is_dir():
+                target.mkdir(exist_ok=True)
+                continue
+            with z.open(entry) as src, target.open("xb") as dst:
+                shutil.copyfileobj(src, dst)
+            if os.name != "nt" and mode & 0o111:
+                target.chmod(0o755)
+            written.append(relative)
+    return written
+
+
+def run(command, env, log, cwd=None, timeout=240):
+    args = [str(x) for x in command]
+    if os.name == "nt" and args[0].endswith(".bat"):
+        require(all(not re.search(r'[%!&|<>^"\r\n]', token) for token in args), "Unsafe batch path")
+        quoted = " ".join(f'"{token}"' for token in args)
+        args = f'cmd.exe /d /s /c "{quoted}"'
+    with log.open("xb") as stream:
+        subprocess.run(args, env=env, cwd=cwd, stdout=stream, stderr=subprocess.STDOUT,
+                       check=True, timeout=timeout)
+    return log.read_text(encoding="utf-8", errors="replace")
+
+
+def paths(output, host):
+    home = output / "home"
+    ghidra = output / "ghidra_12.1.3_PUBLIC"
+    suffix = ".exe" if host == "Windows-x64" else ""
+    java = list((output / "jdk").glob(f"*/bin/java{suffix}"))
+    if host.startswith("Darwin"):
+        java = list((output / "jdk").glob("*/Contents/Home/bin/java"))
+    require(len(java) == 1, "Expected one pinned JDK")
+    jdk = java[0].parents[1]
+    for folder in ("settings", "cache", "tmp", "gradle"):
+        (home / folder).mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, JAVA_HOME=str(jdk), JAVA_HOME_OVERRIDE=str(jdk),
+               PATH=str(jdk / "bin") + os.pathsep + os.environ["PATH"],
+               GHIDRA_INSTALL_DIR=str(ghidra), GHIDRA_HEADLESS_MAXMEM="2G", GHIDRA_GUI_MAXMEM="2G",
+               XDG_CONFIG_HOME=str(home / "settings"), XDG_CACHE_HOME=str(home / "cache"),
+               GRADLE_USER_HOME=str(home / "gradle"))
+    options = {"user.home":home, "application.settingsdir":home/"settings",
+               "application.cachedir":home/"cache", "application.tempdir":home/"tmp",
+               "java.io.tmpdir":home/"tmp"}
+    env["JAVA_TOOL_OPTIONS"] = " ".join(f'"-D{key}={value}"' for key, value in options.items())
+    for key in ("JDK_JAVA_OPTIONS", "_JAVA_OPTIONS", "GHIDRA_JAVA_OPTIONS",
+                "GHIDRA_HEADLESS_JAVA_OPTIONS", "GHIDRA_GUI_JAVA_OPTIONS"):
+        env.pop(key, None)
+    return ghidra, java[0], home, env
+
+
+def prepare(output, host, cache):
+    output.mkdir()
+    downloads = output/"downloads"
+    downloads.mkdir()
+    ghidra = download(pins["ghidra"], downloads, cache)
+    extensions = [download(spec, downloads, cache) for spec in pins["extensions"]]
+    release_checksums = download(pins["extension_manifest"], downloads, cache)
+    expected = {name: sha for _, _, name, sha in pins["extensions"]}
+    require(dict((name, sha) for sha, name in (line.split() for line in
+            release_checksums.read_text().splitlines())) == expected, "Published manifest disagrees")
+    jdk = download(["adoptium/temurin21-binaries", "jdk-21.0.13.1+2", *pins["jdk"][host]], downloads, cache)
+    unzip(ghidra, output)
+    if jdk.suffix == ".zip":
+        unzip(jdk, output/"jdk")
+    else:
+        with tarfile.open(jdk) as archive:
+            archive.extractall(output/"jdk", filter="data")
+    scripts = output/"example"
+    scripts.mkdir()
+    for name, sha in examples.items():
+        # Git may materialize CRLF on Windows. The staged scripts use the exact pinned blob bytes.
+        content = (example/name).read_bytes().replace(b"\r\n", b"\n")
+        require(hashlib.sha256(content).hexdigest() == sha, f"Public example input changed: {name}")
+        (scripts/name).write_bytes(content)
+    run([sys.executable, scripts/"make_cartridges.py", output/"roms"], os.environ, output/"fixture.log")
+    require({item.name:digest(item) for item in (output/"roms").glob("*.ws")} == pins["fixtures"],
+            "The public synthetic cartridges changed")
+    ghidra, java, home, env = paths(output, host)
+    version = run([java, "-XshowSettings:properties", "-version"], env, output/"java.log")
+    arches = ("aarch64",) if host.endswith("arm64") else ("amd64","x86_64")
+    require("21.0.13.1+2" in version and any(f"os.arch = {arch}\n" in version for arch in arches),
+            "Wrong native JDK")
+    if host.startswith("Darwin"):
+        gradle = ghidra/"support/gradle"
+        wrapper = gradle/"gradle-wrapper.properties"
+        text = wrapper.read_text()
+        require("gradle-9.6.1-bin.zip" in text and "distributionSha256Sum=" not in text, "Gradle pin drift")
+        wrapper.write_text(text + f'\ndistributionSha256Sum={pins["gradle_sha256"]}\n')
+        run(["/usr/bin/xcodebuild", "-version"], env, output/"xcode.log")
+        run([gradle/"gradlew", "--no-daemon", "buildNatives"], env, output/"native-build.log",
+            gradle, timeout=1800)
+    ids = {"Linux-x64":"linux_x86_64", "Windows-x64":"win_x86_64",
+           "Darwin-arm64":"mac_arm_64", "Darwin-x64":"mac_x86_64"}
+    decompiler = ghidra/"Ghidra/Features/Decompiler"
+    basename = "decompile.exe" if host == "Windows-x64" else "decompile"
+    base = decompiler/("build" if host.startswith("Darwin") else "")
+    native = base/"os"/ids[host]/basename
+    require(native.is_file(), "Expected native decompiler is missing")
+    if host.startswith("Darwin"):
+        identity = run(["/usr/bin/file", native], env, output/"native-format.log")
+        require("Mach-O" in identity and ("arm64" if host.endswith("arm64") else "x86_64") in identity,
+                "Wrong native decompiler architecture")
+    state = {"platform":host, "ghidra_sha256":pins["ghidra"][3], "jdk_sha256":pins["jdk"][host][1],
+             "extensions":expected, "native_sha256":digest(native),
+             "runner_image":os.environ.get("ImageVersion"), "os":platform.release()}
+    (output/"setup.json").write_text(json.dumps(state, indent=2) + "\n")
+    return extensions
+
+
+def expected_files(output):
+    files = {}
+    for spec in pins["extensions"]:
+        archive = output/"downloads"/spec[2]
+        require(digest(archive) == spec[3], "Extension archive changed")
+        with zipfile.ZipFile(archive) as z:
+            for entry in z.infolist():
+                if not entry.is_dir():
+                    files[Path(entry.filename)] = hashlib.sha256(z.read(entry)).hexdigest()
+    return files
+
+
+def extension_tree(output):
+    return output/"home/settings/ghidra/ghidra_12.1.3_PUBLIC/Extensions"
+
+
+def verify_install(output):
+    prefix = extension_tree(output)
+    expected = expected_files(output)
+    got = {path.relative_to(prefix):digest(path) for path in prefix.rglob("*") if path.is_file()}
+    require(got == expected and len(got) == 44, "Installed extension files differ from the public ZIPs")
+    return len(got)
+
+
+def headless(output, host, extensions, wrapper):
+    ghidra, java, home, env = paths(output, host)
+    for archive in extensions:
+        unzip(archive, extension_tree(output))
+    installed = verify_install(output)
+    launcher = wrapper or ghidra/"support"/("analyzeHeadless.bat" if host == "Windows-x64" else "analyzeHeadless")
+    projects = output/"projects"
+    projects.mkdir()
+    reports = {}
+    for sample, mode in (("bank-fe","observed"), ("bank-ff","observed"),
+                         ("bank-unknown","observed"), ("bank-unknown","static")):
+        name = f"{sample}-{mode}"
+        original = output/"roms"/f"{sample}.ws"
+        receipt = output/f"{name}.txt"
+        common = [launcher, projects, name, "-max-cpu", "1", "-scriptPath", output/"example"]
+        imported = run([*common, "-import", original, "-preScript", "ConfigureBankEvidence.java",
+                        output/f"{name}.jsonl", mode], env, output/f"{name}-import.log")
+        require("Analysis succeeded" in imported and "Save succeeded" in imported, f"Import failed: {name}")
+        saved = list((projects/f"{name}.rep").rglob("db.*.gbf"))
+        require(len(saved) == 1, f"Expected one saved program database for {name}")
+        before = digest(saved[0])
+        run([*common, "-process", original.name, "-noanalysis", "-readOnly", "-postScript",
+             "VerifyBankedCall.java", original, receipt, mode], env, output/f"{name}-reopen.log")
+        text = receipt.read_text()
+        overrides = 1 if mode == "observed" else 0
+        require(f"sha256\t{pins['fixtures'][original.name]}\n" in text
+                and f"physical-overrides\t{overrides}\n" in text
+                and "\t9a69000020\n" in text and digest(saved[0]) == before, f"Invalid reopen: {name}")
+        if mode == "observed":
+            marker, address = ("99","10069") if sample == "bank-ff" else ("42","69")
+            require(f"rom-offset\t0x{address}\n" in text and
+                    f"uRam00000200=0x{marker};" in "".join(text.split()), f"Wrong expected native output: {name}")
+        reports[name] = {"saved_database_sha256":before, "receipt_sha256":digest(receipt), "overrides":overrides}
+    (output/"headless.json").write_text(json.dumps({
+        "mode":"headless", "platform":host, "installed_files":installed, "projects":reports
+    }, indent=2) + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", choices=("headless","stage-gui","gui-probe","launch-gui","verify-gui-install"))
+    parser.add_argument("directory", type=Path)
+    parser.add_argument("--cache", type=Path)
+    parser.add_argument("--local-wrapper", type=Path)
+    parser.add_argument("--project", type=Path)
+    parser.add_argument("--expected-host", choices=platforms.values())
+    args = parser.parse_args()
+    output = args.directory.resolve()
+    host = platforms.get((platform.system(), platform.machine()))
+    require(host is not None and (args.expected_host is None or host == args.expected_host), "Unexpected native host")
+    if args.mode in ("headless","stage-gui"):
+        extensions = prepare(output, host, args.cache)
+        if args.mode == "headless":
+            headless(output, host, extensions, args.local_wrapper)
+    elif args.mode == "verify-gui-install":
+        print(f"{verify_install(output)} installed files match the approved ZIPs")
+    else:
+        ghidra, java, home, env = paths(output, host)
+        if args.mode == "gui-probe":
+            run([java, here/"DesktopProbe.java"], env, output/"desktop.log", timeout=30)
+            require("DESKTOP_PROBE_PASS" in (output/"desktop.log").read_text(), "Desktop probe lacked positive evidence")
+        else:
+            launcher = ghidra/"support"/("launch.bat" if host == "Windows-x64" else "launch.sh")
+            command = [launcher, "fg", "jdk", "Ghidra", "2G", "", "ghidra.GhidraRun"]
+            if args.project:
+                project = args.project.resolve()
+                require(project.is_relative_to(output) and project.suffix == ".gpr", "Expected isolated .gpr")
+                command.append(project)
+            index = len(list(output.glob("gui-launch-*.log")))
+            run(command, env, output/f"gui-launch-{index}.log", timeout=7200)
+
+
+if __name__ == "__main__":
+    main()
