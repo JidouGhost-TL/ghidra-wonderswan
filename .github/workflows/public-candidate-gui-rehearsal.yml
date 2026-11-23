@@ -1,0 +1,53 @@
+name: Exact source candidate Ghidra GUI rehearsal
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  candidate-gui:
+    if: github.repository == 'JidouGhost-TL/ghidra-wonderswan' && github.ref == 'refs/heads/main'
+    name: Candidate GUI ${{ matrix.host }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            host: Windows-x64
+          - runner: macos-15
+            host: Darwin-arm64
+          - runner: macos-15-intel
+            host: Darwin-x64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: e1ebe4beb2d46889ddcd68c5b9f6bef58edf4160
+          path: candidate-extension-source
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: "3.13"
+      - name: Build and rehearse the exact Windows source candidate
+        if: matrix.host == 'Windows-x64'
+        shell: pwsh
+        run: |
+          $scratch = Join-Path $env:RUNNER_TEMP 'ghidra-candidate-gui'
+          $source = Join-Path $env:GITHUB_WORKSPACE 'candidate-extension-source'
+          & './tools/release-rehearsal/gui/Run-NativeGui.ps1' -Output $scratch -CandidateCheckout $source
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build and rehearse the exact macOS source candidate
+        if: matrix.host != 'Windows-x64'
+        shell: bash
+        env:
+          EXPECTED_HOST: ${{ matrix.host }}
+        run: |
+          python -B tools/release-rehearsal/gui/run_macos.py \
+            "$RUNNER_TEMP/ghidra-candidate-gui" --expected-host "$EXPECTED_HOST" \
+            --candidate-checkout "$GITHUB_WORKSPACE/candidate-extension-source"
