@@ -39,7 +39,10 @@ FIXTURE_CHECKPOINTS = {
                "focus_import_confirmation", "deliver_import_confirmation", "dismiss_import_options",
                "show_import_summary", "activate_import_summary", "verify_import_summary_sha",
                "verify_import_summary_metadata", "capture_import_summary", "import_error_dialog",
-               "open_program", "configure_analysis", "wait_for_analysis", "save_program", "set_read_only"},
+               "open_program", "await_prior_import_summary_dismissal", "activate_project_tree",
+               "verify_project_file_row", "open_project_file_row", "await_fresh_codebrowser",
+               "dismiss_optional_plugin_prompt", "await_fresh_analyze_prompt", "verify_fresh_analyze_prompt",
+               "configure_analysis", "wait_for_analysis", "save_program", "set_read_only"},
     "reopen": {"open_read_only_program", "open_references", "inspect_references", "inspect_decompiler",
                "close_program"},
 }
@@ -121,6 +124,48 @@ class GhidraGui(Session):
                 return title
             time.sleep(0.25)
         raise VisibleEvidenceTimeout(f"Expected a visible {'read-only' if read_only else 'fresh'} CodeBrowser")
+
+    def open_fresh_project_file(self, name):
+        title = "CodeBrowser: " + PROJECT + ":/" + name
+        shown = r"^(?:WINDOW|ACTIVE)\t"
+        self.checkpoint("await_prior_import_summary_dismissal", name)
+        self.wait(shown + r"Import Results Summary\t", present=False)
+        self.checkpoint("activate_project_tree", name)
+        self.call("front", literal(MANAGER))
+        self.wait(r"^ACTIVE\t" + literal(MANAGER) + r"\t")
+        self.checkpoint("verify_project_file_row", name)
+        self.wait(r"^project-file-row\t" + literal(name) + r"\t")
+        self.checkpoint("open_project_file_row", name)
+        self.call("open-project-file", MANAGER, name)
+        plugin = "New Plugins Found!"
+        plugin_visible = shown + literal(plugin) + r"\t"
+        dismissed_plugin = False
+        for checkpoint, window in (("await_fresh_codebrowser", title), ("await_fresh_analyze_prompt", "Analyze?")):
+            self.checkpoint(checkpoint, name)
+            evidence = shown + literal(window) + r"\t"
+            view = self.wait(evidence + "|" + plugin_visible)
+            if re.search(plugin_visible, view, flags=re.M):
+                if dismissed_plugin:
+                    raise RuntimeError("Unexpected repeated optional plugin prompt")
+                self.checkpoint("dismiss_optional_plugin_prompt", name)
+                self.call("front", literal(plugin))
+                self.wait(r"^ACTIVE\t" + literal(plugin) + r"\t")
+                self.button("No")
+                self.wait(plugin_visible, present=False)
+                dismissed_plugin = True
+                self.checkpoint(checkpoint, name)
+                self.wait(evidence)
+        return title
+
+    def verify_fresh_analyze_prompt(self, name):
+        self.checkpoint("verify_fresh_analyze_prompt", name)
+        prompt = literal("Analyze?")
+        self.wait(r"^ACTIVE\t" + prompt + r"\t")
+        view = self.call("snapshot-active-window", prompt)
+        message = name + " has not been analyzed. Would you like to analyze it now?"
+        message_row = r"^[^\t\n]*\t" + literal(message) + r"\t-?[0-9]+,-?[0-9]+$"
+        if not re.search(message_row, view, flags=re.M) or not re.search(r"^JButton:enabled\tYes\t", view, flags=re.M):
+            raise RuntimeError("Active analysis prompt does not identify the expected fixture")
 
     def analysis_option(self, label, role):
         view = self.wait(rf"^GDLabel\t{literal(label)}\t")
@@ -242,7 +287,8 @@ def confirm_second_windows_import(ui, import_dialog, fixture, digest):
     return ui.call("capture-import-summary", digest)
 
 
-def stage_import(ui, fixture_dir, project_dir, report_path, chooser_row=False, finish_with_space=False):
+def stage_import(ui, fixture_dir, project_dir, report_path, chooser_row=False, finish_with_space=False,
+                 project_row_open=False):
     ui.wait(r"^(?:ACTIVE|WINDOW)\t")
     start = time.monotonic()
     while time.monotonic() - start < 60:
@@ -307,9 +353,11 @@ def stage_import(ui, fixture_dir, project_dir, report_path, chooser_row=False, f
         ui.button("OK")
     for file in FIXTURES:
         ui.checkpoint("open_program", file)
-        title = ui.open_program(file)
+        title = ui.open_fresh_project_file(file) if project_row_open else ui.open_program(file)
         ui.call("fit", literal(title))
         ui.call("front", literal("Analyze?"))
+        if project_row_open:
+            ui.verify_fresh_analyze_prompt(file)
         ui.button("Yes")
         ui.checkpoint("configure_analysis", file)
         ui.wait(r"^ACTIVE\tAnalysis Options\t")
@@ -419,6 +467,7 @@ def main():
     parser.add_argument("--report")
     parser.add_argument("--chooser-row", action="store_true")
     parser.add_argument("--wizard-finish-with-space", action="store_true")
+    parser.add_argument("--project-row-open", action="store_true")
     args = parser.parse_args()
     ui = GhidraGui(args.control)
     deadline = time.monotonic() + 90
@@ -430,7 +479,8 @@ def main():
     pid = int(ready.read_text())
     ui.checkpoint("startup")
     if args.phase == "import":
-        data = stage_import(ui, args.fixture_dir, args.project_dir, args.report, args.chooser_row, args.wizard_finish_with_space)
+        data = stage_import(ui, args.fixture_dir, args.project_dir, args.report, args.chooser_row,
+                            args.wizard_finish_with_space, args.project_row_open)
     else:
         data = stage_reopen(ui)
     args.output.write_text(json.dumps({"gui_jvm_pid": pid, "cases": data}, indent=2) + "\n")

@@ -145,7 +145,7 @@ def phase_run(phase, output, ghidra, agent, projects, env, diagnostic, *, finish
                           "--fixture-dir", output / "roms", "--project-dir", projects,
                           "--report", output / "observed.jsonl"]
                 if phase == "import" and finish_with_space:
-                    driver.append("--wizard-finish-with-space")
+                    driver.extend(("--wizard-finish-with-space", "--project-row-open"))
                 rehearse.run(driver, env, output / (phase + "-driver.log"), timeout=600)
             except subprocess.CalledProcessError as error:
                 diagnostic.item = read_checkpoint(control, phase)

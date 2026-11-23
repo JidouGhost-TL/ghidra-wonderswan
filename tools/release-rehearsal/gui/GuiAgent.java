@@ -39,6 +39,7 @@ import javax.swing.JTree;
 import javax.swing.KeyStroke;
 import javax.swing.SwingUtilities;
 import javax.swing.text.JTextComponent;
+import javax.swing.tree.TreePath;
 
 public class GuiAgent {
     private static final String IMPORT_CHOOSER = "Select File to Import";
@@ -170,11 +171,17 @@ public class GuiAgent {
                 }
             }
         } else if (component instanceof JTree tree) {
+            boolean projectTree = isProjectDataTree(tree);
             for (int i = 0; i < Math.min(100, tree.getRowCount()); i++) {
                 Rectangle cell = tree.getRowBounds(i);
                 if (cell != null && tree.getVisibleRect().intersects(cell)) {
-                    rows.add(new Control("tree", tree.getPathForRow(i).getLastPathComponent().toString(),
-                        center(tree, cell), cell, owner));
+                    TreePath path = tree.getPathForRow(i);
+                    Object node = path.getLastPathComponent();
+                    Point point = center(tree, cell);
+                    rows.add(new Control("tree", node.toString(), point, cell, owner));
+                    if (projectTree && isRootProjectFile(path)) {
+                        rows.add(new Control("project-file-row", node.toString(), point, cell, owner, tree));
+                    }
                 }
             }
         } else if (component instanceof JList<?> list) {
@@ -365,12 +372,59 @@ public class GuiAgent {
         return fields.contains(digest) && fields.contains("WonderSwan Cartridge");
     }
 
+    private static boolean isProjectDataTree(Component component) {
+        for (Component current = component; current != null; current = current.getParent()) {
+            if ("ghidra.framework.main.datatree.DataTree".equals(current.getClass().getName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isRootProjectFile(TreePath path) {
+        return path.getPathCount() == 2
+            && "ghidra.framework.main.datatree.DomainFolderRootNode".equals(path.getPathComponent(0).getClass().getName())
+            && "ghidra.framework.main.datatree.DomainFileNode".equals(path.getLastPathComponent().getClass().getName());
+    }
+
+    private static boolean isForegroundProjectFile(Control row, String title, String name) {
+        if (!row.owner.isActive() || !title.equals(row.owner.getAccessibleContext().getAccessibleName())
+                || !(row.component instanceof JTree tree) || !tree.isShowing()) {
+            return false;
+        }
+        Point point = new Point(row.point);
+        SwingUtilities.convertPointFromScreen(point, tree);
+        var path = tree.getPathForLocation(point.x, point.y);
+        if (path == null || !tree.getVisibleRect().contains(point)) {
+            return false;
+        }
+        return isRootProjectFile(path) && title.equals("Ghidra: " + path.getPathComponent(0))
+            && name.equals(path.getLastPathComponent().toString());
+    }
+
     private static String command(Robot robot, String request) throws Exception {
         String[] parts = request.split("\t", 3);
         String editModifier = Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx() == InputEvent.META_DOWN_MASK
             ? "META" : "CONTROL";
         return switch (parts[0]) {
             case "snapshot" -> String.join("\n", edt(GuiAgent::visible).stream().map(Control::describe).toList());
+            case "snapshot-active-window" -> edt(() -> {
+                Window owner = window(parts[1]);
+                if (!owner.isActive()) {
+                    throw new IllegalStateException("Expected an active window");
+                }
+                var rows = new ArrayList<Control>();
+                collect(owner, rows, owner);
+                return String.join("\n", rows.stream().map(Control::describe).toList());
+            });
+            case "open-project-file" -> {
+                Control row = find("project-file-row", Pattern.quote(parts[2]));
+                if (!edt(() -> isForegroundProjectFile(row, parts[1], parts[2]))) {
+                    throw new IllegalStateException("Expected the exact file row in the active project manager");
+                }
+                click(robot, row.point, 2, InputEvent.BUTTON1_DOWN_MASK);
+                yield row.describe();
+            }
             case "click", "double", "right" -> {
                 Control control = find(parts[1], parts[2]);
                 if (control.point == null) {
