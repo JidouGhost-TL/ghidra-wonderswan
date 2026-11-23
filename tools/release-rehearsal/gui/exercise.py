@@ -55,7 +55,10 @@ FIXTURE_CHECKPOINTS = {
                "await_static_wsmachine_off",
                "verify_evidence_report", "apply_analysis_options", "verify_applied_analysis_options",
                "submit_analysis_options", "await_analysis_options_dismissal",
-               "wait_for_analysis", "save_program", "set_read_only"},
+               "wait_for_analysis", "acknowledge_analysis_summary", "activate_save_codebrowser",
+               "open_program_save_menu", "choose_program_save", "open_program_close_menu", "choose_close_tool",
+               "inspect_close_save_confirmation", "confirm_close_save", "await_project_manager_after_close",
+               "set_read_only"},
     "reopen": {"open_read_only_program", "open_references", "activate_reference_listing",
                "open_reference_go", "await_reference_go", "verify_reference_go_editor",
                "submit_reference_go_address", "await_reference_go_dismissal", "await_reference_dialog_clear",
@@ -201,6 +204,26 @@ class GhidraGui(Session):
     def choose(self, menu, action):
         self.click("JMenu", menu)
         self.click("DockingMenuItem", action)
+
+    def save_and_close_program(self, file, title):
+        self.checkpoint("activate_save_codebrowser", file)
+        self.call("focus", literal(title))
+        self.wait(r"^ACTIVE\t" + literal(title) + r"\t")
+        self.checkpoint("open_program_save_menu", file)
+        self.click("JMenu", "File")
+        self.checkpoint("choose_program_save", file)
+        self.click("DockingMenuItem", "Save '" + file + "'")
+        self.checkpoint("open_program_close_menu", file)
+        self.click("JMenu", "File")
+        self.checkpoint("choose_close_tool", file)
+        self.click("DockingMenuItem", "Close Tool")
+        self.checkpoint("inspect_close_save_confirmation", file)
+        view = self.call("snapshot")
+        if "ACTIVE\tSave Program?\t" in view:
+            self.checkpoint("confirm_close_save", file)
+            self.button("Save")
+        self.checkpoint("await_project_manager_after_close", file)
+        self.wait(r"^(?:WINDOW|ACTIVE)\t" + literal(MANAGER) + r"\t")
 
     def button(self, name):
         self.click("JButton", name)
@@ -691,15 +714,9 @@ def stage_import(ui, fixture_dir, project_dir, report_path, chooser_row=False, f
             ui.button("Analyze")
         ui.checkpoint("wait_for_analysis", file)
         ui.wait(r"^ACTIVE\tAuto Analysis Summary\t", timeout=120)
+        ui.checkpoint("acknowledge_analysis_summary", file)
         ui.button("OK")
-        ui.checkpoint("save_program", file)
-        ui.call("focus", literal(title))
-        ui.choose("File", "Save '" + file + "'")
-        ui.choose("File", "Close Tool")
-        view = ui.call("snapshot")
-        if "ACTIVE\tSave Program?\t" in view:
-            ui.button("Save")
-        ui.wait(r"^(?:WINDOW|ACTIVE)\t" + literal(MANAGER) + r"\t")
+        ui.save_and_close_program(file, title)
         ui.checkpoint("set_read_only", file)
         ui.call("focus", literal(MANAGER))
         ui.direct("right", "tree", literal(file))
