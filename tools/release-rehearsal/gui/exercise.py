@@ -91,7 +91,8 @@ ANALYZER_REVEAL_FAILURES = {
 REFERENCE_KEY_INPUT_REFUSED = "reference_key_input_refused"
 REFERENCE_RECOVERABLE_FOREGROUND = {"reference_foreground_project_manager"}
 REFERENCE_OTHER_DIALOGS = {
-    "reference_foreign_active_modeless_dialog", "reference_foreign_active_document_modal",
+    "reference_foreign_active_modeless_dialog", "reference_foreign_active_stock_tip",
+    "reference_foreign_active_document_modal",
     "reference_foreign_active_application_modal", "reference_foreign_inactive_application_modal",
     "reference_foreign_active_toolkit_modal", "reference_foreign_inactive_toolkit_modal",
     "reference_foreground_multiple_dialogs",
@@ -128,6 +129,7 @@ REFERENCE_KEY_FAILURES = {
     "reference_foreign_active_toolkit_modal": 55,
     "reference_foreign_inactive_toolkit_modal": 56,
     "reference_foreground_multiple_dialogs": 57,
+    "reference_foreign_active_stock_tip": 58,
 }
 
 

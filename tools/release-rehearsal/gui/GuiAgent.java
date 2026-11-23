@@ -413,9 +413,25 @@ public class GuiAgent {
             && containsStockListing(owner);
     }
 
+    private static boolean isStockTip(Dialog dialog) {
+        Class<?> wrapper = dialog.getClass();
+        if (!"docking.DockingDialog".equals(wrapper.getName())) {
+            return false;
+        }
+        try {
+            Object provider = wrapper.getMethod("getDialogComponent").invoke(dialog);
+            return provider != null && provider.getClass().getClassLoader() == wrapper.getClassLoader()
+                && "ghidra.app.plugin.core.totd.TipOfTheDayDialog".equals(provider.getClass().getName());
+        }
+        catch (ReflectiveOperationException error) {
+            return false;
+        }
+    }
+
     private static String foreignReferenceDialog(Dialog dialog) {
         return switch (dialog.getModalityType()) {
-            case MODELESS -> "reference_foreign_active_modeless_dialog";
+            case MODELESS -> isStockTip(dialog) ? "reference_foreign_active_stock_tip"
+                : "reference_foreign_active_modeless_dialog";
             case DOCUMENT_MODAL -> "reference_foreign_active_document_modal";
             case APPLICATION_MODAL -> dialog.isActive() ? "reference_foreign_active_application_modal"
                 : "reference_foreign_inactive_application_modal";
