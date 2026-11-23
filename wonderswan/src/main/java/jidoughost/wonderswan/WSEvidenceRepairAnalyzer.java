@@ -35,6 +35,7 @@ import ghidra.util.task.TaskMonitor;
  *       rule K1 identifies LSI C-86 code, else the compiler spec's default (Ghidra's analyzers otherwise
  *       leave __cdecl16near / unknown, which the decompiler reads as stack arguments);
  *   R1  register return values from caller/callee evidence ({@link WSReturns});
+ *   L1  proven register interfaces and per-routine preservation models ({@link WSCallLocks});
  *   V1  RAM flags written by interrupt handlers and polled in spin-wait loops are volatile
  *       ({@link WSVolatile}).
  */
@@ -170,6 +171,7 @@ public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
                 r.apply();
                 parts.add(r.summary());
             });
+            rule("L1", s, program, log, failed, () -> parts.add(WSCallLocks.applyLocks(program, line -> s.emit("%s", line), monitor)));
             rule("V1", s, program, log, failed, () -> {
                 WSVolatile v = new WSVolatile(program, ev, ivt, line -> s.emit("%s", line), monitor);
                 v.apply();
@@ -320,6 +322,7 @@ public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
             SourceType src = f.getSignatureSource();
             if (src == SourceType.USER_DEFINED || src == SourceType.IMPORTED) { kept++; continue; }
             if (WSLsiLiveThrough.apply(f, cc, emit)) { specialized++; continue; }
+            if (WSCallLocks.reconcileConvention(f, cc, emit)) { specialized++; continue; }
             if (WSAsmAxLiveThrough.reconcileConvention(f, cc, emit)) { specialized++; continue; }
             if (WSAsmBxLiveThrough.reconcileConvention(f, cc, emit)) { specialized++; continue; }
             if (!cc.equals(f.getCallingConventionName())) { f.setCallingConvention(cc); set++; }

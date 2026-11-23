@@ -18,6 +18,9 @@ import ghidra.util.task.TaskMonitor;
  * entry-value, saved/restored and unresolved paths veto an output, including callers
  * expecting their own pre-call value. Register inputs come from use before definition.
  * Explicit signatures and compiler conventions other than the register convention win.
+ * L2 (H2): after a call or interrupt whose outputs are not proven, a read of a unit it may write
+ * leaves the input set unknown, and so does a frame read at or above the return address; no lock
+ * is written, and an earlier lock of this rule is reset. Status flags are never inputs.
  */
 public final class WSReturns {
     static final List<String> UNITS = List.of("AL", "AH", "BL", "BH", "CL", "CH", "DL", "DH",
@@ -33,7 +36,9 @@ public final class WSReturns {
     final Map<String, Register> units = new LinkedHashMap<>();
     final Map<Function, Graph> graphs = new HashMap<>();
     final Map<String, Integer> supplyCache = new HashMap<>();
-    int functions, unchanged, skippedSig;
+    int functions, unchanged, skippedSig, reverted;
+    String unknownReason;
+    Address unknownAt;
     final Map<String, Integer> regCounts = new TreeMap<>();
 
     WSReturns(Program p, Consumer<String> emit, TaskMonitor monitor) {
@@ -48,8 +53,8 @@ public final class WSReturns {
         WSReturns r = new WSReturns(p, emit, monitor); r.apply(); return r.summary();
     }
     String summary() {
-        return String.format("R1b signatures changed %d, unchanged %d, explicit/compiler signatures skipped %d %s",
-            functions, unchanged, skippedSig, regCounts);
+        return String.format("R1b signatures changed %d, unchanged %d, explicit/compiler signatures skipped %d, reverted %d %s",
+            functions, unchanged, skippedSig, reverted, regCounts);
     }
     Set<String> mask(Object[] objects) {
         Set<String> s = new LinkedHashSet<>();
@@ -80,7 +85,17 @@ public final class WSReturns {
         if (f.getSignatureSource() == SourceType.USER_DEFINED || f.getSignatureSource() == SourceType.IMPORTED) return true;
         for (Parameter v : f.getParameters()) if (v.getSource() == SourceType.USER_DEFINED || v.getSource() == SourceType.IMPORTED) return true;
         String cc = f.getCallingConventionName();
-        return cc != null && !cc.equals("unknown") && !cc.equals("default") && !cc.equals("__wsasm");
+        return cc != null && !cc.equals("unknown") && !cc.equals("default") && !cc.equals("__wsasm")
+            && !cc.startsWith(WSCallLocks.PREFIX);
+    }
+    /** An R1b-shaped lock: analysis custom storage on the register convention with in_ inputs. */
+    static boolean ownedLock(Function f) {
+        String cc = f.getCallingConventionName();
+        if (f.getSignatureSource() != SourceType.ANALYSIS || !f.hasCustomVariableStorage()
+                || (cc != null && !cc.equals("unknown") && !cc.equals("default") && !cc.equals("__wsasm"))) return false;
+        for (Parameter v : f.getParameters())
+            if (v.getSource() != SourceType.ANALYSIS || !v.getName().startsWith("in_")) return false;
+        return true;
     }
     void apply() throws Exception {
         // A later callee can acquire inputs needed by an earlier caller. Settle the
@@ -150,7 +165,21 @@ public final class WSReturns {
                 }
             }
             if (outs.isEmpty()) continue;
-            Set<String> ins = inputs(g);
+            // A rule-owned L1 lock carries the proven inputs; R1b only supplies its return.
+            boolean l1 = f.getCallingConventionName() != null && f.getCallingConventionName().startsWith(WSCallLocks.PREFIX);
+            Set<String> ins = l1 ? Set.of() : inputs(g);
+            if (ins == null) {
+                emit.accept(String.format("{\"rule\":\"R1b\",\"function\":\"%s\",\"outcome\":\"VETO_INPUTS_UNKNOWN\",\"reason\":\"%s\",\"at\":\"%s\",\"units\":\"%s\"}",
+                    f.getEntryPoint(), unknownReason, unknownAt, outs));
+                if (ownedLock(f)) {
+                    f.updateFunction(f.getCallingConventionName(), new ReturnParameterImpl(DefaultDataType.dataType, p), List.of(),
+                        Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS, false, SourceType.DEFAULT);
+                    reverted++;
+                    emit.accept(String.format("{\"rule\":\"R1b\",\"function\":\"%s\",\"outcome\":\"REVERT\",\"reason\":\"%s\"}",
+                        f.getEntryPoint(), unknownReason));
+                }
+                continue;
+            }
             setSignature(f, coalesce(outs), coalesce(ins), consumers, calls.size());
         }
     }
@@ -361,27 +390,63 @@ public final class WSReturns {
         if ((source & 8) == 0) memo.put(a, source);
         path.remove(a); return source;
     }
+    static boolean flag(String unit) { return unit.length() == 2 && unit.endsWith("F") && !unit.equals("DF"); }
+    private static boolean frameSetup(Instruction i) {
+        String m = i.getMnemonicString().toUpperCase();
+        if (m.equals("ENTER")) return true;
+        if (!m.equals("MOV") || i.getNumOperands() != 2) return false;
+        Object[] d = i.getOpObjects(0), s = i.getOpObjects(1);
+        return d.length == 1 && s.length == 1 && d[0] instanceof Register rd && s[0] instanceof Register rs
+            && rd.getName().equals("BP") && rs.getName().equals("SP");
+    }
+    /** A BP-based memory operand at a non-negative displacement: saved BP, return address or arguments. */
+    private static boolean frameRead(Instruction i) {
+        for (int k = 0; k < i.getNumOperands(); k++) {
+            if (!ghidra.program.model.lang.OperandType.isDynamic(i.getOperandType(k))) continue;
+            boolean bp = false; long disp = 0;
+            for (Object o : i.getOpObjects(k)) {
+                if (o instanceof Register r && r.getName().equals("BP")) bp = true;
+                if (o instanceof ghidra.program.model.scalar.Scalar sc) disp = sc.getSignedValue();
+            }
+            if (bp && disp >= 0) return true;
+        }
+        return false;
+    }
+    /** Register inputs from use before definition, or null when L2 leaves them unknown. */
     Set<String> inputs(Graph g) {
-        Map<Address, Set<String>> defined = new HashMap<>();
+        boolean frame = g.code.values().stream().anyMatch(WSReturns::frameSetup);
+        Map<Address, Set<String>> defined = new HashMap<>(), tainted = new HashMap<>();
         ArrayDeque<Address> work = new ArrayDeque<>();
-        Address entry = g.f.getEntryPoint(); defined.put(entry, new HashSet<>()); work.add(entry);
+        Address entry = g.f.getEntryPoint(); defined.put(entry, new HashSet<>()); tainted.put(entry, new HashSet<>()); work.add(entry);
         Set<String> inputs = new LinkedHashSet<>();
         int steps = 0;
         while (!work.isEmpty() && steps++ < MAX_BODY * 32) {
             Address a = work.remove(); Instruction i = g.code.get(a); if (i == null) continue;
-            Set<String> have = new HashSet<>(defined.get(a));
-            for (String u : reads(i)) if (!have.contains(u)) inputs.add(u);
-            have.addAll(writes(i));
+            Set<String> have = new HashSet<>(defined.get(a)), taint = new HashSet<>(tainted.get(a));
+            if (frame && frameRead(i)) { unknownReason = "FRAME_READ"; unknownAt = a; return null; }
+            for (String u : reads(i)) if (!have.contains(u) && !flag(u)) {
+                if (taint.contains(u)) { unknownReason = "READ_AFTER_UNPROVEN_CALL"; unknownAt = a; return null; }
+                inputs.add(u);
+            }
+            have.addAll(writes(i)); taint.removeAll(writes(i));
+            String mn = i.getMnemonicString().toUpperCase();
             if (i.getFlowType().isCall()) {
                 Function callee = directCallee(i);
                 if (callee != null) {
                     for (Parameter param : callee.getParameters()) for (var vn : param.getVariableStorage().getVarnodes()) {
                         Register r = p.getRegister(vn.getAddress(), vn.getSize());
-                        if (r != null) for (String u : mask(new Object[]{r})) if (!have.contains(u)) inputs.add(u);
+                        if (r != null) for (String u : mask(new Object[]{r})) if (!have.contains(u) && !flag(u)) {
+                            if (taint.contains(u)) { unknownReason = "READ_AFTER_UNPROVEN_CALL"; unknownAt = a; return null; }
+                            inputs.add(u);
+                        }
                     }
-                    for (String u : UNITS) if (supplied(callee, u, new HashSet<>())) have.add(u);
-                }
-            }
+                    for (String u : UNITS) {
+                        int source = sources(callee, u, new HashSet<>());
+                        if (source == 1) { have.add(u); taint.remove(u); }
+                        else if (source != 2) taint.add(u);
+                    }
+                } else taint.addAll(UNITS);
+            } else if (mn.startsWith("INT")) taint.addAll(UNITS);
             List<Address> next = new ArrayList<>();
             if (i.getFallThrough() != null) next.add(i.getFallThrough());
             if (i.getFlowType().isJump()) next.addAll(Arrays.asList(i.getFlows()));
@@ -389,7 +454,11 @@ public final class WSReturns {
                 if (!g.code.containsKey(b) || b.equals(entry)) continue;
                 Set<String> old = defined.get(b), merged = new HashSet<>(have);
                 if (old != null) merged.retainAll(old);
-                if (old == null || !old.equals(merged)) { defined.put(b, merged); work.add(b); }
+                Set<String> oldTaint = tainted.get(b), mergedTaint = new HashSet<>(taint);
+                if (oldTaint != null) mergedTaint.addAll(oldTaint);
+                if (old == null || !old.equals(merged) || !oldTaint.equals(mergedTaint)) {
+                    defined.put(b, merged); tainted.put(b, mergedTaint); work.add(b);
+                }
             }
         }
         return inputs;
@@ -430,6 +499,7 @@ public final class WSReturns {
         VariableStorage storage = new VariableStorage(p, outputs.toArray(new Register[0]));
         if (storage.size() != bytes || result.getLength() != bytes) throw new IllegalStateException("R1b result size mismatch");
         List<Variable> params = new ArrayList<>(Arrays.asList(f.getParameters()));
+        if (f.getCallingConventionName() != null && f.getCallingConventionName().startsWith(WSCallLocks.PREFIX)) inputs = List.of();
         for (Register r : inputs) {
             VariableStorage s = new VariableStorage(p, r);
             if (params.stream().anyMatch(v -> v.getVariableStorage().intersects(s))) continue;
