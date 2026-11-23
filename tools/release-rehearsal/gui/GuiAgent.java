@@ -397,6 +397,7 @@ public class GuiAgent {
 
     private static boolean isAnalyzerTable(JTable table, Window owner) {
         if (!(owner instanceof Dialog dialog) || !ANALYSIS_OPTIONS.equals(dialog.getTitle())
+                || SwingUtilities.getWindowAncestor(table) != owner
                 || column(table, "Analyzer") < 0 || column(table, "Enabled") < 0) {
             return false;
         }
@@ -481,26 +482,98 @@ public class GuiAgent {
         return new AnalyzerViewport(visible, target, center(table, visible));
     }
 
-    private static String revealAnalyzer(Robot robot, Control control, String name) throws Exception {
-        AnalyzerViewport current = edt(() -> analyzerViewport(control, name));
-        for (int wheelSteps = 0; wheelSteps <= 18; wheelSteps++) {
-            if (current.visible.contains(current.target)) {
-                return wheelSteps == 0 ? "viewport-unchanged" : "viewport-moved";
+    private static int analyzerPageDistance(AnalyzerViewport view) {
+        int above = view.visible.y - view.target.y;
+        int below = view.target.y + view.target.height - view.visible.y - view.visible.height;
+        return Math.max(0, Math.max(above, below));
+    }
+
+    private static Point analyzerFocusPoint(Control control, String name) {
+        AnalyzerViewport view = analyzerViewport(control, name);
+        JTable table = (JTable) control.component;
+        int analyzer = column(table, "Analyzer");
+        int direction = view.target.y < view.visible.y ? -1 : 1;
+        Rectangle screen = control.owner.getGraphicsConfiguration().getBounds();
+        for (int offset = 0; offset < table.getRowCount(); offset++) {
+            int row = direction > 0 ? table.getRowCount() - 1 - offset : offset;
+            Rectangle cell = table.getCellRect(row, analyzer, false);
+            if (view.visible.contains(cell)) {
+                Point point = center(table, cell);
+                if (screen.contains(point) && control.owner.getBounds().contains(point)) {
+                    return point;
+                }
             }
-            if (wheelSteps == 18) {
+        }
+        throw new IllegalStateException("No visible analyzer cell to focus within the active desktop");
+    }
+
+    private static void requireAnalyzerPageKey(Control control, int key, int direction) {
+        JTable table = (JTable) control.component;
+        if (!control.owner.isActive() || KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner() != table
+                || table.isEditing()) {
+            throw new IllegalStateException("The active analyzer table lacks keyboard focus");
+        }
+        KeyStroke stroke = KeyStroke.getKeyStroke(key, 0);
+        Object binding = table.getInputMap(JComponent.WHEN_FOCUSED).get(stroke);
+        if (binding == null) {
+            binding = table.getInputMap(JComponent.WHEN_ANCESTOR_OF_FOCUSED_COMPONENT).get(stroke);
+        }
+        String expected = direction > 0 ? "scrollDownChangeSelection" : "scrollUpChangeSelection";
+        var action = table.getActionMap().get(expected);
+        if (!expected.equals(binding) || action == null || !action.isEnabled()) {
+            throw new IllegalStateException("The analyzer table lacks the expected focused page binding");
+        }
+    }
+
+    private static String revealAnalyzer(Robot robot, Control control, String name, boolean pageKeys) throws Exception {
+        AnalyzerViewport current = edt(() -> analyzerViewport(control, name));
+        Rectangle initial = current.visible;
+        if (pageKeys && !current.visible.contains(current.target)) {
+            Point focus = edt(() -> analyzerFocusPoint(control, name));
+            click(robot, focus, 1, InputEvent.BUTTON1_DOWN_MASK);
+            robot.waitForIdle();
+            current = edt(() -> analyzerViewport(control, name));
+            if (!initial.equals(current.visible)) {
+                throw new IllegalStateException("The analyzer viewport changed while acquiring keyboard focus");
+            }
+        }
+        for (int steps = 0; steps <= 18; steps++) {
+            if (current.visible.contains(current.target)) {
+                return initial.equals(current.visible) ? "viewport-unchanged" : "viewport-moved";
+            }
+            if (steps == 18) {
                 break;
             }
             int direction = current.target.y < current.visible.y ? -1 : 1;
-            robot.mouseMove(current.wheelPoint.x, current.wheelPoint.y);
-            robot.mouseWheel(direction);
+            if (pageKeys) {
+                int key = direction > 0 ? KeyEvent.VK_PAGE_DOWN : KeyEvent.VK_PAGE_UP;
+                edt(() -> {
+                    requireAnalyzerPageKey(control, key, direction);
+                    return null;
+                });
+                robot.keyPress(key);
+                robot.keyRelease(key);
+            }
+            else {
+                robot.mouseMove(current.wheelPoint.x, current.wheelPoint.y);
+                robot.mouseWheel(direction);
+            }
             robot.waitForIdle();
             robot.delay(100);
             AnalyzerViewport next = edt(() -> analyzerViewport(control, name));
             int movement = Integer.signum(next.visible.y - current.visible.y);
             if (movement != direction) {
+                if (pageKeys) {
+                    throw new IllegalStateException(movement == 0
+                        ? "Analyzer page key did not move the active table"
+                        : "Analyzer page key moved the active table away from the target");
+                }
                 throw new IllegalStateException(movement == 0
                     ? "Analyzer wheel did not move the active table"
                     : "Analyzer wheel moved the active table away from the target");
+            }
+            if (pageKeys && analyzerPageDistance(next) >= analyzerPageDistance(current)) {
+                throw new IllegalStateException("Analyzer page key moved the active table away from the target");
             }
             current = next;
         }
@@ -713,9 +786,9 @@ public class GuiAgent {
                 click(robot, row.point, 1, InputEvent.BUTTON1_DOWN_MASK);
                 yield row.describe();
             }
-            case "reveal-analyzer" -> {
+            case "reveal-analyzer", "reveal-analyzer-page" -> {
                 Control table = find("analysis-table", "Analyzer");
-                yield revealAnalyzer(robot, table, parts[1]);
+                yield revealAnalyzer(robot, table, parts[1], parts[0].equals("reveal-analyzer-page"));
             }
             case "open-project-file" -> {
                 Control row = find("project-file-row", Pattern.quote(parts[2]));

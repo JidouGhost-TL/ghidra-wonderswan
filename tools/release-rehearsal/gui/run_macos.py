@@ -145,7 +145,7 @@ def phase_run(phase, output, ghidra, agent, projects, env, diagnostic, *, finish
                           "--fixture-dir", output / "roms", "--project-dir", projects,
                           "--report", output / "observed.jsonl"]
                 if phase == "import":
-                    driver.append("--guarded-analysis-options")
+                    driver.extend(("--guarded-analysis-options", "--analyzer-page-keys"))
                     if finish_with_space:
                         driver.extend(("--wizard-finish-with-space", "--project-row-open"))
                 rehearse.run(driver, env, output / (phase + "-driver.log"), timeout=600)

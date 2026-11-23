@@ -68,6 +68,12 @@ ANALYZER_REVEAL_FAILURES = {
     27: ("analyzer_wheel_stationary", "Analyzer wheel did not move the active table"),
     28: ("analyzer_wheel_wrong_direction", "Analyzer wheel moved the active table away from the target"),
     29: ("analyzer_reveal_limit", "Analyzer row stayed outside the bounded viewport reveal"),
+    30: ("analyzer_page_focus_cell", "No visible analyzer cell to focus within the active desktop"),
+    31: ("analyzer_page_focus_lost", "The active analyzer table lacks keyboard focus"),
+    32: ("analyzer_page_binding", "The analyzer table lacks the expected focused page binding"),
+    33: ("analyzer_page_stationary", "Analyzer page key did not move the active table"),
+    34: ("analyzer_page_wrong_direction", "Analyzer page key moved the active table away from the target"),
+    35: ("analyzer_page_focus_moved", "The analyzer viewport changed while acquiring keyboard focus"),
 }
 
 
@@ -232,7 +238,7 @@ class GhidraGui(Session):
             raise RuntimeError("Expected exactly one matching editor in the active Analysis Options")
         return editors[0][1], editors[0][-1].split(",")
 
-    def configure_visible_analysis(self, file, report_path):
+    def configure_visible_analysis(self, file, report_path, analyzer_page_keys=False):
         options = literal("Analysis Options")
         self.checkpoint("await_analysis_options", file)
         self.wait(r"^(?:WINDOW|ACTIVE)\t" + options + r"\t")
@@ -244,7 +250,8 @@ class GhidraGui(Session):
         analyzer = "WonderSwan Execution Evidence"
         self.checkpoint("reveal_evidence_analyzer", file)
         try:
-            self.call("reveal-analyzer", analyzer)
+            reveal = "reveal-analyzer-page" if analyzer_page_keys else "reveal-analyzer"
+            self.call(reveal, analyzer)
         except RuntimeError as error:
             code = classify_analyzer_reveal(error)
             if code is not None:
@@ -414,7 +421,7 @@ def confirm_second_windows_import(ui, import_dialog, fixture, digest):
 
 
 def stage_import(ui, fixture_dir, project_dir, report_path, chooser_row=False, finish_with_space=False,
-                 project_row_open=False, guarded_analysis_options=False):
+                 project_row_open=False, guarded_analysis_options=False, analyzer_page_keys=False):
     ui.wait(r"^(?:ACTIVE|WINDOW)\t")
     start = time.monotonic()
     while time.monotonic() - start < 60:
@@ -484,7 +491,7 @@ def stage_import(ui, fixture_dir, project_dir, report_path, chooser_row=False, f
         ui.call("front", literal("Analyze?"))
         if guarded_analysis_options:
             ui.confirm_visible_analyze(file)
-            ui.configure_visible_analysis(file, report_path)
+            ui.configure_visible_analysis(file, report_path, analyzer_page_keys)
         else:
             if project_row_open:
                 ui.verify_fresh_analyze_prompt(file)
@@ -610,6 +617,7 @@ def main():
     parser.add_argument("--wizard-finish-with-space", action="store_true")
     parser.add_argument("--project-row-open", action="store_true")
     parser.add_argument("--guarded-analysis-options", action="store_true")
+    parser.add_argument("--analyzer-page-keys", action="store_true")
     args = parser.parse_args()
     ui = GhidraGui(args.control)
     deadline = time.monotonic() + 90
@@ -622,7 +630,8 @@ def main():
     ui.checkpoint("startup")
     if args.phase == "import":
         data = stage_import(ui, args.fixture_dir, args.project_dir, args.report, args.chooser_row,
-                            args.wizard_finish_with_space, args.project_row_open, args.guarded_analysis_options)
+                            args.wizard_finish_with_space, args.project_row_open, args.guarded_analysis_options,
+                            args.analyzer_page_keys)
     else:
         data = stage_reopen(ui)
     args.output.write_text(json.dumps({"gui_jvm_pid": pid, "cases": data}, indent=2) + "\n")
