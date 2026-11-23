@@ -14,7 +14,8 @@ import time
 
 from exercise import (
     ANALYZER_REVEAL_FAILURES, CHECKPOINT_FILE, CHECKPOINTS, EVIDENCE_TIMEOUT, FIXTURE_CHECKPOINTS, FIXTURES, PROJECT,
-    REFERENCE_KEY_FAILURES, REFERENCE_KEY_INPUT_REFUSED, TRANSPORT_TIMEOUT, VISIBLE_STORE,
+    REFERENCE_FOREGROUND_FAILURES, REFERENCE_GO_HANDOFF_UNVERIFIED, REFERENCE_KEY_FAILURES,
+    REFERENCE_KEY_INPUT_REFUSED, TRANSPORT_TIMEOUT, VISIBLE_STORE,
 )
 
 from indexed_storage import IndexedStorageError, saved_programs
@@ -47,11 +48,16 @@ class Diagnostic(rehearse.Diagnostic):
                 reason = "gui_driver_exit"
             if error.reference_key:
                 step, _, fixture = (self.item or "").partition(" ")
-                valid_step = step in {
-                    "verify_reference_key_readiness", "open_reference_editor_key",
-                }
-                submit_only = reason == REFERENCE_KEY_INPUT_REFUSED and step != "open_reference_editor_key"
-                if self.stage != "gui_readonly_reopen" or fixture not in FIXTURES or not valid_step or submit_only:
+                if step in {"restore_reference_listing_focus", "reacquire_reference_browser"}:
+                    allowed = reason in REFERENCE_FOREGROUND_FAILURES or (
+                        step == "restore_reference_listing_focus" and reason == REFERENCE_GO_HANDOFF_UNVERIFIED
+                    )
+                else:
+                    allowed = reason != REFERENCE_GO_HANDOFF_UNVERIFIED and (
+                        step == "open_reference_editor_key" or (
+                            step == "verify_reference_key_readiness" and reason != REFERENCE_KEY_INPUT_REFUSED
+                        ))
+                if self.stage != "gui_readonly_reopen" or fixture not in FIXTURES or not allowed:
                     reason = "gui_driver_exit"
             self.emit("failed", reason)
         elif isinstance(error, ForegroundLauncherExit):

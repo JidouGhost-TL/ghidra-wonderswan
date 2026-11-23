@@ -33,7 +33,7 @@ CHECKPOINTS = {
                "focus_project_finish", "observe_project_finish_action", "await_project_wizard_dismissal",
                "verify_project_storage", "project_creation_error_dialog", "verify_project_activation",
                "verify_project_created", "save_project", "exit_ghidra"},
-    "reopen": {"startup", "open_saved_project", "exit_ghidra"},
+    "reopen": {"startup", "open_saved_project", "pin_reference_project_manager", "exit_ghidra"},
 }
 FIXTURE_CHECKPOINTS = {
     "import": {"open_import_chooser", "activate_import_chooser", "verify_import_chooser_path",
@@ -60,7 +60,8 @@ FIXTURE_CHECKPOINTS = {
                "open_reference_go", "await_reference_go", "verify_reference_go_editor",
                "submit_reference_go_address", "await_reference_go_dismissal", "restore_reference_listing_focus",
                "verify_reference_listing_address",
-               "focus_reference_listing_address", "verify_reference_key_readiness", "open_reference_editor_key",
+               "focus_reference_listing_address", "verify_reference_key_readiness", "reacquire_reference_browser",
+               "refocus_reference_listing_address", "open_reference_editor_key",
                "await_reference_editor",
                "inspect_references", "inspect_decompiler",
                "close_program"},
@@ -84,9 +85,19 @@ ANALYZER_REVEAL_FAILURES = {
     35: ("analyzer_page_focus_moved", "The analyzer viewport changed while acquiring keyboard focus"),
 }
 REFERENCE_KEY_INPUT_REFUSED = "reference_key_input_refused"
+REFERENCE_RECOVERABLE_FOREGROUND = {"reference_foreground_project_manager"}
+REFERENCE_BLOCKED_FOREGROUND = {
+    "reference_foreground_go_dialog", "reference_foreground_owned_dialog",
+    "reference_foreground_other_dialog", "reference_foreground_other_window",
+}
+REFERENCE_FOREGROUND_FAILURES = {
+    "reference_browser_lookup", "reference_foreground_none",
+    *REFERENCE_RECOVERABLE_FOREGROUND, *REFERENCE_BLOCKED_FOREGROUND,
+}
+REFERENCE_GO_HANDOFF_UNVERIFIED = "reference_go_handoff_unverified"
 REFERENCE_KEY_FAILURES = {
     "reference_browser_lookup": 36,
-    "reference_browser_inactive": 37,
+    "reference_foreground_none": 37,
     "reference_listing_address_absent": 38,
     "reference_listing_address_ambiguous": 39,
     "reference_listing_focus_absent": 40,
@@ -95,6 +106,12 @@ REFERENCE_KEY_FAILURES = {
     "reference_cursor_mismatch": 43,
     "reference_cursor_readback": 44,
     REFERENCE_KEY_INPUT_REFUSED: 45,
+    "reference_foreground_go_dialog": 46,
+    "reference_foreground_owned_dialog": 47,
+    "reference_foreground_other_dialog": 48,
+    "reference_foreground_project_manager": 49,
+    "reference_foreground_other_window": 50,
+    REFERENCE_GO_HANDOFF_UNVERIFIED: 51,
 }
 
 
@@ -106,6 +123,7 @@ class AnalyzerRevealFailure(RuntimeError):
 
 class ReferenceKeyFailure(RuntimeError):
     def __init__(self, outcome):
+        self.outcome = outcome
         self.code = REFERENCE_KEY_FAILURES[outcome]
         super().__init__(outcome)
 
@@ -368,17 +386,29 @@ class GhidraGui(Session):
         self.enter_text(address)
         self.call("key", "ENTER")
 
-    def observe_reference_key_readiness(self, title, address):
+    def await_reference_state(self, success, *command):
         deadline = time.monotonic() + 4
+        allowed = (REFERENCE_FOREGROUND_FAILURES if command[0] == "read-reference-browser-foreground"
+                   else REFERENCE_KEY_FAILURES.keys() - {REFERENCE_KEY_INPUT_REFUSED, REFERENCE_GO_HANDOFF_UNVERIFIED})
         while True:
-            outcome = self.call("read-listing-reference-state", title, address)
-            if outcome == "reference_ready":
+            outcome = self.call(*command)
+            if outcome == success:
                 return
-            if outcome not in REFERENCE_KEY_FAILURES or outcome == REFERENCE_KEY_INPUT_REFUSED:
+            if outcome not in allowed:
                 raise RuntimeError("Unexpected reference readiness result")
-            if outcome == "reference_cursor_readback" or time.monotonic() >= deadline:
+            if (outcome in REFERENCE_BLOCKED_FOREGROUND or outcome == "reference_cursor_readback"
+                    or time.monotonic() >= deadline):
                 raise ReferenceKeyFailure(outcome)
             time.sleep(0.15)
+
+    def restore_reference_browser(self, title, *, after_go):
+        command = "restore-reference-browser" if after_go else "reacquire-reference-browser"
+        outcome = self.call(command, title)
+        if outcome in REFERENCE_FOREGROUND_FAILURES or (after_go and outcome == REFERENCE_GO_HANDOFF_UNVERIFIED):
+            raise ReferenceKeyFailure(outcome)
+        if outcome not in {"reference_browser_active", "reference_browser_request_sent"}:
+            raise RuntimeError("Unexpected reference browser restoration result")
+        self.await_reference_state("reference_browser_active", "read-reference-browser-foreground", title)
 
     def open_scoped_references(self, file, title):
         address = "ram:f000:010d"
@@ -396,17 +426,26 @@ class GhidraGui(Session):
         self.checkpoint("await_reference_go_dismissal", file)
         self.wait(r"^(?:ACTIVE|WINDOW)\tGo To \.\.\.\t", present=False)
         self.checkpoint("restore_reference_listing_focus", file)
-        self.call("front", literal(title))
-        self.wait(r"^ACTIVE\t" + literal(title) + r"\t")
+        self.restore_reference_browser(title, after_go=True)
         self.checkpoint("verify_reference_listing_address", file)
         self.wait(r"^field\t" + literal(address) + r"\t", active_dialog=title)
         self.checkpoint("focus_reference_listing_address", file)
         self.call("focus-listing-address", title, address)
         self.checkpoint("verify_reference_key_readiness", file)
-        self.observe_reference_key_readiness(title, address)
+        try:
+            self.await_reference_state("reference_ready", "read-listing-reference-state", title, address)
+        except ReferenceKeyFailure as error:
+            if error.outcome not in REFERENCE_RECOVERABLE_FOREGROUND:
+                raise
+            self.checkpoint("reacquire_reference_browser", file)
+            self.restore_reference_browser(title, after_go=False)
+            self.checkpoint("refocus_reference_listing_address", file)
+            self.call("focus-listing-address", title, address)
+            self.checkpoint("verify_reference_key_readiness", file)
+            self.await_reference_state("reference_ready", "read-listing-reference-state", title, address)
         self.checkpoint("open_reference_editor_key", file)
         outcome = self.call("open-listing-references", title, address)
-        if outcome in REFERENCE_KEY_FAILURES:
+        if outcome in REFERENCE_KEY_FAILURES and outcome != REFERENCE_GO_HANDOFF_UNVERIFIED:
             raise ReferenceKeyFailure(outcome)
         if outcome != "reference_key_sent":
             raise RuntimeError("Unexpected reference key submission result")
@@ -662,6 +701,9 @@ def rows_at(view, address, expected_type, expected_source):
 def stage_reopen(ui, guarded_reference_open=False):
     ui.checkpoint("open_saved_project")
     ui.wait(r"^(?:ACTIVE|WINDOW)\t" + literal(MANAGER) + r"\t")
+    if guarded_reference_open:
+        ui.checkpoint("pin_reference_project_manager")
+        ui.call("pin-reference-project-manager", PROJECT)
     receipt = {}
     for file in FIXTURES:
         ui.checkpoint("open_read_only_program", file)

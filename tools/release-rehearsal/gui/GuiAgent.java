@@ -53,6 +53,10 @@ public class GuiAgent {
     private static final String STATIC_OPTION = "Run WSMachine";
     private static final String REPORT_OPTION = "Evidence report file (JSON lines; empty = none)";
     private static Window preferredWindow;
+    private static Window referenceProjectManager;
+    private static String referenceProject;
+    private static Window referenceProgramBrowser;
+    private static ReferenceGoHandoff referenceGoHandoff;
     private static JButton watchedButton;
     private static Window watchedWindow;
     private static int buttonActions;
@@ -336,24 +340,148 @@ public class GuiAgent {
     }
 
     private static Control listingField(String browser, String address) throws Exception {
-        var matches = listingFields(activeWindow(browser), address);
+        ReferenceBrowser state = referenceBrowser(browser);
+        if (!state.foreground.equals("reference_browser_active")) {
+            throw new IllegalStateException("The exact listing browser cannot receive address input");
+        }
+        var matches = listingFields(state.owner, address);
         if (matches.size() != 1) {
             throw new IllegalStateException("Expected one exact visible listing address in the active program");
         }
         return matches.getFirst();
     }
 
-    private static String listingReferenceReadiness(String browser, String address) throws Exception {
+    private record ReferenceBrowser(Window owner, String foreground) {}
+
+    private record ReferenceGoHandoff(Window browser, Window dialog) {}
+
+    private static boolean containsProjectRoot(Component component, String project) {
+        if (!component.isShowing()) {
+            return false;
+        }
+        if (component instanceof JTree tree && isProjectDataTree(tree)) {
+            Object root = tree.getModel().getRoot();
+            return root != null && "ghidra.framework.main.datatree.DomainFolderRootNode".equals(root.getClass().getName())
+                && project.equals(root.toString());
+        }
+        if (component instanceof Container container) {
+            for (Component child : container.getComponents()) {
+                if (containsProjectRoot(child, project)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean isReferenceProjectManager(Window window, String project) {
+        return window.isShowing() && "docking.DockingFrame".equals(window.getClass().getName())
+            && ("Ghidra: " + project).equals(window.getAccessibleContext().getAccessibleName())
+            && containsProjectRoot(window, project);
+    }
+
+    private static void pinReferenceProjectManager(String project) {
+        var matches = List.of(Window.getWindows()).stream()
+            .filter(window -> isReferenceProjectManager(window, project)).toList();
+        if (referenceProjectManager != null || matches.size() != 1) {
+            throw new IllegalStateException("Expected one stock manager for the exact reopened project");
+        }
+        referenceProjectManager = matches.getFirst();
+        referenceProject = project;
+    }
+
+    private static boolean containsStockListing(Component component) {
+        if (!component.isShowing()) {
+            return false;
+        }
+        if ("ghidra.app.util.viewer.listingpanel.ListingPanel".equals(component.getClass().getName())) {
+            return true;
+        }
+        if (component instanceof Container container) {
+            for (Component child : container.getComponents()) {
+                if (containsStockListing(child)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean isReferenceProgramBrowser(Window owner, String title) {
+        return referenceProject != null && title.startsWith("CodeBrowser: " + referenceProject + ":/")
+            && title.endsWith(" [Read-Only]") && "docking.DockingFrame".equals(owner.getClass().getName())
+            && containsStockListing(owner);
+    }
+
+    private static ReferenceBrowser referenceBrowser(String browser) throws Exception {
         Window owner;
         try {
             owner = window(Pattern.quote(browser));
         }
         catch (IllegalArgumentException error) {
-            return "reference_browser_lookup";
+            return new ReferenceBrowser(null, "reference_browser_lookup");
         }
-        if (!owner.isActive()) {
-            return "reference_browser_inactive";
+        if (owner != referenceProgramBrowser || !isReferenceProgramBrowser(owner, browser)) {
+            return new ReferenceBrowser(null, "reference_browser_lookup");
         }
+
+        String blocker = null;
+        for (Window shown : Window.getWindows()) {
+            if (!(shown instanceof Dialog dialog) || !dialog.isShowing()) {
+                continue;
+            }
+            if ("Go To ...".equals(dialog.getTitle())) {
+                return new ReferenceBrowser(owner, "reference_foreground_go_dialog");
+            }
+            boolean owned = ownedBy(dialog, owner);
+            if (dialog.isActive() || (dialog.isModal() &&
+                    (owned || dialog.getModalityType() != Dialog.ModalityType.DOCUMENT_MODAL))) {
+                blocker = owned ? "reference_foreground_owned_dialog" : "reference_foreground_other_dialog";
+            }
+        }
+        if (blocker != null) {
+            return new ReferenceBrowser(owner, blocker);
+        }
+
+        Window foreground = KeyboardFocusManager.getCurrentKeyboardFocusManager().getActiveWindow();
+        if (foreground == null || !foreground.isShowing()) {
+            return new ReferenceBrowser(owner, "reference_foreground_none");
+        }
+        if (foreground == owner && owner.isActive()) {
+            return new ReferenceBrowser(owner, "reference_browser_active");
+        }
+        if (foreground == referenceProjectManager && foreground.isActive()
+                && isReferenceProjectManager(foreground, referenceProject)) {
+            return new ReferenceBrowser(owner, "reference_foreground_project_manager");
+        }
+        return new ReferenceBrowser(owner, "reference_foreground_other_window");
+    }
+
+    private static String restoreReferenceBrowser(String browser, boolean afterGo) throws Exception {
+        ReferenceBrowser state = referenceBrowser(browser);
+        boolean noForeground = state.foreground.equals("reference_foreground_none");
+        boolean canRestore = noForeground || state.foreground.equals("reference_foreground_project_manager");
+        if (afterGo && (canRestore || state.foreground.equals("reference_browser_active"))) {
+            ReferenceGoHandoff handoff = referenceGoHandoff;
+            referenceGoHandoff = null;
+            if (handoff == null || handoff.browser != state.owner || handoff.dialog.isShowing()) {
+                return "reference_go_handoff_unverified";
+            }
+        }
+        if (canRestore && (afterGo || !noForeground)) {
+            state.owner.toFront();
+            state.owner.requestFocus();
+            return "reference_browser_request_sent";
+        }
+        return state.foreground;
+    }
+
+    private static String listingReferenceReadiness(String browser, String address) throws Exception {
+        ReferenceBrowser state = referenceBrowser(browser);
+        if (!state.foreground.equals("reference_browser_active")) {
+            return state.foreground;
+        }
+        Window owner = state.owner;
         List<Control> matches = listingFields(owner, address);
         if (matches.size() != 1) {
             return matches.isEmpty() ? "reference_listing_address_absent" : "reference_listing_address_ambiguous";
@@ -982,7 +1110,13 @@ public class GuiAgent {
                 return String.join("\n", rows.stream().map(Control::describe).toList());
             });
             case "start-listing-go" -> {
-                edt(() -> activeWindow(parts[1]));
+                edt(() -> {
+                    if (!isReferenceProgramBrowser(activeWindow(parts[1]), parts[1])) {
+                        throw new IllegalStateException("Expected the stock read-only CodeBrowser Listing");
+                    }
+                    referenceGoHandoff = null;
+                    return null;
+                });
                 chord(robot, "G");
                 yield "";
             }
@@ -991,13 +1125,20 @@ public class GuiAgent {
                 yield "";
             }
             case "submit-go-address" -> {
-                edt(() -> {
-                    if (!parts[2].equals(focusedGoEditor(parts[1]).getText())) {
+                ReferenceGoHandoff handoff = edt(() -> {
+                    JTextComponent editor = focusedGoEditor(parts[1]);
+                    Window owner = window(Pattern.quote(parts[1]));
+                    if (!isReferenceProgramBrowser(owner, parts[1]) || !parts[2].equals(editor.getText())) {
                         throw new IllegalStateException("The focused Go To editor lacks the exact requested address");
                     }
-                    return null;
+                    return new ReferenceGoHandoff(owner, SwingUtilities.getWindowAncestor(editor));
                 });
                 chord(robot, "ENTER");
+                edt(() -> {
+                    referenceProgramBrowser = handoff.browser;
+                    referenceGoHandoff = handoff;
+                    return null;
+                });
                 yield "";
             }
             case "focus-listing-address" -> {
@@ -1008,6 +1149,17 @@ public class GuiAgent {
             }
             case "read-listing-reference-state" ->
                 edt(() -> listingReferenceReadiness(parts[1], parts[2]));
+            case "read-reference-browser-foreground" ->
+                edt(() -> referenceBrowser(parts[1]).foreground);
+            case "pin-reference-project-manager" -> {
+                edt(() -> {
+                    pinReferenceProjectManager(parts[1]);
+                    return null;
+                });
+                yield "";
+            }
+            case "restore-reference-browser", "reacquire-reference-browser" ->
+                edt(() -> restoreReferenceBrowser(parts[1], parts[0].equals("restore-reference-browser")));
             case "open-listing-references" -> {
                 String readiness = edt(() -> listingReferenceReadiness(parts[1], parts[2]));
                 if (!readiness.equals("reference_ready")) {
