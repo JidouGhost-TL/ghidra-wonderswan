@@ -14,6 +14,7 @@ import ghidra.program.model.data.WordDataType;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.FlowOverride;
 import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.ParameterImpl;
 import ghidra.program.model.listing.ReturnParameterImpl;
 import ghidra.program.model.listing.VariableStorage;
@@ -83,6 +84,38 @@ public final class WSAsmAxLiveThrough {
     }
 
     private static List<Address> prove(Function function) {
+        var code = readOnlyLeaf(function);
+        if (code.isEmpty()) return List.of();
+        var program = function.getProgram();
+        Set<Address> definitions = new HashSet<>();
+        Register ax = program.getRegister("AX");
+        boolean esInput = false;
+        for (var ins : code) {
+            for (PcodeOp op : ins.getPcode()) {
+                for (var input : op.getInputs()) {
+                    Register r = register(function, input);
+                    if (input.isRegister() && r == null) return List.of();
+                    if (r == null || IMPLICIT_READS.contains(r.getName())) continue;
+                    if (FRAME.contains(r.getName()) || overlaps(ax, r)) return List.of();
+                    for (int i = 0; i < input.getSize(); i++) {
+                        if (definitions.contains(input.getAddress().add(i))) continue;
+                        if (!r.getName().equals("ES")) return List.of();
+                        esInput = true;
+                    }
+                }
+                var output = op.getOutput();
+                Register r = register(function, output);
+                if (output != null && output.isRegister() && r == null) return List.of();
+                if (r != null) {
+                    if (FRAME.contains(r.getName()) || r.getName().equals("ES") || overlaps(ax, r)) return List.of();
+                    for (int i = 0; i < output.getSize(); i++) definitions.add(output.getAddress().add(i));
+                }
+            }
+        }
+        return esInput ? directNearCallers(function) : List.of();
+    }
+
+    static List<Instruction> readOnlyLeaf(Function function) {
         var body = function.getBody();
         if (function.isExternal() || function.isThunk() || function.isInline() || function.hasNoReturn()
                 || function.getCallFixup() != null || body.getNumAddressRanges() != 1
@@ -96,9 +129,7 @@ public final class WSAsmAxLiveThrough {
 
         var ins = listing.getInstructionAt(entry);
         if (ins == null || ins.getFallFrom() != null) return List.of();
-        Set<Address> definitions = new HashSet<>();
-        Register ax = program.getRegister("AX");
-        boolean esInput = false;
+        var bodyInstructions = new ArrayList<Instruction>();
         while (ins != null && body.contains(ins.getMinAddress(), ins.getMaxAddress())) {
             String mnemonic = ins.getMnemonicString();
             if (ins.getFlowOverride() != FlowOverride.NONE || ins.isFallThroughOverridden()) return List.of();
@@ -119,32 +150,20 @@ public final class WSAsmAxLiveThrough {
                             PcodeOp.CALLIND, PcodeOp.BRANCHIND, PcodeOp.RETURN -> { return List.of(); }
                     default -> { }
                 }
-                for (var input : op.getInputs()) {
-                    Register r = register(function, input);
-                    if (input.isRegister() && r == null) return List.of();
-                    if (r == null || IMPLICIT_READS.contains(r.getName())) continue;
-                    if (FRAME.contains(r.getName()) || ax.equals(r) || ax.contains(r) || r.contains(ax)) return List.of();
-                    for (int i = 0; i < input.getSize(); i++) {
-                        if (definitions.contains(input.getAddress().add(i))) continue;
-                        if (!r.getName().equals("ES")) return List.of();
-                        esInput = true;
-                    }
-                }
-                var output = op.getOutput();
-                if (output != null && output.getAddress().isMemoryAddress()) return List.of();
-                Register r = register(function, output);
-                if (output != null && output.isRegister() && r == null) return List.of();
-                if (r != null) {
-                    if (FRAME.contains(r.getName()) || r.getName().equals("ES")
-                            || ax.equals(r) || ax.contains(r) || r.contains(ax)) return List.of();
-                    for (int i = 0; i < output.getSize(); i++) definitions.add(output.getAddress().add(i));
-                }
+                if (op.getOutput() != null && op.getOutput().getAddress().isMemoryAddress()) return List.of();
             }
+            bodyInstructions.add(ins);
             ins = listing.getInstructionAt(fallThrough);
         }
-        if (!esInput || ins == null || !ins.getMnemonicString().equals("RET")
+        if (ins == null || !ins.getMnemonicString().equals("RET")
                 || ins.getLength() != 1 || !ins.getMaxAddress().equals(body.getMaxAddress())) return List.of();
+        return bodyInstructions;
+    }
 
+    static List<Address> directNearCallers(Function function) {
+        var program = function.getProgram();
+        var listing = program.getListing();
+        var entry = function.getEntryPoint();
         var calls = new ArrayList<Address>();
         for (var ref : program.getReferenceManager().getReferencesTo(entry)) {
             if (!ref.getReferenceType().isFlow()) continue;
@@ -159,7 +178,11 @@ public final class WSAsmAxLiveThrough {
         return calls;
     }
 
-    private static Register register(Function function, Varnode node) {
+    static boolean overlaps(Register a, Register b) {
+        return a.equals(b) || a.contains(b) || b.contains(a);
+    }
+
+    static Register register(Function function, Varnode node) {
         return node != null && node.isRegister() ? function.getProgram().getRegister(node.getAddress(), node.getSize()) : null;
     }
 }

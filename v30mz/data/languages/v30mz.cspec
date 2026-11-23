@@ -281,4 +281,26 @@
       <register name="DF"/>
     </unaffected>
   </prototype>
+  <!-- R1d: a proved read-only near leaf returns SI/ES and preserves incoming BX. -->
+  <prototype name="__wsasm_near_bx_preserved" extrapop="2" stackshift="2" strategy="register">
+    <input>
+      <pentry minsize="2" maxsize="2"><register name="AX"/></pentry>
+    </input>
+    <output>
+      <pentry minsize="2" maxsize="2"><register name="SI"/></pentry>
+      <pentry minsize="4" maxsize="4"><addr space="join" piece1="SI" piece2="ES"/></pentry>
+    </output>
+    <killedbycall>
+      <register name="AX"/>
+      <register name="CX"/>
+    </killedbycall>
+    <unaffected>
+      <register name="BX"/>
+      <register name="SP"/>
+      <register name="DS"/>
+      <register name="CS"/>
+      <register name="SS"/>
+      <register name="DF"/>
+    </unaffected>
+  </prototype>
 </compiler_spec>

@@ -84,10 +84,13 @@ public final class WSReturns {
         do { previous = functions; applyPass(); } while (functions != previous);
         // Established output signatures take precedence over a void leaf with
         // proved AX live-through.
-        if (p.getCompilerSpec().getCallingConvention(WSAsmAxLiveThrough.CONVENTION) != null) {
+        boolean axLiveThrough = p.getCompilerSpec().getCallingConvention(WSAsmAxLiveThrough.CONVENTION) != null;
+        boolean bxLiveThrough = p.getCompilerSpec().getCallingConvention(WSAsmBxLiveThrough.CONVENTION) != null;
+        if (axLiveThrough || bxLiveThrough) {
             for (Function f : p.getFunctionManager().getFunctions(true)) {
                 monitor.checkCancelled();
-                WSAsmAxLiveThrough.apply(f, emit);
+                if (axLiveThrough) WSAsmAxLiveThrough.apply(f, emit);
+                if (bxLiveThrough) WSAsmBxLiveThrough.apply(f, emit);
             }
         }
     }
