@@ -26,7 +26,8 @@ import ghidra.util.task.TaskMonitor;
  *   E1R re-seed executed addresses that later analysis removed;
  *   J1  CS-relative jump/call tables by rule ({@link WSJumpTables}), checked against observed targets
  *       (unguarded byte-index sites already get J1 before stock switch analysis, {@link WSSwitchOrderAnalyzer});
- *   C   tag unguarded byte-index JMP tables J1 leaves without a proven end (WARNING bookmark, log entry);
+ *   J1w withdraw what J1u wrote at a site phase 2 cannot re-prove (code kept as hypotheses);
+ *   C   tag unguarded byte-index JMP tables J1 leaves unresolved (WARNING bookmark, log entry);
  *   D1  DS/SS context at function entries; A1 preserve and tag unresolved decode hypotheses;
  *   P1  preserve functions without a current memory image and record the unresolved hypothesis;
  *   D0  title DS/SS defaults from execution evidence ({@link WSCompilerRules}), before D1;
@@ -118,10 +119,14 @@ public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
             rule("J3", s, program, log, failed, () -> parts.add(WSInlineTables.apply(program, line -> s.emit("%s", line), monitor)));
             if (j != null) rule("J1r", s, program, log, failed, () -> j.restoreClearedSites(monitor));
             if (j != null) rule("J1l-finish", s, program, log, failed, () -> j.finish());
-            if (j != null) rule("C", s, program, log, failed, () -> parts.add(j.tagHazards(line -> {
+            if (j != null) rule("J1w", s, program, log, failed, () -> parts.add(j.withdrawUnproven(WSSwitchOrderAnalyzer.beforeSwitch(program), line -> {
                 log.appendMsg(NAME + ": " + line);
                 Msg.warn(this, NAME + ": " + line);
             })));
+            if (j != null) rule("C", s, program, log, failed, () -> parts.add(j.tagHazards(line -> {
+                log.appendMsg(NAME + ": " + line);
+                Msg.warn(this, NAME + ": " + line);
+            }, WSSwitchOrderAnalyzer.beforeSwitch(program))));
             if (j != null) parts.add(j.summary());
             if (cp != null) parts.add(cp.summary());
             if (gc != null) parts.add(gc.summary());

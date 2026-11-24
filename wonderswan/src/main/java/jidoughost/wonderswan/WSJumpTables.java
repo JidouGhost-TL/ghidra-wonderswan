@@ -96,7 +96,9 @@ import ghidra.util.task.TaskMonitor;
  *   decompiler without limit. Stock analysis skips a computed jump that already has computed references,
  *   and a stored lock (when a function contains the site) keeps every later decompile on the proven table. Same
  *   recovery and stop rules; a site J1 cannot prove yet is left for the later passes.
- * Rule C (end of phase 2): an unguarded byte-index JMP site still unresolved for lack of a proven end gets a
+ * J1w (end of phase 2): a J1u site phase 2 cannot re-prove loses the references and lock J1u wrote (code kept, H2).
+ * Rule C (end of phase 2): an unguarded byte-index JMP site still unresolved for lack of a proven end, or because its
+ *   proven targets conflict with existing code or data (J1s), gets a
  *   WARNING bookmark (WSJumpTableHazard), a log entry and a report line. Its code is preserved and no table
  *   end is invented.
  * Index scaling by ADD r,r counts as SHL r,1.
@@ -386,6 +388,7 @@ public final class WSJumpTables {
                 if (e.getValue() == null || e.getValue().targets.isEmpty()) handleUnresolved(e.getKey(), e.getValue());
                 else {
                     if (!applySite(e.getKey(), e.getValue(), monitor)) {
+                        conflicts.put(e.getKey().getAddress(), e.getValue());   // proven end, conflicting targets (J1s)
                         if (reported.add(e.getKey().getAddress())) emitUnresolved(e.getKey(), e.getValue());
                         continue;
                     }
@@ -426,31 +429,36 @@ public final class WSJumpTables {
     final Set<Address> csOperands = new HashSet<>();
     int beforeSwitch, beforeSwitchSites;
 
-    /** J1u scope: an index bounded only by its byte width (J1c) or by an AND mask, with no CMP guard and no
-     *  conditional branch or join between the instruction that loads the index byte from memory and the site.
-     *  Stock switch recovery can then bound the index only by that width or mask (128 or 256 slots for a byte),
-     *  so it reads past the real table. A branch or join after the load may guard the value for the stock
-     *  recovery (e.g. CMP AL,n; JA before MOV BL,AL), so such sites stay with it; a join at or before the load
-     *  (or before the AND) cannot constrain the value it produces. An index copied from another byte register
-     *  is followed back to its own load. */
+    /** J1u scope: an index bounded only by its byte width (J1c) or by an AND mask on the index register, with no
+     *  conditional branch and no join (conditional or unconditional jump into the slice) between the instruction that
+     *  loads the index from memory and the site. Stock switch recovery can then bound the index only by that width or
+     *  mask (128 or 256 slots for a byte), so it reads past the real table. A branch or join after the load may guard
+     *  the value for the stock recovery (CMP AL,n; JA before MOV BL,AL, or before an AND mask), so such sites stay
+     *  with it; a join at the load cannot constrain a value read from memory there. The index is followed back
+     *  through register copies (MOV BX,AX; MOV BL,AL) to its load; without a load in the slice, any branch or join
+     *  in the whole slice counts as a possible guard. */
     boolean unguardedByteIndex(Instruction site, Rec r) {
         if (r == null || !r.byteBound && r.maskOffsets == null) return false;
-        String lo = r.idx == null ? null : (r.scaledBy == null ? r.idx : r.scaledBy);
-        lo = lo != null && lo.length() == 2 && (lo.charAt(1) == 'X' || lo.charAt(1) == 'L') ? lo.charAt(0) + "L" : null;
+        String reg = r.idx == null ? null : (r.scaledBy == null ? r.idx : r.scaledBy);
+        if (reg == null || reg.length() != 2) return false;
         List<Instruction> slice = new ArrayList<>(predecessors(site, 16));
         slice.add(0, site);
         for (Instruction q : slice) {
             String t = q.toString().toUpperCase().replace(" ", "");
-            // a mask bounds whatever reached it: only branches and joins after the AND can guard
-            if (r.maskOffsets != null && t.startsWith("AND") && t.contains(",0X")) return true;
-            if (lo != null && t.startsWith("MOV" + lo + ",")) {
+            String w = reg.charAt(1) == 'X' ? reg : null, lo = w == null ? reg : w.charAt(0) + "L";
+            if (w != null && t.startsWith("MOV" + w + ",")) {
                 String src = t.substring(t.indexOf(',') + 1);
-                if (src.contains("[")) return true;                          // loaded from memory here
-                if (src.matches("[ABCD][LH]")) lo = src;                     // copied: follow the source byte
+                if (src.contains("[")) return true;                              // index word loaded here
+                if (src.matches("[ABCD]X|SI|DI|BP")) { reg = src; continue; }    // copied: follow the source
+            }
+            if (t.startsWith("MOV" + lo + ",") || t.startsWith("MOVZX" + (w == null ? lo : w) + ",")) {
+                String src = t.substring(t.indexOf(',') + 1);
+                if (src.contains("[")) return true;                              // index byte loaded here
+                if (src.matches("[ABCD][LH]")) { reg = src.charAt(1) == 'L' ? src.charAt(0) + "X" : src; continue; }
             }
             if (q != site && q.getFlowType().isConditional()) return false;
             for (Reference ref : p.getReferenceManager().getReferencesTo(q.getAddress()))
-                if (ref.getReferenceType().isConditional()) return false;
+                if (ref.getReferenceType().isJump() || ref.getReferenceType().isConditional()) return false;
         }
         return true;
     }
@@ -500,7 +508,7 @@ public final class WSJumpTables {
         for (Map.Entry<Instruction, Rec> e : recs.entrySet()) {
             monitor.checkCancelled();
             try {
-                if (!applySite(e.getKey(), e.getValue(), monitor)) continue;
+                if (!applySite(e.getKey(), e.getValue(), monitor)) { conflicts.put(e.getKey().getAddress(), e.getValue()); continue; }
             }
             catch (ghidra.util.exception.CancelledException c) { throw c; }
             catch (Exception x) {
@@ -511,10 +519,65 @@ public final class WSJumpTables {
                 continue;
             }
             done.add(e.getKey().getAddress());
+            beforeSwitchTargets.put(e.getKey().getAddress(), new ArrayList<>(e.getValue().targets));
             applied++;
         }
         beforeSwitch += applied;
         return applied;
+    }
+
+    /** Sites whose proven table had conflicting targets (applySite refused, J1s), with the recovery that proved it. */
+    final Map<Address, Rec> conflicts = new HashMap<>();
+    /** Sites whose table this instance recovered (J1 or J1u). */
+    final Set<Address> recoveredSites = new HashSet<>();
+    /** J1u: site -> targets it applied before stock switch analysis. */
+    final Map<Address, List<Address>> beforeSwitchTargets = new LinkedHashMap<>();
+    int withdrawn;
+
+    /**
+     * Rule J1w (end of phase 2, this instance = the phase-2 J1): a site J1u applied before stock switch analysis that
+     * phase 2 cannot re-prove from the final listing loses what J1u wrote: its analysis-sourced computed references to
+     * the J1u targets (observed targets stay) and its jump-table lock. The code decoded from those targets is kept and
+     * tagged (H2, reason J1U_WITHDRAWN); the site is left to the later rules like any unresolved site.
+     */
+    String withdrawUnproven(WSJumpTables early, java.util.function.Consumer<String> log) throws Exception {
+        if (early == null) return "J1w J1u sites withdrawn 0";
+        for (Map.Entry<Address, List<Address>> e : early.beforeSwitchTargets.entrySet()) {
+            Address site = e.getKey();
+            if (recoveredSites.contains(site)) continue;
+            Instruction ins = listing.getInstructionAt(site);
+            Set<Long> obs = observed.getOrDefault(site.getOffset(), Set.of());
+            Set<Address> j1u = new HashSet<>(e.getValue());
+            List<Address> gone = new ArrayList<>();
+            for (Reference ref : p.getReferenceManager().getReferencesFrom(site)) {
+                if (!ref.getReferenceType().isComputed() || ref.getSource() != SourceType.ANALYSIS) continue;
+                if (!j1u.contains(ref.getToAddress()) || obs.contains(ref.getToAddress().getOffset())) continue;
+                p.getReferenceManager().delete(ref);
+                gone.add(ref.getToAddress());
+            }
+            int locks = 0;
+            for (Symbol sw : p.getSymbolTable().getSymbols(site)) {
+                if (!sw.getName().equals("switch") || !sw.getParentNamespace().getName().startsWith("jmp_")) continue;
+                List<Symbol> labels = new ArrayList<>();
+                boolean protectedNamespace = false;
+                for (Symbol q : p.getSymbolTable().getSymbols(sw.getParentNamespace())) {
+                    if (q.getSymbolType() != SymbolType.LABEL) protectedNamespace = true;
+                    labels.add(q);
+                }
+                if (protectedNamespace) continue;
+                for (Symbol q : labels) q.delete();
+                locks++;
+                break;
+            }
+            for (Address t : gone) preserveHypothesis(site, t, "J1U_WITHDRAWN");
+            withdrawn++;
+            String line = String.format("{\"rule\":\"J1w\",\"site\":\"%s\",\"insn\":\"%s\",\"outcome\":\"J1U_WITHDRAWN\",\"refs_deleted\":%d,\"locks_removed\":%d,\"j1u_targets\":%d}",
+                site, ins, gone.size(), locks, j1u.size());
+            emit.accept(line);
+            log.accept(site + ": J1w: phase 2 could not re-prove the table J1u applied before switch analysis; "
+                + gone.size() + " references and " + locks + " lock withdrawn, decoded code kept as hypotheses");
+        }
+        return "J1w J1u sites withdrawn " + withdrawn;
     }
 
     /**
@@ -523,24 +586,47 @@ public final class WSJumpTables {
      * reads handler bytes as further slots. The code is preserved (H2) and no table end is invented: the
      * site gets a WARNING bookmark, a log entry and a report line.
      */
-    String tagHazards(java.util.function.Consumer<String> log) {
-        int tagged = 0;
+    String tagHazards(java.util.function.Consumer<String> log) { return tagHazards(log, null); }
+
+    /** @param early the J1u instance of this program (its target conflicts count too), or null */
+    String tagHazards(java.util.function.Consumer<String> log, WSJumpTables early) {
+        int tagged = 0, conflictTags = 0, failed = 0;
         for (Address site : new TreeSet<>(reported)) {
-            Instruction ins = listing.getInstructionAt(site);
-            if (ins == null || !ins.getMnemonicString().equalsIgnoreCase("JMP")) continue;
-            Rec r = recover(ins);
-            if (!r.byteBound || !unguardedByteIndex(ins, r) || !r.shape.contains("BYTE_INDEX_WEAK_STOP")) continue;
-            String note = String.format("Rule C: unguarded byte-index CS jump table at %s (%s) has no range guard and "
-                + "no proven end (scan stopped on %s after %d slots); J1 left it unresolved. Stock switch recovery "
-                + "reads all %d index slots here.", r.tableAddress, r.bound, r.stop, r.slots, r.cap);
-            p.getBookmarkManager().setBookmark(site, BookmarkType.WARNING, "WSJumpTableHazard", note);
-            emit.accept(String.format("{\"rule\":\"C\",\"site\":\"%s\",\"insn\":\"%s\",\"outcome\":\"HAZARD_TAGGED\",\"table\":\"%s\",\"stop\":\"%s\",\"slots\":%d,\"cap\":%d}",
-                site, ins, r.tableAddress, r.stop, r.slots, r.cap));
-            log.accept(site + ": " + note);
-            tagged++;
+            try {
+                Instruction ins = listing.getInstructionAt(site);
+                if (ins == null || !ins.getMnemonicString().equalsIgnoreCase("JMP")) continue;
+                // a proven end whose targets conflicted with existing code or data (J1s) when J1 or J1u tried it; the
+                // recovery from that attempt is the evidence (later analysis, e.g. stock table data, may hide it now)
+                Rec proven = conflicts.containsKey(site) ? conflicts.get(site) : early == null ? null : early.conflicts.get(site);
+                Rec r = proven != null ? proven : recover(ins);  // null: not a CS-relative table site (rule C does not apply)
+                if (r == null || !r.byteBound || !unguardedByteIndex(ins, r)) continue;
+                boolean conflict = proven != null || !r.shape.contains("BYTE_INDEX_WEAK_STOP") && !r.targets.isEmpty();
+                boolean weak = !conflict && r.shape.contains("BYTE_INDEX_WEAK_STOP");
+                if (!weak && !conflict) continue;
+                String note = weak
+                    ? String.format("Rule C: unguarded byte-index CS jump table at %s (%s) has no range guard and "
+                        + "no proven end (scan stopped on %s after %d slots); J1 left it unresolved. Stock switch recovery "
+                        + "reads all %d index slots here.", r.tableAddress, r.bound, r.stop, r.slots, r.cap)
+                    : String.format("Rule C: unguarded byte-index CS jump table at %s (%s) ends on %s after %d slots, "
+                        + "but its targets conflict with existing code or data, so J1 left it unresolved (J1s). Stock "
+                        + "switch recovery reads all %d index slots here.", r.tableAddress, r.bound, r.stop, r.slots, r.cap);
+                p.getBookmarkManager().setBookmark(site, BookmarkType.WARNING, "WSJumpTableHazard", note);
+                emit.accept(String.format("{\"rule\":\"C\",\"site\":\"%s\",\"insn\":\"%s\",\"outcome\":\"%s\",\"table\":\"%s\",\"stop\":\"%s\",\"slots\":%d,\"cap\":%d}",
+                    site, ins, weak ? "HAZARD_TAGGED" : "HAZARD_TAGGED_CONFLICT", r.tableAddress, r.stop, r.slots, r.cap));
+                log.accept(site + ": " + note);
+                tagged++;
+                if (conflict) conflictTags++;
+            }
+            catch (RuntimeException e) {
+                // one site must not end rule C for the others; reported per site, never silently
+                failed++;
+                emit.accept(String.format("{\"rule\":\"C\",\"site\":\"%s\",\"outcome\":\"ERROR\",\"error\":\"%s\"}", site, String.valueOf(e).replace('"', '\'')));
+                log.accept(site + ": rule C failed at this site: " + e);
+                p.getBookmarkManager().setBookmark(site, BookmarkType.ERROR, "WSJumpTableHazard", "Rule C failed at this site: " + e);
+            }
         }
         hazards = tagged;
-        return "C unguarded byte-index hazards tagged " + tagged;
+        return "C unguarded byte-index hazards tagged " + tagged + " (target conflicts " + conflictTags + ", site errors " + failed + ")";
     }
     int hazards;
 
@@ -719,6 +805,7 @@ public final class WSJumpTables {
             emit.accept(String.format("{\"rule\":\"J1w\",\"site\":\"%s\",\"outcome\":\"TABLE_WORDS\",\"slots\":%d}", ins.getAddress(), dataSlots));
         observedMissing += missing.size();
         recovered++;
+        recoveredSites.add(ins.getAddress());
         if (!r.baseAdds.isEmpty()) computedBases++;
         emit.accept(String.format("{\"rule\":\"J1\",\"site\":\"%s\",\"insn\":\"%s\",\"outcome\":\"RECOVERED\",\"shape\":\"%s\",\"index\":\"%s\",\"scaled_by\":\"%s\",\"table\":\"%04x\",\"bound\":\"%s\",\"stop\":\"%s\",\"entries\":%d,\"superseded_refs\":%d,\"slots\":%d,\"empty_slots\":%d,\"observed\":%d,\"base_via\":\"%s\",\"observed_missing_added\":%s}",
             ins.getAddress(), ins, r.shape, r.idx, r.scaledBy, r.table, r.bound.replace("\"", "'"), r.stop, r.targets.size(), superseded, r.slots, r.empty, obs.size(),
@@ -1510,6 +1597,13 @@ public final class WSJumpTables {
         boolean hiClear = false, loByte = false, cbw = false;
         for (Instruction q : back) {
             String t = q.toString().toUpperCase().replace(" ", "");
+            // J1c through a register copy (MOV BX,AX): the bound is the source's, scaled the same way
+            java.util.regex.Matcher copy = Pattern.compile("MOV" + reg + ",([ABCD]X)").matcher(t);
+            if (copy.matches() && !hiClear && !loByte) {
+                reg = copy.group(1); lo = reg.charAt(0) + "L"; hi = reg.charAt(0) + "H";
+                r.bound = "via MOV " + r.idx + "," + reg;
+                continue;
+            }
             java.util.regex.Matcher m = Pattern.compile("SHL" + reg + ",(0X[0-9A-F]+|1)").matcher(t);
             if (m.matches()) { shift += m.group(1).equals("1") ? 1 : Integer.parseInt(m.group(1).substring(2), 16); continue; }
             if (t.startsWith("ADD" + reg + ",0X")) continue;
@@ -1518,13 +1612,14 @@ public final class WSJumpTables {
             if (t.startsWith("MOV" + lo + ",")) { loByte = true; if (hiClear) break; continue; }
             if (t.equals("CBW") && reg.equals("AX")) { cbw = true; loByte = true; hiClear = true; break; }
             if (t.startsWith("MOVZX" + reg)) { loByte = true; hiClear = true; break; }
-            if (writes(t, reg)) return;
+            if (writes(t, reg)) { if (r.bound.startsWith("via ")) r.bound = "none"; return; }
         }
-        if (!(hiClear && loByte)) return;
+        if (!(hiClear && loByte)) { if (r.bound.startsWith("via ")) r.bound = "none"; return; }
         int bytes = (cbw ? 128 : 256) << shift;           // CBW: only the 0..127 half lies at or after the base
         r.cap = Math.max(1, bytes / 2);
         r.byteBound = true;
-        r.bound = (cbw ? "byte index (CBW, forward half)" : "byte index") + " << " + shift + " -> " + r.cap + " entries";
+        String via = r.bound.startsWith("via ") ? " (" + r.bound + ")" : "";
+        r.bound = (cbw ? "byte index (CBW, forward half)" : "byte index") + " << " + shift + " -> " + r.cap + " entries" + via;
     }
 
     /** The immediate must still be the top stack word on every path to dispatch.

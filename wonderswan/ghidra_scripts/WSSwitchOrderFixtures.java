@@ -23,7 +23,16 @@ import jidoughost.wonderswan.WonderSwanLoader;
  *             prove an end; the site is tagged (rule C) and preserved, and no table end is invented.
  * masked:     IN AL,0B5h; MOV BL,AL; MOV BH,0; AND BX,0FEh; ADD BX,tbl; JMP CS:[BX]: the mask allows 128 slots, the
  *             table has 7 followed by its handler; same expectations as proven.
+ * copy:       MOV AL,[BP+4]; XOR AH,AH; SHL AX,1; PUSH BX; MOV BX,AX; MOV AX,CS:[BX+tbl]; POP BX; JMP AX: the byte bound
+ *             reaches the table through a register copy; same expectations as proven.
+ * npe:        the unprovable table plus a DS-relative JMP word ptr [0200h] (not a CS table): rule C still tags the
+ *             table site and does not fail on the other site.
+ * conflict:   7 slots followed by the first handler, but one slot points inside the dispatcher (offcut): J1 leaves the
+ *             site unresolved (J1s) and rule C tags it as a target conflict; nothing is invented.
+ * withdraw:   the proven cartridge; after analysis one J1u target is overwritten by defined data and phase 2 rerun:
+ *             it cannot re-prove the site, so rule J1w withdraws J1u's references and lock and keeps the code (H2).
  * guarded:    CMP AL,6; JA out before the scaling: stock switch recovery bounds it itself and keeps it (unchanged).
+ * guardmask:  CMP AL,6; JA out before SHL and an AND mask: guarded, left to stock recovery (unchanged).
  *
  * Usage: headless post script on any program (it imports its own cartridges into a temporary project).
  */
@@ -47,6 +56,7 @@ public class WSSwitchOrderFixtures extends GhidraScript {
     static String word(int v) { return String.format("%02x%02x", v & 0xff, (v >> 8) & 0xff); }
 
     static final int SITE_PROVEN = 0x50, TABLE = 0x60, SITE_GUARDED = 0x54, SITE_MASKED = 0x4e;
+    static boolean guardedVariant(String v) { return v.equals("guarded") || v.equals("guardmask"); }
     static final int[] ADJACENT = {0x6e, 0x75, 0x7c, 0x83, 0x8a, 0x91, 0x98};
     static final int[] DETACHED = {0x100, 0x107, 0x10e, 0x115, 0x11c, 0x123, 0x12a};
 
@@ -55,11 +65,22 @@ public class WSSwitchOrderFixtures extends GhidraScript {
         byte[] rom = new byte[0x20000];
         Arrays.fill(rom, (byte) 0xff);
         // reset: CLI; XOR AX,AX; MOV DS,AX; MOV AL,[0100h]; CMP AL,5Ah; JNZ spin; CALL 0040h; spin: JMP spin
-        put(rom, 0x00, "fa31c08ed8a000013c5a7503e83100ebfe");
-        int[] handlers = variant.equals("unprovable") ? DETACHED : ADJACENT;
+        if (variant.equals("npe")) {
+            // ... JNZ spin; CALL 0040h; CALL 0030h; spin: JMP spin, with JMP word ptr [0200h] at 0030h
+            put(rom, 0x00, "fa31c08ed8a000013c5a7506e83100e81e00ebfe");
+            put(rom, 0x30, "ff260002");
+        } else
+            put(rom, 0x00, "fa31c08ed8a000013c5a7503e83100ebfe");
+        int[] handlers = variant.equals("unprovable") || variant.equals("npe") ? DETACHED : ADJACENT;
         if (variant.equals("masked")) {
             // IN AL,0B5h; MOV BL,AL; MOV BH,0; AND BX,00FEh; ADD BX,0060h; JMP CS:[BX]
             put(rom, 0x40, "e4b588c3b70081e3fe0081c360002eff27");
+        } else if (variant.equals("copy")) {
+            // MOV AL,[BP+4]; XOR AH,AH; SHL AX,1; PUSH BX; MOV BX,AX; MOV AX,CS:[BX+0060h]; POP BX; JMP AX
+            put(rom, 0x40, "8a460432e4d1e0538bd82e8b8760005bffe0");
+        } else if (variant.equals("guardmask")) {
+            // IN AL,0B5h; CMP AL,6; JA 0057h; SHL AL,1; MOV BL,AL; MOV BH,0; AND BX,00FEh; ADD BX,0060h; JMP CS:[BX]; RET
+            put(rom, 0x40, "e4b53c067711d0e088c3b70081e3fe0081c360002eff27c3");
         } else if (variant.equals("guarded")) {
             // IN AL,0B5h; NOP x4; CMP AL,6; JA 0057h; SHL AL,1; MOV BL,AL; MOV BH,0; ADD BX,0060h;
             // JMP CS:[BX]; RET
@@ -69,7 +90,8 @@ public class WSSwitchOrderFixtures extends GhidraScript {
             put(rom, 0x40, "e4b590909090d0e088c3b70081c360002eff27");
         }
         StringBuilder table = new StringBuilder();
-        for (int h : handlers) table.append(word(h));
+        for (int k = 0; k < handlers.length; k++)
+            table.append(word(variant.equals("conflict") && k == 6 ? 0x41 : handlers[k]));   // conflict: inside IN AL,0B5h
         if (variant.equals("unprovable")) table.append(word(0x400));   // next word: erased bytes
         put(rom, TABLE, table.toString());
         for (int k = 0; k < handlers.length; k++)
@@ -117,9 +139,36 @@ public class WSSwitchOrderFixtures extends GhidraScript {
         } finally { d.dispose(); }
     }
 
+    /** J1w: overwrite handler 2 with defined data, rerun phase 2: J1u's references and lock go, the code stays. */
+    void withdraw(Program p, Address site) throws Exception {
+        String v = "withdraw";
+        check(v, computedTargets(p, site).size() == 7 && has(p, site, "switch", SourceType.USER_DEFINED),
+            "J1u table and lock in place after analysis: " + computedTargets(p, site));
+        int tx = p.startTransaction("withdraw");
+        try {
+            Address h2 = at(p, ADJACENT[2]);
+            p.getListing().clearCodeUnits(h2, h2.add(6), false);
+            p.getListing().createData(h2, ghidra.program.model.data.WordDataType.dataType);
+            new jidoughost.wonderswan.WSEvidenceRepairAnalyzer().added(p, p.getMemory(), monitor, new ghidra.app.util.importer.MessageLog());
+        } finally { p.endTransaction(tx, true); }
+        Set<Address> left = computedTargets(p, site);
+        check(v, left.isEmpty(), "J1u references withdrawn: " + left);
+        check(v, !has(p, site, "switch", SourceType.USER_DEFINED), "J1u lock withdrawn");
+        boolean kept = true;
+        for (int k = 0; k < ADJACENT.length; k++)
+            if (k != 2) kept &= p.getListing().getInstructionAt(at(p, ADJACENT[k])) != null;
+        check(v, kept, "the other 6 handlers stay decoded (H2)");
+        int tagged = 0;
+        for (Iterator<Bookmark> it = p.getBookmarkManager().getBookmarksIterator(BookmarkType.ANALYSIS); it.hasNext(); ) {
+            Bookmark b = it.next();
+            if (b.getCategory().startsWith("WSHypothesis") && b.getCategory().contains("J1U_WITHDRAWN")) tagged++;
+        }
+        check(v, tagged >= 6, "withdrawn targets tagged as hypotheses (" + tagged + ")");
+    }
+
     void fixture(File dir, String variant) throws Exception {
         Path file = dir.toPath().resolve(variant + ".ws");
-        Files.write(file, rom(variant));
+        Files.write(file, rom(variant.equals("withdraw") ? "proven" : variant));
         GhidraProject project = GhidraProject.createProject(dir.getAbsolutePath(), "switch-order-" + variant, true);
         Program p;
         try {
@@ -130,7 +179,8 @@ public class WSSwitchOrderFixtures extends GhidraScript {
             try { analyzeAll(p); } finally { p.endTransaction(tx, true); }
             long seconds = (System.nanoTime() - t0) / 1_000_000_000L;
             check(variant, seconds < 120, "analysis finished in " + seconds + " s");
-            Address site = at(p, variant.equals("guarded") ? SITE_GUARDED : variant.equals("masked") ? SITE_MASKED : SITE_PROVEN);
+            Address site = at(p, guardedVariant(variant) ? SITE_GUARDED : variant.equals("masked") ? SITE_MASKED
+                : SITE_PROVEN);
             Instruction ins = p.getListing().getInstructionAt(site);
             check(variant, ins != null && ins.toString().startsWith("JMP"), "dispatch site decoded: " + ins);
             if (ins == null) return;
@@ -138,9 +188,16 @@ public class WSSwitchOrderFixtures extends GhidraScript {
             check(variant, f != null && f.getEntryPoint().equals(at(p, 0x40)), "dispatcher function at F000:0040: " + f);
             Bookmark hazard = p.getBookmarkManager().getBookmark(site, BookmarkType.WARNING, "WSJumpTableHazard");
             int errors = p.getBookmarkManager().getBookmarkCount(BookmarkType.ERROR);
-            if (variant.equals("unprovable")) {
+            if (variant.equals("withdraw")) { withdraw(p, site); return; }
+            if (variant.equals("unprovable") || variant.equals("npe") || variant.equals("conflict")) {
                 check(variant, hazard != null, "rule C WARNING bookmark at the site: " + (hazard == null ? null : hazard.getComment()));
                 check(variant, hazard == null || hazard.getComment().toLowerCase().contains("f000:0060"), "bookmark names the table");
+                if (variant.equals("conflict"))
+                    check(variant, hazard != null && hazard.getComment().contains("conflict"), "tagged as a target conflict");
+                boolean ruleFailed = false;
+                for (Iterator<Bookmark> it = p.getBookmarkManager().getBookmarksIterator(BookmarkType.ERROR); it.hasNext(); )
+                    ruleFailed |= it.next().getComment().contains("rule C failed");
+                check(variant, !ruleFailed, "rule C did not fail on any site");
                 boolean kept = true;
                 for (int off : new int[] {0x40, 0x42, 0x46, 0x48, 0x4a, 0x4c, 0x50})
                     kept &= p.getListing().getInstructionAt(at(p, off)) != null;
@@ -157,7 +214,7 @@ public class WSSwitchOrderFixtures extends GhidraScript {
             for (int h : ADJACENT) decoded &= p.getListing().getInstructionAt(at(p, h)) != null;
             check(variant, decoded, "all 7 handlers decoded");
             AddressSet code = new AddressSet(at(p, 0x00), at(p, 0x10));
-            code.add(at(p, 0x40), at(p, variant.equals("guarded") ? 0x57 : 0x52));
+            code.add(at(p, 0x40), at(p, guardedVariant(variant) ? 0x57 : 0x52));
             code.add(at(p, 0x6e), at(p, 0x9e));
             List<Address> stray = new ArrayList<>();
             for (Instruction i : p.getListing().getInstructions(true))
@@ -165,7 +222,7 @@ public class WSSwitchOrderFixtures extends GhidraScript {
             check(variant, stray.isEmpty(), "no code decoded from handler bytes read as slots: " + stray);
             check(variant, errors == 0, "no ERROR bookmarks (" + errors + ")");
             boolean stock = has(p, site, "switchD", SourceType.ANALYSIS);
-            if (!variant.equals("guarded"))
+            if (!guardedVariant(variant))
                 check(variant, !stock, "stock switch recovery did not reach the site (no switchD label)");
             else
                 check(variant, stock, "stock switch recovery still recovers the guarded table (switchD label)");
@@ -182,7 +239,8 @@ public class WSSwitchOrderFixtures extends GhidraScript {
     public void run() throws Exception {
         File dir = Files.createTempDirectory("ws-switch-order").toFile();
         String[] args = getScriptArgs();
-        List<String> variants = args.length > 0 ? List.of(args) : List.of("proven", "masked", "unprovable", "guarded");
+        List<String> variants = args.length > 0 ? List.of(args) : List.of("proven", "masked", "copy", "unprovable", "npe", "conflict",
+            "withdraw", "guarded", "guardmask");
         for (String v : variants) {
             try { fixture(dir, v); }
             catch (Exception e) { check(v, false, "fixture raised " + e); }

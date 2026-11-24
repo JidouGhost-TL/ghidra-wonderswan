@@ -296,7 +296,13 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
             tables.apply(monitor);
             tables.restoreClearedSites(monitor);
             tables.finish();
-            tables.tagHazards(line -> ghidra.util.Msg.warn(WSEvidenceAnalyzer.class, line));
+            try { tables.tagHazards(line -> ghidra.util.Msg.warn(WSEvidenceAnalyzer.class, line)); }
+            catch (RuntimeException e) {
+                // reported (log, report line, bookmark); the remaining repair steps still run
+                ghidra.util.Msg.error(WSEvidenceAnalyzer.class, "rule C failed: " + e, e);
+                s.emit("{\"rule\":\"C\",\"outcome\":\"ERROR\",\"error\":\"%s\"}", String.valueOf(e).replace("\"", "'"));
+                program.getBookmarkManager().setBookmark(program.getMinAddress(), BookmarkType.ERROR, "WSEvidence", "rule C failed: " + e);
+            }
             WSDecodeRepair.align(program, ev, line -> s.emit("%s", line), monitor);
             s.classifyArtefacts(tables.keptTargets);
             WSExecutedFunctions functions = new WSExecutedFunctions(program, ev, line -> s.emit("%s", line), monitor);
