@@ -32,6 +32,8 @@ import jidoughost.wonderswan.WonderSwanLoader;
  * withdraw:   the proven cartridge; after analysis one J1u target is overwritten by defined data and phase 2 rerun:
  *             it cannot re-prove the site, so rule J1uw withdraws J1u's references and lock and keeps the code (H2).
  * eqmask:     CMP AL,0FFh; JZ out before an AND mask: excluding one value is no range guard, so J1u applies.
+ * eqjnz:      CMP AL,3; JNZ out before the scaling: the index is constant on the path to the site; J1u leaves it to
+ *             phase-2 J1 (the equality exemption covers only JZ leaving the slice or a compare of another register).
  * guarded:    CMP AL,6; JA out before the scaling: stock switch recovery bounds it itself and keeps it (unchanged).
  * guardmask:  CMP AL,6; JA out before SHL and an AND mask: guarded, left to stock recovery (unchanged).
  *
@@ -79,6 +81,10 @@ public class WSSwitchOrderFixtures extends GhidraScript {
         } else if (variant.equals("copy")) {
             // MOV AL,[BP+4]; XOR AH,AH; SHL AX,1; PUSH BX; MOV BX,AX; MOV AX,CS:[BX+0060h]; POP BX; JMP AX
             put(rom, 0x40, "8a460432e4d1e0538bd82e8b8760005bffe0");
+        } else if (variant.equals("eqjnz")) {
+            // IN AL,0B5h; CMP AL,3; JNZ 0053h; SHL AL,1; MOV BL,AL; MOV BH,0; ADD BX,0060h; JMP CS:[BX]; RET
+            // (AL == 3 on the path to the site: a constant index, so the JNZ is a possible guard)
+            put(rom, 0x40, "e4b53c03750dd0e088c3b70081c360002eff27c3");
         } else if (variant.equals("eqmask")) {
             // IN AL,0B5h; CMP AL,0FFh; JZ 0055h; MOV BL,AL; MOV BH,0; AND BX,00FEh; ADD BX,0060h; JMP CS:[BX]; RET
             put(rom, 0x40, "e4b53cff740f88c3b70081e3fe0081c360002eff27c3");
@@ -143,6 +149,18 @@ public class WSSwitchOrderFixtures extends GhidraScript {
         } finally { d.dispose(); }
     }
 
+    /** Whether J1u applied a table at the site (its per-program state, read reflectively: package-private). */
+    boolean appliedBeforeSwitch(Program p, Address site) throws Exception {
+        Class<?> a = Class.forName("jidoughost.wonderswan.WSSwitchOrderAnalyzer");
+        java.lang.reflect.Method m = a.getDeclaredMethod("beforeSwitch", Program.class);
+        m.setAccessible(true);
+        Object j = m.invoke(null, p);
+        if (j == null) return false;
+        java.lang.reflect.Field f = j.getClass().getDeclaredField("beforeSwitchTargets");
+        f.setAccessible(true);
+        return ((Map<?, ?>) f.get(j)).containsKey(site);
+    }
+
     /** J1uw: overwrite handler 2 with defined data, rerun phase 2: J1u's references and lock go, the code stays. */
     void withdraw(Program p, Address site) throws Exception {
         String v = "withdraw";
@@ -193,6 +211,11 @@ public class WSSwitchOrderFixtures extends GhidraScript {
             Bookmark hazard = p.getBookmarkManager().getBookmark(site, BookmarkType.WARNING, "WSJumpTableHazard");
             int errors = p.getBookmarkManager().getBookmarkCount(BookmarkType.ERROR);
             if (variant.equals("withdraw")) { withdraw(p, site); return; }
+            if (variant.equals("eqjnz")) {
+                check(variant, !appliedBeforeSwitch(p, site), "J1u left the site to phase-2 J1");
+                check(variant, computedTargets(p, site).size() == 7, "phase-2 J1 still recovers the 7-slot table: " + computedTargets(p, site));
+                return;
+            }
             if (variant.equals("unprovable") || variant.equals("npe") || variant.equals("conflict")) {
                 check(variant, hazard != null, "rule C WARNING bookmark at the site: " + (hazard == null ? null : hazard.getComment()));
                 check(variant, hazard == null || hazard.getComment().toLowerCase().contains("f000:0060"), "bookmark names the table");
@@ -243,7 +266,7 @@ public class WSSwitchOrderFixtures extends GhidraScript {
     public void run() throws Exception {
         File dir = Files.createTempDirectory("ws-switch-order").toFile();
         String[] args = getScriptArgs();
-        List<String> variants = args.length > 0 ? List.of(args) : List.of("proven", "masked", "eqmask", "copy", "unprovable", "npe", "conflict",
+        List<String> variants = args.length > 0 ? List.of(args) : List.of("proven", "masked", "eqmask", "eqjnz", "copy", "unprovable", "npe", "conflict",
             "withdraw", "guarded", "guardmask");
         for (String v : variants) {
             try { fixture(dir, v); }

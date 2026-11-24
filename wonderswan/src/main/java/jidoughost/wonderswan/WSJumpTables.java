@@ -436,7 +436,7 @@ public final class WSJumpTables {
      *  the value for the stock recovery (CMP AL,n; JA before MOV BL,AL, or before an AND mask), so such sites stay
      *  with it; a join at the load cannot constrain a value read from memory there. The index is followed back
      *  through register copies (MOV BX,AX; MOV BL,AL) to its load; without a load in the slice, any branch or join
-     *  in the whole slice counts as a possible guard. JZ/JNZ after CMP x,imm (one value excluded) is no guard. */
+     *  in the whole slice counts as a possible guard. An equality exclusion (see {@link #equalityExclusion}) is no guard. */
     boolean unguardedByteIndex(Instruction site, Rec r) {
         if (r == null || !r.byteBound && r.maskOffsets == null) return false;
         String reg = r.idx == null ? null : (r.scaledBy == null ? r.idx : r.scaledBy);
@@ -457,7 +457,7 @@ public final class WSJumpTables {
                 if (src.contains("[")) return true;                              // index byte loaded here
                 if (src.matches("[ABCD][LH]")) { reg = src.charAt(1) == 'L' ? src.charAt(0) + "X" : src; continue; }
             }
-            if (q != site && q.getFlowType().isConditional() && !equalityExclusion(q, qi + 1 < slice.size() ? slice.get(qi + 1) : null))
+            if (q != site && q.getFlowType().isConditional() && !equalityExclusion(q, qi + 1 < slice.size() ? slice.get(qi + 1) : null, reg))
                 return false;
             for (Reference ref : p.getReferenceManager().getReferencesTo(q.getAddress()))
                 if (ref.getReferenceType().isJump() || ref.getReferenceType().isConditional()) return false;
@@ -465,13 +465,25 @@ public final class WSJumpTables {
         return true;
     }
 
-    /** JZ/JNZ on the flags of CMP x,imm excludes one value (e.g. an end marker FFFFh); it bounds no range, so it is
-     *  no guard for switch recovery. Every other conditional branch (ordered compares, TEST masks, ...) may be one. */
-    static boolean equalityExclusion(Instruction branch, Instruction flags) {
+    /** An equality test that bounds no range for switch recovery, so it is no guard: JZ/JE on the flags of
+     *  CMP x,imm, whose taken edge leaves the fall-through slice, excludes one value (e.g. an end marker FFFFh) on the
+     *  path to the site; any JZ/JNZ on CMP reg,imm whose register is not the index's. JNZ/JNE on the index leaves the
+     *  index constant on the path to the site, so it stays a possible guard (phase-2 J1 handles such a site). */
+    static boolean equalityExclusion(Instruction branch, Instruction flags, String index) {
         String m = branch.getMnemonicString().toUpperCase();
-        if (!(m.equals("JZ") || m.equals("JNZ") || m.equals("JE") || m.equals("JNE")) || flags == null) return false;
-        String t = flags.toString().toUpperCase().replace(" ", "");
-        return t.startsWith("CMP") && t.matches("CMP[^,]+,-?0X[0-9A-F]+");
+        boolean jz = m.equals("JZ") || m.equals("JE"), jnz = m.equals("JNZ") || m.equals("JNE");
+        if (!(jz || jnz) || flags == null) return false;
+        java.util.regex.Matcher c = Pattern.compile("CMP([A-Z]{2}),-?0X[0-9A-F]+").matcher(flags.toString().toUpperCase().replace(" ", ""));
+        if (!c.matches()) return false;
+        if (!sameRegisterFamily(c.group(1), index)) return true;       // another register: the index is unconstrained
+        return jz;                                                     // taken edge (equal) leaves the slice
+    }
+
+    /** AL/AH/AX (and B, C, D) are one family; SI, DI, BP only match themselves. */
+    static boolean sameRegisterFamily(String a, String b) {
+        if (a == null || b == null) return true;
+        boolean ga = a.matches("[ABCD][LHX]"), gb = b.matches("[ABCD][LHX]");
+        return ga && gb ? a.charAt(0) == b.charAt(0) : a.equals(b);
     }
 
     /**
