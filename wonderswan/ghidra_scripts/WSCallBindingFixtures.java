@@ -299,6 +299,16 @@ public class WSCallBindingFixtures extends GhidraScript {
             unlocked(fn(p, fx, 0x100), "F10 reset");
             check(fn(p, fx, 0x100).getCallingConventionName().equals("__wsasm"), "F10 reset convention");
         });
+        // F13: g kills DX but keeps the default (its AX result is consumed unproven); f reads g's DX.
+        // Under the family-wide model DX is unknown at g's call, so a lock of f would show an entry DX.
+        fixture("F13", new Fx("f13").fn(0x180, "8b161021", "a11221", "c3").fn(0x1c0, "call:0180", "a31421", "c3")
+                .fn(0x100, "call:0180", STORE_DX, "c3").fn(0x40, "call:0100", "b80000", "a31621", "c3"), null, (p, fx, l) -> {
+            unlocked(fn(p, fx, 0x180), "F13 g");
+            unlocked(fn(p, fx, 0x100), "F13 f");
+            vetoed(l, fn(p, fx, 0x100), "F13", "CALLEE_UNLOCKED_KILLS");
+            String c = cText(p, fx, 0x100);
+            check(!c.contains("unaff_"), "F13 no entry value invented: " + c);
+        });
         // F11 vetoes: RAM body, stack read above the return address, explicit signature.
         Fx ram = new Fx("f11ram").fn(0x100, STORE_BX, "c3").fn(0x40, "bb3412", "call:0100", "c3");
         ram.segment = 0x0000; ram.writable = true;

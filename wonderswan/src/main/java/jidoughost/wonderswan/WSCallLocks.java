@@ -66,6 +66,7 @@ public final class WSCallLocks {
         Address at;
         boolean far;
         final Set<String> inputs = new LinkedHashSet<>(), preserved = new LinkedHashSet<>(), killed = new LinkedHashSet<>();
+        final Set<Function> callees = new LinkedHashSet<>();
         static Summary veto(String reason, Address at) { Summary s = new Summary(); s.veto = reason; s.at = at; return s; }
     }
 
@@ -165,10 +166,17 @@ public final class WSCallLocks {
         return cc != null && !cc.equals("unknown") && !cc.equals("default") && !cc.equals(BASE) && !cc.startsWith(PREFIX);
     }
 
+    /** A planned lock, written once every callee it relies on is settled. */
+    record Plan(Function f, Summary s, ReturnParameterImpl ret, boolean proven, int callers) {}
+
+    /** Units the base register convention already kills at a call. */
+    static final Set<String> BASE_KILLED = Set.of("AL", "AH", "BL", "BH", "CL", "CH");
+
     void apply() throws Exception {
         WSReturns r = new WSReturns(p, emit, monitor);
         List<Function> all = new ArrayList<>();
         for (Function f : p.getFunctionManager().getFunctions(true)) all.add(f);
+        Map<Function, Plan> plans = new LinkedHashMap<>();
         for (Function f : all) {
             monitor.checkCancelled();
             if (f.isExternal() || f.isThunk()) continue;
@@ -200,6 +208,31 @@ public final class WSCallLocks {
                 if (consumer != null) { veto(f, "UNPROVEN_OUTPUT", consumer.getAddress(), owned); continue; }
                 ret = new ReturnParameterImpl(VoidDataType.dataType, VariableStorage.VOID_STORAGE, p);
             }
+            plans.put(f, new Plan(f, s, ret, proven, calls.size()));
+        }
+        // A callee that keeps the default convention is decompiled with the family-wide model, which
+        // leaves DX, SI, DI, BP and ES unknown at the call rather than killed. A caller proof that relies
+        // on such a callee killing them would read them as entry values: lock only when every callee
+        // that kills more than the family-wide set is locked as well.
+        boolean changed;
+        do {
+            changed = false;
+            for (var it = plans.values().iterator(); it.hasNext();) {
+                Plan plan = it.next();
+                for (Function c : plan.s().callees) {
+                    if (plans.containsKey(c)) continue;
+                    Summary cs = summary(c, 0);
+                    if (cs.veto == null && BASE_KILLED.containsAll(cs.killed)) continue;
+                    it.remove();
+                    changed = true;
+                    veto(plan.f(), "CALLEE_UNLOCKED_KILLS", c.getEntryPoint(), owned(plan.f()));
+                    break;
+                }
+            }
+        } while (changed);
+        for (Plan plan : plans.values()) {
+            Function f = plan.f(); Summary s = plan.s(); ReturnParameterImpl ret = plan.ret();
+            Parameter oldReturn = f.getReturn();
             List<Variable> params = new ArrayList<>();
             for (Register reg : r.coalesce(s.inputs))
                 params.add(new ParameterImpl("in_" + reg.getName(), r.type(reg), new VariableStorage(p, reg), p, SourceType.ANALYSIS));
@@ -214,7 +247,7 @@ public final class WSCallLocks {
             f.updateFunction(model, ret, params, Function.FunctionUpdateType.CUSTOM_STORAGE, true, SourceType.ANALYSIS);
             set++;
             emit.accept(String.format("{\"rule\":\"L1\",\"function\":\"%s\",\"outcome\":\"SET\",\"inputs\":\"%s\",\"return\":\"%s\",\"model\":\"%s\",\"preserved\":\"%s\",\"killed\":\"%s\",\"far\":%b,\"callers\":%d,\"r1b_return\":%b}",
-                f.getEntryPoint(), s.inputs, ret.getVariableStorage(), model, s.preserved, s.killed, s.far, calls.size(), proven));
+                f.getEntryPoint(), s.inputs, ret.getVariableStorage(), model, s.preserved, s.killed, s.far, plan.callers(), plan.proven()));
         }
     }
 
@@ -574,6 +607,7 @@ public final class WSCallLocks {
         if (c.veto != null) throw new Veto("CALLEE_" + c.veto, a);
         boolean farCall = i.getMnemonicString().toUpperCase(Locale.ROOT).equals("CALLF");
         if (farCall != c.far) throw new Veto("RETURN_KIND", a);
+        s.callees.add(callee);
         operandReads(i, st, s);
         for (String u : c.inputs) read(st, u, s, a);
         for (String u : c.killed) st.units.put(u, new HashSet<>(Set.of(OTHER)));
