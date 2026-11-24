@@ -225,6 +225,25 @@ public class WSCallTableFixtures extends GhidraScript {
         } finally { done(p); }
     }
 
+    /** CT1e: unused slots aim at the table's end (undecodable fill there); the table ends exactly at that address. */
+    void placeholderEnd(boolean matching) throws Exception {
+        byte[] m = fill(0x1000);
+        put(m, 0x40, "8b1e1000d1e32eff970001c3");               // CALL CS:[BX+0x100] at 4000:0046, unbounded index
+        put(m, 0x100, matching ? "000206014002" : "00020a014002");   // slot 1 -> 0x106 (the table end) or 0x10a (not the end)
+        if (!matching) { put(m, 0x106, "c3"); }                 // control: a function entry ends the table at 0x106
+        for (int t : new int[] { 0x200, 0x240 }) put(m, t, "b80100c3");
+        ProgramDB p = make(matching ? "ct1e-placeholder" : "ct1e-control", m, null);
+        try {
+            code(p, 0x40, true);
+            if (!matching) code(p, 0x106, true);
+            repair(p, new WSEvidence());
+            if (matching) {
+                check(insn(p, at(p, 0x200)) && insn(p, at(p, 0x240)), "CT1e targets around the placeholder decoded");
+                check(!insn(p, at(p, 0x106)), "CT1e placeholder target not decoded");
+            } else check(!insn(p, at(p, 0x240)), "CT1e control: placeholder not aimed at the table end, table not proven");
+        } finally { done(p); }
+    }
+
     /** IT1 program: INT n site at 0x40, two inline words, handler at 0x200 with an F2 IVT[n] bookmark. */
     ProgramDB interrupt(String name, int vector, String handler, String words, boolean csBase, boolean dataRef) throws Exception {
         byte[] m = fill(0x1000);
@@ -325,6 +344,8 @@ public class WSCallTableFixtures extends GhidraScript {
         all.put("CT1c-observed-span", this::observedSpan);
         all.put("CT1c-control-no-observed", this::observedSpanNone);
         all.put("CT1d-ffff-slot", this::segmentEndSlot);
+        all.put("CT1e-placeholder-end", () -> placeholderEnd(true));
+        all.put("CT1e-control-not-end", () -> placeholderEnd(false));
         all.put("IT1a-general-handler", this::interruptGeneral);
         all.put("IT1b-data-reference-end", this::interruptDataRefEnd);
         all.put("IT1b-control-no-end", this::interruptNoEnd);

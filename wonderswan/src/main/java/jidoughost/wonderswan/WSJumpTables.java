@@ -128,6 +128,11 @@ import ghidra.util.task.TaskMonitor;
  *   before the weak stop, slots 0..span are kept (decoded like any recovered table); slots after the span up to the
  *   weak stop are H2 hypotheses (tagged WSHypothesis:CT1c on the slot, not decoded). No observed target: unresolved
  *   as before.
+ * CT1e: a slot whose target does not decode but points forward, on a slot boundary, inside the scanned table region
+ *   is a placeholder (unused entries aimed at the table's end). The scan goes on; the placeholders are accepted only
+ *   when the table then ends exactly at their common target by the J1j OWN_TARGET stop. They are not decoded (kept like
+ *   empty slots, one CT1e line each). Otherwise the table is rescanned as plain J1 (the first placeholder is the weak
+ *   UNDECODABLE stop again).
  * CT1d (J1o extended to the segment end): a near slot 0xFFFF (last byte of the code segment, where the IP wraps) and a
  *   far slot FFFF:FFFF (past 1 MiB) are skipped like empty slots: no routine entry can live there.
  */
@@ -143,7 +148,10 @@ public final class WSJumpTables {
         List<Integer> emptySlots = new ArrayList<>();
         int base, disp, table, cap = 64;
         int width = 2;                          // CT1a: 4 for far (offset, segment) slots
-        String ct1;                             // CT1a/b/c provenance (null: plain J1)
+        String ct1;                             // CT1a/b/c/e provenance (null: plain J1)
+        boolean allowPlaceholders;              // CT1e
+        List<Integer> placeholderSlots = new ArrayList<>();
+        Set<Address> placeholderTargets = new HashSet<>();
         TreeSet<Integer> maskOffsets;
         Set<Address> baseAdds = new HashSet<>();  // J1i: ADD idx,reg2 instructions that added a constant base
         String baseVia = "direct", j1iMiss;       // J1i provenance / why a candidate base register was not constant
@@ -1659,13 +1667,23 @@ public final class WSJumpTables {
         }
         if (r.bound.equals("none")) byteBound(back, ix, r);
         boolean bounded = !r.bound.equals("none");
-        for (int i = 0; i < r.cap; i++) {
-            Address ea;
-            try { ea = seg(cs, (r.table + r.width * i) & 0xFFFF); } catch (Exception e) { r.stop = "OUT_OF_ROM"; break; }
-            String why = scanSlot(cs, ea, r);
-            if (why == null) continue;
-            r.stop = why;
-            break;
+        r.allowPlaceholders = true;
+        scanTable(cs, r);
+        if (!r.placeholderTargets.isEmpty()) {
+            // CT1e: placeholders are valid only when the table ends exactly at their (common) target
+            Address end = r.stop.equals("OWN_TARGET") ? seg(cs, (r.table + r.width * r.slots) & 0xFFFF) : null;
+            boolean ok = end != null;
+            for (Address t : r.placeholderTargets) if (!t.equals(end)) ok = false;
+            if (ok) {
+                r.ct1 = (r.ct1 == null ? "" : r.ct1 + "+") + "CT1e " + r.placeholderSlots.size() + " placeholder slots -> table end " + end;
+                for (int k : r.placeholderSlots)
+                    emit.accept(String.format("{\"rule\":\"CT1e\",\"site\":\"%s\",\"slot\":%d,\"target\":\"%s\",\"outcome\":\"PLACEHOLDER_NOT_DECODED\"}", r.site, k, end));
+            } else {
+                // not proven: rescan as plain J1 (the first placeholder is the weak UNDECODABLE stop again)
+                r.slots = 0; r.empty = 0; r.emptySlots.clear(); r.slotOf.clear(); r.targets.clear(); r.stop = "BOUND";
+                r.placeholderSlots.clear(); r.placeholderTargets.clear(); r.allowPlaceholders = false;
+                scanTable(cs, r);
+            }
         }
         boolean strong = r.stop.equals("EXECUTED_CODE") || r.stop.equals("TABLE_BOUNDARY") || r.stop.equals("FUNCTION_ENTRY") || r.stop.equals("DIRECT_CALL_ENTRY")
             || r.stop.equals("TABLE_BASE") || r.stop.equals("OWN_TARGET") || r.stop.equals("PUSH_RETURN_ENTRY");
@@ -1727,6 +1745,18 @@ public final class WSJumpTables {
         spanHypotheses.put(r.site, rest);
     }
 
+    /** The ascending slot scan of a recovered site (stops on the first stop reason). */
+    void scanTable(int cs, Rec r) {
+        for (int i = 0; i < r.cap; i++) {
+            Address ea;
+            try { ea = seg(cs, (r.table + r.width * i) & 0xFFFF); } catch (Exception e) { r.stop = "OUT_OF_ROM"; break; }
+            String why = scanSlot(cs, ea, r);
+            if (why == null) continue;
+            r.stop = why;
+            break;
+        }
+    }
+
     List<Address> trimToSlots(Rec r, int lim) {
         List<Address> keep = new ArrayList<>();
         for (int k = 0; k < r.slotOf.size(); k++) if (r.slotOf.get(k) < lim) keep.add(r.targets.get(k));
@@ -1766,6 +1796,19 @@ public final class WSJumpTables {
             return null;
         }
         why = implausible(t, ea);
+        // CT1e: an undecodable target that points forward into the scanned table region, on a slot boundary, is a
+        // placeholder candidate (unused entries aimed at the table's end); kept only if the table ends exactly there
+        if ("UNDECODABLE".equals(why) && r.allowPlaceholders && t != null && t.getAddressSpace().equals(ea.getAddressSpace())
+                && tableStart != null && t.getAddressSpace().equals(tableStart.getAddressSpace())) {
+            long d = t.subtract(tableStart);
+            if (t.compareTo(ea) > 0 && d % r.width == 0 && d / r.width < r.cap) {
+                r.placeholderSlots.add(r.slots - 1);
+                r.placeholderTargets.add(t);
+                r.empty++;
+                r.emptySlots.add(r.slots - 1);
+                return null;
+            }
+        }
         if (why != null) { r.slots--; return why; }
         r.slotOf.add(r.slots - 1);
         r.targets.add(t);
@@ -1876,7 +1919,7 @@ public final class WSJumpTables {
         // or direct call. Its bytes still cannot be read as further table slots.
         for (Address b : bytes) if (directCallEntry(b)) return "DIRECT_CALL_ENTRY";
         if (!ea.equals(tableStart) && tableBases.contains(ea)) return "TABLE_BASE";
-        for (Address b : bytes) if (r.targets.contains(b)) return "OWN_TARGET";   // J1j
+        for (Address b : bytes) if (r.targets.contains(b) || r.placeholderTargets.contains(b)) return "OWN_TARGET";   // J1j, CT1e
         return null;
     }
 
