@@ -85,6 +85,8 @@ import ghidra.util.task.TaskMonitor;
  *   Anything else (no kept fall-through anchor, no clean rejoin, wrong shape) stays unresolved.
  * J1s: an offcut or protected target keeps the entire site unresolved; no reduced target set is
  *   published. Later analysis can retry the complete table if independent evidence resolves the conflict.
+ * J1z: the exception is a CALL table (no switch override, every slot its own call entry): a conflicted slot stays
+ *   unresolved with its preserved interpretation and conflict bookmark, and the other proven slots are published.
  * J1t (post-analysis script WSJumpTableFinish, after the J1m lock): a function at a recovered JMP site's kept
  *   target whose body contains another kept target of the same site is an over-glued case block (stock analysis
  *   joined sibling cases into one body, which then decompiles with the parent switch's mis-recovered cases):
@@ -749,6 +751,10 @@ public final class WSJumpTables {
             missing.add(String.format("%05x", o));
             r.targets.add(seg(cs, (int) ((o - ((long) cs << 4)) & 0xFFFF)));
         }
+        // J1z: a CALL table publishes no switch override; each slot is its own call entry. A conflicted slot
+        // stays unresolved (its preserved interpretation untouched) without withholding the other proven slots.
+        boolean callTable = ins.getMnemonicString().equalsIgnoreCase("CALL");
+        List<Address> unresolvedTargets = new ArrayList<>();
         for (Address t : r.targets) {
             Instruction conflict = listing.getInstructionContaining(t);
             Data data = listing.getDefinedDataContaining(t);
@@ -756,11 +762,14 @@ public final class WSJumpTables {
                     || (data != null && !canDeshadow(t))) {
                 if (conflict != null) offcut++;
                 reportTargetConflict(ins, t);
-                return false;
+                if (!callTable) return false;
+                unresolvedTargets.add(t);
             }
         }
+        r.targets.removeAll(unresolvedTargets);
+        if (r.targets.isEmpty()) return false;
         boolean pushedCall = r.returnEnd != null && r.stop.equals("PUSH_RETURN_ENTRY");
-        boolean isCall = ins.getMnemonicString().equalsIgnoreCase("CALL") || pushedCall;
+        boolean isCall = callTable || pushedCall;
         if (pushedCall) {
             ins.setFlowOverride(FlowOverride.CALL);
             p.getBookmarkManager().setBookmark(ins.getAddress(), BookmarkType.ANALYSIS, "WSDecompilerBoundary",
@@ -777,7 +786,9 @@ public final class WSJumpTables {
                 if (listing.getInstructionContaining(t) != null) {
                     offcut++;
                     reportTargetConflict(ins, t);
-                    return false;
+                    if (!callTable) return false;
+                    unresolvedTargets.add(t);
+                    continue;
                 }
                 // single-byte data shadowing a proven target (a data pointer read the slot first):
                 // cleared (user data and multi-byte data stay, keeping today's behavior there)
@@ -788,7 +799,9 @@ public final class WSJumpTables {
                 new DisassembleCommand(t, null, true).applyTo(p, monitor);
                 if (listing.getInstructionAt(t) == null) {
                     reportTargetConflict(ins, t);
-                    return false;
+                    if (!callTable) return false;
+                    unresolvedTargets.add(t);
+                    continue;
                 }
                 newCode++;
             }
@@ -796,12 +809,20 @@ public final class WSJumpTables {
             if (isCall && p.getFunctionManager().getFunctionAt(t) == null && listing.getInstructionAt(t) != null)
                 new CreateFunctionCmd(t).applyTo(p, monitor);
         }
+        if (kept.isEmpty()) return false;
+        if (!unresolvedTargets.isEmpty()) {
+            List<String> open = new ArrayList<>();
+            for (Address t : unresolvedTargets) open.add("\"" + t + "\"");
+            emit.accept(String.format("{\"rule\":\"J1z\",\"site\":\"%s\",\"outcome\":\"PARTIAL_CALL_TABLE\",\"published\":%d,\"unresolved\":[%s]}",
+                ins.getAddress(), kept.size(), String.join(",", open)));
+        }
         for (Address t : kept) ins.addMnemonicReference(t, isCall ? RefType.COMPUTED_CALL : RefType.COMPUTED_JUMP, SourceType.ANALYSIS);
         r.targets = kept;
         keptTargets.addAll(kept);
         // J1g: computed-flow references another analysis guessed for this site (Ghidra's switch recovery reads
         // past the table end, e.g. into the next table) are superseded by the proven table; user references stay.
         Set<Address> keep = new HashSet<>(kept);
+        keep.addAll(unresolvedTargets);   // J1z: a proven slot left unresolved is not a superseded guess
         int superseded = 0;
         List<Address> gone = new ArrayList<>();
         for (Reference ref : p.getReferenceManager().getReferencesFrom(ins.getAddress())) {
