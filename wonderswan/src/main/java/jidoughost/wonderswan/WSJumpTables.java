@@ -96,7 +96,7 @@ import ghidra.util.task.TaskMonitor;
  *   decompiler without limit. Stock analysis skips a computed jump that already has computed references,
  *   and a stored lock (when a function contains the site) keeps every later decompile on the proven table. Same
  *   recovery and stop rules; a site J1 cannot prove yet is left for the later passes.
- * J1w (end of phase 2): a J1u site phase 2 cannot re-prove loses the references and lock J1u wrote (code kept, H2).
+ * J1uw (end of phase 2): a J1u site phase 2 cannot re-prove loses the references and lock J1u wrote (code kept, H2).
  * Rule C (end of phase 2): an unguarded byte-index JMP site still unresolved for lack of a proven end, or because its
  *   proven targets conflict with existing code or data (J1s), gets a
  *   WARNING bookmark (WSJumpTableHazard), a log entry and a report line. Its code is preserved and no table
@@ -546,13 +546,13 @@ public final class WSJumpTables {
     int withdrawn;
 
     /**
-     * Rule J1w (end of phase 2, this instance = the phase-2 J1): a site J1u applied before stock switch analysis that
+     * Rule J1uw (end of phase 2, this instance = the phase-2 J1): a site J1u applied before stock switch analysis that
      * phase 2 cannot re-prove from the final listing loses what J1u wrote: its analysis-sourced computed references to
      * the J1u targets (observed targets stay) and its jump-table lock. The code decoded from those targets is kept and
      * tagged (H2, reason J1U_WITHDRAWN); the site is left to the later rules like any unresolved site.
      */
     String withdrawUnproven(WSJumpTables early, java.util.function.Consumer<String> log) throws Exception {
-        if (early == null) return "J1w J1u sites withdrawn 0";
+        if (early == null) return "J1uw J1u sites withdrawn 0";
         for (Map.Entry<Address, List<Address>> e : early.beforeSwitchTargets.entrySet()) {
             Address site = e.getKey();
             if (recoveredSites.contains(site)) continue;
@@ -582,13 +582,13 @@ public final class WSJumpTables {
             }
             for (Address t : gone) preserveHypothesis(site, t, "J1U_WITHDRAWN");
             withdrawn++;
-            String line = String.format("{\"rule\":\"J1w\",\"site\":\"%s\",\"insn\":\"%s\",\"outcome\":\"J1U_WITHDRAWN\",\"refs_deleted\":%d,\"locks_removed\":%d,\"j1u_targets\":%d}",
+            String line = String.format("{\"rule\":\"J1uw\",\"site\":\"%s\",\"insn\":\"%s\",\"outcome\":\"J1U_WITHDRAWN\",\"refs_deleted\":%d,\"locks_removed\":%d,\"j1u_targets\":%d}",
                 site, ins, gone.size(), locks, j1u.size());
             emit.accept(line);
-            log.accept(site + ": J1w: phase 2 could not re-prove the table J1u applied before switch analysis; "
+            log.accept(site + ": J1uw: phase 2 could not re-prove the table J1u applied before switch analysis; "
                 + gone.size() + " references and " + locks + " lock withdrawn, decoded code kept as hypotheses");
         }
-        return "J1w J1u sites withdrawn " + withdrawn;
+        return "J1uw J1u sites withdrawn " + withdrawn;
     }
 
     /**

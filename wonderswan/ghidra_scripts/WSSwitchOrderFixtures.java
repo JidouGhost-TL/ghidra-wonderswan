@@ -30,7 +30,7 @@ import jidoughost.wonderswan.WonderSwanLoader;
  * conflict:   7 slots followed by the first handler, but one slot points inside the dispatcher (offcut): J1 leaves the
  *             site unresolved (J1s) and rule C tags it as a target conflict; nothing is invented.
  * withdraw:   the proven cartridge; after analysis one J1u target is overwritten by defined data and phase 2 rerun:
- *             it cannot re-prove the site, so rule J1w withdraws J1u's references and lock and keeps the code (H2).
+ *             it cannot re-prove the site, so rule J1uw withdraws J1u's references and lock and keeps the code (H2).
  * eqmask:     CMP AL,0FFh; JZ out before an AND mask: excluding one value is no range guard, so J1u applies.
  * guarded:    CMP AL,6; JA out before the scaling: stock switch recovery bounds it itself and keeps it (unchanged).
  * guardmask:  CMP AL,6; JA out before SHL and an AND mask: guarded, left to stock recovery (unchanged).
@@ -143,7 +143,7 @@ public class WSSwitchOrderFixtures extends GhidraScript {
         } finally { d.dispose(); }
     }
 
-    /** J1w: overwrite handler 2 with defined data, rerun phase 2: J1u's references and lock go, the code stays. */
+    /** J1uw: overwrite handler 2 with defined data, rerun phase 2: J1u's references and lock go, the code stays. */
     void withdraw(Program p, Address site) throws Exception {
         String v = "withdraw";
         check(v, computedTargets(p, site).size() == 7 && has(p, site, "switch", SourceType.USER_DEFINED),

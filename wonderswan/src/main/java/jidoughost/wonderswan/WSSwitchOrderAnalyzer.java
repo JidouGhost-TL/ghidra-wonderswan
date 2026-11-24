@@ -38,7 +38,7 @@ public class WSSwitchOrderAnalyzer extends AbstractAnalyzer {
     /** One J1 state per program and evidence run (J1f operand cache, sites already applied). */
     private static final Map<Program, WSJumpTables> STATE = Collections.synchronizedMap(new WeakHashMap<>());
 
-    /** The J1u state of a program in this session (null when J1u did not run), for rule J1w in phase 2. */
+    /** The J1u state of a program in this session (null when J1u did not run), for rule J1uw in phase 2. */
     static WSJumpTables beforeSwitch(Program program) { return STATE.get(program); }
 
     public WSSwitchOrderAnalyzer() {
