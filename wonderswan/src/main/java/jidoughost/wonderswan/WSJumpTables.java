@@ -133,6 +133,8 @@ import ghidra.util.task.TaskMonitor;
  *   when the table then ends exactly at their common target by the J1j OWN_TARGET stop. They are not decoded (kept like
  *   empty slots, one CT1e line each). Otherwise the table is rescanned as plain J1 (the first placeholder is the weak
  *   UNDECODABLE stop again).
+ * CT1g: a far table whose index scale (SHL/ADD idx,idx along the slice) exceeds the 4-byte slot reads records:
+ *   slots are one record stride apart (e.g. 8-byte records of two far pointers, read by two sites with +0 and +4).
  * CT1d (J1o extended to the segment end): a near slot 0xFFFF (last byte of the code segment, where the IP wraps) and a
  *   far slot FFFF:FFFF (past 1 MiB) are skipped like empty slots: no routine entry can live there.
  */
@@ -148,6 +150,7 @@ public final class WSJumpTables {
         List<Integer> emptySlots = new ArrayList<>();
         int base, disp, table, cap = 64;
         int width = 2;                          // CT1a: 4 for far (offset, segment) slots
+        int stride = 2;                         // CT1g: bytes between slots (> width for records of several pointers)
         String ct1;                             // CT1a/b/c/e provenance (null: plain J1)
         boolean allowPlaceholders;              // CT1e
         List<Integer> placeholderSlots = new ArrayList<>();
@@ -390,8 +393,8 @@ public final class WSJumpTables {
             if (tb.equals(tableStart)) continue;
             long off;
             try { off = tb.subtract(tableStart); } catch (Exception e) { continue; }
-            if (off <= 0 || off >= (long) r.width * r.slots || off % r.width != 0) continue;
-            int lim = (int) (off / r.width);
+            if (off <= 0 || off >= (long) r.stride * r.slots || off % r.stride != 0) continue;
+            int lim = (int) (off / r.stride);
             r.slots = lim;
             r.targets = trimToSlots(r, lim);
             r.empty = (int) r.emptySlots.stream().filter(k -> k < lim).count();
@@ -449,9 +452,11 @@ public final class WSJumpTables {
             if (ra.tableAddress == null || rb.tableAddress == null ||
                     !ra.tableAddress.getAddressSpace().equals(rb.tableAddress.getAddressSpace())) continue;
             long distance = rb.tableAddress.subtract(ra.tableAddress);
-            if (distance > 0 && distance < (long) ra.width * ra.slots) {
+            // CT1g: a table base inside one of ra's records (another field of the same records) is no boundary
+            if (ra.stride > ra.width && distance % ra.stride >= ra.width) continue;
+            if (distance > 0 && distance < (long) ra.stride * ra.slots) {
                 // keep only targets read from slots before the next table
-                int lim = (int) (distance / ra.width);
+                int lim = (int) (distance / ra.stride);
                 ra.slots = lim;
                 ra.targets = trimToSlots(ra, lim);
                 ra.empty = (int) ra.emptySlots.stream().filter(k -> k < lim).count();
@@ -891,7 +896,7 @@ public final class WSJumpTables {
         }
         int dataSlots = 0;
         if (r.maskOffsets == null) {
-            if (r.slots > 0 && WSInlineTables.words(p, seg(cs, r.table), r.slots * r.width / 2, ins.getAddress(), emit)) dataSlots = r.slots;
+            if (r.slots > 0 && WSInlineTables.words(p, seg(cs, r.table), ((r.slots - 1) * r.stride + r.width) / 2, ins.getAddress(), emit)) dataSlots = r.slots;
         } else {
             int scanned = 0;
             for (int offset : r.maskOffsets) {
@@ -1575,7 +1580,7 @@ public final class WSJumpTables {
         int cs = csOf(site.getAddress());
         List<Instruction> back = predecessors(site, 16);
         boolean far = site.getMnemonicString().equalsIgnoreCase("CALLF");
-        if (far) r.width = 4;
+        if (far) { r.width = 4; r.stride = 4; }
         Matcher mm = (far ? FARMEM : MEM).matcher(site.toString());
         if (far && !csPrefixed(site)) { r.shape = "FAR_NOT_CS"; return r; }
         if (mm.find()) { r.shape = far ? "FAR_MEM" : "MEM"; r.idx = mm.group(1).toUpperCase(); r.disp = disp(mm); if (far) r.ct1 = "CT1a"; }
@@ -1640,6 +1645,15 @@ public final class WSJumpTables {
         String ix = r.scaledBy == null ? r.idx : r.scaledBy;
         if (!r.baseAdds.isEmpty()) back = withoutBaseAdds(back, r);
         r.maskOffsets = maskValues(back, ix, r);
+        if (r.width == 4) {
+            // CT1g: the index scale is the record stride; a scale above the slot width means records of several
+            // far pointers, of which this site reads one field (its offset is already in the base)
+            int sh = scaleShift(back, ix);
+            if (sh <= 8 && (1 << sh) > r.width) {
+                r.stride = 1 << sh;
+                r.ct1 = (r.ct1 == null ? "" : r.ct1 + "+") + "CT1g stride " + r.stride;
+            }
+        }
         r.table = (r.base + r.disp) & 0xFFFF;
         tableStart = seg(cs, r.table);
         r.tableAddress = tableStart;
@@ -1671,7 +1685,7 @@ public final class WSJumpTables {
         scanTable(cs, r);
         if (!r.placeholderTargets.isEmpty()) {
             // CT1e: placeholders are valid only when the table ends exactly at their (common) target
-            Address end = r.stop.equals("OWN_TARGET") ? seg(cs, (r.table + r.width * r.slots) & 0xFFFF) : null;
+            Address end = r.stop.equals("OWN_TARGET") ? seg(cs, (r.table + r.stride * r.slots) & 0xFFFF) : null;
             boolean ok = end != null;
             for (Address t : r.placeholderTargets) if (!t.equals(end)) ok = false;
             if (ok) {
@@ -1731,7 +1745,7 @@ public final class WSJumpTables {
         int cs = csOf(r.site);
         for (int k = 0; k < r.targets.size(); k++) {
             if (r.slotOf.get(k) <= span) { keep.add(r.targets.get(k)); keepSlots.add(r.slotOf.get(k)); }
-            else rest.add(new Address[] { seg(cs, (r.table + r.width * r.slotOf.get(k)) & 0xFFFF), r.targets.get(k) });
+            else rest.add(new Address[] { seg(cs, (r.table + r.stride * r.slotOf.get(k)) & 0xFFFF), r.targets.get(k) });
         }
         int lim = span + 1;
         r.ct1 = (r.ct1 == null ? "" : r.ct1 + "+") + "CT1c span " + lim + " of " + r.slots + " scanned slots ("
@@ -1749,7 +1763,7 @@ public final class WSJumpTables {
     void scanTable(int cs, Rec r) {
         for (int i = 0; i < r.cap; i++) {
             Address ea;
-            try { ea = seg(cs, (r.table + r.width * i) & 0xFFFF); } catch (Exception e) { r.stop = "OUT_OF_ROM"; break; }
+            try { ea = seg(cs, (r.table + r.stride * i) & 0xFFFF); } catch (Exception e) { r.stop = "OUT_OF_ROM"; break; }
             String why = scanSlot(cs, ea, r);
             if (why == null) continue;
             r.stop = why;
@@ -1801,7 +1815,7 @@ public final class WSJumpTables {
         if ("UNDECODABLE".equals(why) && r.allowPlaceholders && t != null && t.getAddressSpace().equals(ea.getAddressSpace())
                 && tableStart != null && t.getAddressSpace().equals(tableStart.getAddressSpace())) {
             long d = t.subtract(tableStart);
-            if (t.compareTo(ea) > 0 && d % r.width == 0 && d / r.width < r.cap) {
+            if (t.compareTo(ea) > 0 && d % r.stride == 0 && d / r.stride < r.cap) {
                 r.placeholderSlots.add(r.slots - 1);
                 r.placeholderTargets.add(t);
                 r.empty++;
@@ -1823,6 +1837,21 @@ public final class WSJumpTables {
         r.emptySlots.add(r.slots - 1);
         emit.accept(String.format("{\"rule\":\"CT1d\",\"site\":\"%s\",\"slot\":%d,\"value\":\"%s\",\"outcome\":\"SKIPPED\"}",
             r.site, r.slots - 1, value));
+    }
+
+    /** CT1g: total left shift applied to the index along the slice (SHL idx,n / ADD idx,idx) back to its last other
+     *  write; constant additions (the base) are skipped. */
+    static int scaleShift(List<Instruction> back, String reg) {
+        int shift = 0;
+        for (Instruction q : back) {
+            String t = q.toString().toUpperCase().replace(" ", "");
+            Matcher m = Pattern.compile("SHL" + reg + ",(0X[0-9A-F]+|1)").matcher(t);
+            if (m.matches()) { shift += m.group(1).equals("1") ? 1 : Integer.parseInt(m.group(1).substring(2), 16); continue; }
+            if (t.equals("ADD" + reg + "," + reg)) { shift++; continue; }
+            if (t.startsWith("ADD" + reg + ",0X")) continue;
+            if (writes(t, reg)) break;
+        }
+        return shift;
     }
 
     /** J1c: index register loaded from a byte (zero- or sign-extended) before scaling. */
@@ -1852,7 +1881,7 @@ public final class WSJumpTables {
         }
         if (!(hiClear && loByte)) { if (r.bound.startsWith("via ")) r.bound = "none"; return; }
         int bytes = (cbw ? 128 : 256) << shift;           // CBW: only the 0..127 half lies at or after the base
-        r.cap = Math.max(1, bytes / r.width);
+        r.cap = Math.max(1, bytes / r.stride);
         r.byteBound = true;
         String via = r.bound.startsWith("via ") ? " (" + r.bound + ")" : "";
         r.bound = (cbw ? "byte index (CBW, forward half)" : "byte index") + " << " + shift + " -> " + r.cap + " entries" + via;

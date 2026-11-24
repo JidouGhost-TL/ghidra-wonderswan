@@ -244,6 +244,53 @@ public class WSCallTableFixtures extends GhidraScript {
         } finally { done(p); }
     }
 
+    /** CT1g: 8-byte records of two far pointers; site A reads field +0, site B (ADD BX,4) field +4. */
+    void recordStride() throws Exception {
+        byte[] m = fill(0x1000);
+        put(m, 0x40, "32ff8a1e1000c1e3032eff9f0001c3");         // site A at 4000:0049
+        put(m, 0x60, "32ff8a1e1000c1e30383c3042eff9f0001c3");   // site B at 4000:006c
+        put(m, 0x100, "000200400003004020020040200300404002004040030040");
+        put(m, 0x118, "c3"); put(m, 0x11c, "c3");
+        for (int t : new int[] { 0x200, 0x220, 0x240 }) put(m, t, "b80100cb");
+        for (int t : new int[] { 0x300, 0x320, 0x340 }) put(m, t, "b80200cb");
+        ProgramDB p = make("ct1g-stride", m, null);
+        try {
+            code(p, 0x40, true); code(p, 0x60, true); code(p, 0x118, true); code(p, 0x11c, true);
+            repair(p, new WSEvidence());
+            boolean aOk = true, bOk = true, mixed = false;
+            for (int t : new int[] { 0x200, 0x220, 0x240 }) { aOk &= ref(p, 0x49, at(p, t)); mixed |= ref(p, 0x6c, at(p, t)); }
+            for (int t : new int[] { 0x300, 0x320, 0x340 }) { bOk &= ref(p, 0x6c, at(p, t)); mixed |= ref(p, 0x49, at(p, t)); }
+            check(aOk && bOk, "CT1g each site recovers its own field");
+            check(!mixed, "CT1g no site holds the other field's targets");
+        } finally { done(p); }
+    }
+
+    @SuppressWarnings("unchecked")
+    void evidence(Program p, WSEvidence ev) throws Exception {
+        var f = WSEvidenceAnalyzer.class.getDeclaredField("EVIDENCE");
+        f.setAccessible(true);
+        ((Map<Program, WSEvidence>) f.get(null)).put(p, ev);
+    }
+
+    /** F2v: a far pair stored at a low DS offset under a defaulted DS is no interrupt vector; under DS proven 0000
+     *  by the chain, into a vector the program uses (INT 0x40), it is. Runs the full repair analyzer (F1-F4). */
+    void vectorProof(boolean proven) throws Exception {
+        byte[] m = fill(0x1000);
+        if (proven) put(m, 0x40, "33c08ed8c70600012003c70602010040c3");   // XOR AX,AX; MOV DS,AX; [0x100]=4000:0320
+        else put(m, 0x40, "c70644010003c70646010040c3");                  // [0x144]=4000:0300 with DS from the context
+        put(m, 0x80, "cd40c3");
+        put(m, proven ? 0x320 : 0x300, "b80100cf");
+        ProgramDB p = make(proven ? "f2v-proven" : "f2v-default-ds", m, null);
+        try {
+            p.getProgramContext().setValue(p.getRegister("DS"), at(p, 0), at(p, 0xfff), BigInteger.ZERO);
+            code(p, 0x40, true); code(p, 0x80, true);
+            evidence(p, new WSEvidence());
+            new WSEvidenceRepairAnalyzer().added(p, p.getMemory(), monitor, new ghidra.app.util.importer.MessageLog());
+            if (proven) check(insn(p, at(p, 0x320)), "F2v vector stored under DS proven 0000 (used vector 0x40) seeds its handler");
+            else check(!insn(p, at(p, 0x300)), "F2v pair at DS:0144 under a defaulted DS is not an interrupt handler");
+        } finally { done(p); }
+    }
+
     /** IT1 program: INT n site at 0x40, two inline words, handler at 0x200 with an F2 IVT[n] bookmark. */
     ProgramDB interrupt(String name, int vector, String handler, String words, boolean csBase, boolean dataRef) throws Exception {
         byte[] m = fill(0x1000);
@@ -346,6 +393,9 @@ public class WSCallTableFixtures extends GhidraScript {
         all.put("CT1d-ffff-slot", this::segmentEndSlot);
         all.put("CT1e-placeholder-end", () -> placeholderEnd(true));
         all.put("CT1e-control-not-end", () -> placeholderEnd(false));
+        all.put("CT1g-record-stride", this::recordStride);
+        all.put("F2v-default-ds-not-vector", () -> vectorProof(false));
+        all.put("F2v-control-proven-vector", () -> vectorProof(true));
         all.put("IT1a-general-handler", this::interruptGeneral);
         all.put("IT1b-data-reference-end", this::interruptDataRefEnd);
         all.put("IT1b-control-no-end", this::interruptNoEnd);
