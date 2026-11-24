@@ -310,6 +310,25 @@ public class WSCallTableFixtures extends GhidraScript {
         } finally { done(p); }
     }
 
+    /** CT1f: an unbounded 70-slot table (all slots plausible) that ends at a function entry, or (control) at fill. */
+    void longTable(boolean strongEnd) throws Exception {
+        byte[] m = fill(0x1000);
+        put(m, 0x40, "8b1e1000d1e32eff970001c3");               // CALL CS:[BX+0x100] at 4000:0046, unbounded index
+        StringBuilder t = new StringBuilder();
+        for (int k = 0; k < 70; k++) { int a = 0x300 + 4 * k; t.append(String.format("%02x%02x", a & 0xff, a >> 8)); put(m, a, "b80100c3".substring(0, 2) + "00c3"); }
+        put(m, 0x100, t.toString());
+        if (strongEnd) put(m, 0x100 + 140, "c3");
+        ProgramDB p = make(strongEnd ? "ct1f-long" : "ct1f-control", m, null);
+        try {
+            code(p, 0x40, true);
+            if (strongEnd) code(p, 0x100 + 140, true);
+            repair(p, new WSEvidence());
+            if (strongEnd) check(insn(p, at(p, 0x300)) && insn(p, at(p, 0x300 + 4 * 69)) && ref(p, 0x46, at(p, 0x300 + 4 * 69)),
+                "CT1f 70-slot table ended by a function entry fully recovered");
+            else check(!insn(p, at(p, 0x300 + 4 * 69)), "CT1f control: no strong end, table not proven");
+        } finally { done(p); }
+    }
+
     /** IT1 program: INT n site at 0x40, two inline words, handler at 0x200 with an F2 IVT[n] bookmark. */
     ProgramDB interrupt(String name, int vector, String handler, String words, boolean csBase, boolean dataRef) throws Exception {
         byte[] m = fill(0x1000);
@@ -412,6 +431,8 @@ public class WSCallTableFixtures extends GhidraScript {
         all.put("CT1d-ffff-slot", this::segmentEndSlot);
         all.put("CT1e-placeholder-end", () -> placeholderEnd(true));
         all.put("CT1e-control-not-end", () -> placeholderEnd(false));
+        all.put("CT1f-long-table", () -> longTable(true));
+        all.put("CT1f-control-no-strong-end", () -> longTable(false));
         all.put("CT1g-record-stride", this::recordStride);
         all.put("F2v-default-ds-not-vector", () -> vectorProof(false));
         all.put("F2v-control-proven-vector", () -> vectorProof(true));

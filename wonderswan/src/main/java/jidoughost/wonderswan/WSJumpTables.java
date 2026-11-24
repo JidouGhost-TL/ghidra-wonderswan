@@ -135,6 +135,8 @@ import ghidra.util.task.TaskMonitor;
  *   UNDECODABLE stop again).
  * CT1g: a far table whose index scale (SHL/ADD idx,idx along the slice) exceeds the 4-byte slot reads records:
  *   slots are one record stride apart (e.g. 8-byte records of two far pointers, read by two sites with +0 and +4).
+ * CT1f: an unbounded index (J1b) whose first 64 slots are all plausible scans on, up to 256 slots; the longer
+ *   table is kept only when it ends on a strong stop (the J1b proof); otherwise the 64-slot result stands as before.
  * CT1d (J1o extended to the segment end): a near slot 0xFFFF (last byte of the code segment, where the IP wraps) and a
  *   far slot FFFF:FFFF (past 1 MiB) are skipped like empty slots: no routine entry can live there.
  */
@@ -1683,6 +1685,13 @@ public final class WSJumpTables {
         boolean bounded = !r.bound.equals("none");
         r.allowPlaceholders = true;
         scanTable(cs, r);
+        if (!bounded && r.stop.equals("BOUND") && r.cap == 64) {
+            // CT1f: all 64 slots of an unbounded index were plausible; scan on (up to 256) and keep the longer table
+            // only if it then ends on a strong stop, as J1b requires; otherwise the 64-slot result stands (weak)
+            resetScan(r); r.cap = 256; scanTable(cs, r);
+            if (STRONG.contains(r.stop)) r.ct1 = (r.ct1 == null ? "" : r.ct1 + "+") + "CT1f extended scan ended by " + r.stop + " at slot " + r.slots;
+            else { resetScan(r); r.cap = 64; scanTable(cs, r); }
+        }
         if (!r.placeholderTargets.isEmpty()) {
             // CT1e: placeholders are valid only when the table ends exactly at their (common) target
             Address end = r.stop.equals("OWN_TARGET") ? seg(cs, (r.table + r.stride * r.slots) & 0xFFFF) : null;
@@ -1694,8 +1703,7 @@ public final class WSJumpTables {
                     emit.accept(String.format("{\"rule\":\"CT1e\",\"site\":\"%s\",\"slot\":%d,\"target\":\"%s\",\"outcome\":\"PLACEHOLDER_NOT_DECODED\"}", r.site, k, end));
             } else {
                 // not proven: rescan as plain J1 (the first placeholder is the weak UNDECODABLE stop again)
-                r.slots = 0; r.empty = 0; r.emptySlots.clear(); r.slotOf.clear(); r.targets.clear(); r.stop = "BOUND";
-                r.placeholderSlots.clear(); r.placeholderTargets.clear(); r.allowPlaceholders = false;
+                resetScan(r); r.allowPlaceholders = false;
                 scanTable(cs, r);
             }
         }
@@ -1757,6 +1765,14 @@ public final class WSJumpTables {
         r.empty = r.emptySlots.size();
         r.stop = "OBSERVED_SPAN";
         spanHypotheses.put(r.site, rest);
+    }
+
+    static final Set<String> STRONG = Set.of("EXECUTED_CODE", "TABLE_BOUNDARY", "FUNCTION_ENTRY", "DIRECT_CALL_ENTRY",
+        "TABLE_BASE", "OWN_TARGET", "PUSH_RETURN_ENTRY");
+
+    static void resetScan(Rec r) {
+        r.slots = 0; r.empty = 0; r.emptySlots.clear(); r.slotOf.clear(); r.targets.clear(); r.stop = "BOUND";
+        r.placeholderSlots.clear(); r.placeholderTargets.clear();
     }
 
     /** The ascending slot scan of a recovered site (stops on the first stop reason). */
