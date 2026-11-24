@@ -73,6 +73,9 @@ import ghidra.util.task.TaskMonitor;
  *   the recovery override, after which the decompiler's own unbounded table read follows garbage cross-space.
  * J1q: every jump-table override is filtered to the site's address space: a foreign-bank override target sends
  *   the decompiler where nothing was decoded. References keep every bank (they are evidence and harmless).
+ * J1y: a site's table slots and observed targets resolve in the site's own address space when applied, not in
+ *   the space of whichever site was recovered last in the pass: a bank-overlay site's observed targets are overlay
+ *   addresses, never the empty bank window.
  * J1r: a quarantined site whose own instruction was removed by an earlier analysis gets one
  *   restoration attempt before the final
  *   verdict: the cleared run is re-decoded from the fall-through of the nearest preceding kept instruction in the
@@ -734,6 +737,9 @@ public final class WSJumpTables {
     }
 
     boolean applySite(Instruction ins, Rec r, TaskMonitor monitor) throws Exception {
+        // J1y: resolve this site's table and observed targets in its own space. recover() runs for every
+        // site of a pass before any applySite(), so the field still names the last recovered site's space.
+        siteSpace = ins.getAddress().getAddressSpace();
         Set<Long> obs = observed.getOrDefault(ins.getAddress().getOffset(), Set.of());
         Set<Long> got = new HashSet<>();
         for (Address t : r.targets) got.add(t.getOffset());
@@ -1733,6 +1739,11 @@ public final class WSJumpTables {
     static final Pattern CSMEM = Pattern.compile("CS:\\[(?:(BX|SI|DI|BP)(?: ?([+-]) ?0x([0-9a-f]+))?|0x([0-9a-f]+))\\]", Pattern.CASE_INSENSITIVE);
 
     void collectTableBases(TaskMonitor monitor) throws Exception {
+        AddressSpace caller = siteSpace;
+        try { collectTableBasesInner(monitor); } finally { siteSpace = caller; }
+    }
+
+    void collectTableBasesInner(TaskMonitor monitor) throws Exception {
         tableBases.clear();
         for (Instruction ins : listing.getInstructions(true)) {
             monitor.checkCancelled();
