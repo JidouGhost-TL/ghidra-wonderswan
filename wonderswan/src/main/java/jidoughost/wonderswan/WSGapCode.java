@@ -42,6 +42,8 @@ import ghidra.util.task.TaskMonitor;
  * U1a: a direct call to the start of an existing instruction that existing code already reaches by a CALL counts as
  *    a call to a function entry (the function is created by later analysis; code a phase-2 rule just disassembled
  *    has none yet), so whether a candidate is accepted does not depend on when that function appears.
+ * U1c: a candidate whose walk covers a byte that existing code reads or writes as data (a data reference from an
+ *    instruction, e.g. LES SI,CS:[0347h] on a far-pointer table) is rejected: those bytes are data.
  * Both repeat until no new candidate is accepted (an accepted function exposes the bytes after its own end).
  */
 final class WSGapCode {
@@ -90,9 +92,11 @@ final class WSGapCode {
         // run (>= 16 bytes of 00 / FF) in a block that holds code -- e.g. code placed at an aligned address
         List<Object[]> cands = new ArrayList<>();   // {start, terminator or null}
         Set<MemoryBlock> codeBlocks = new LinkedHashSet<>();
+        csData.clear();
         for (Instruction i : listing.getInstructions(true)) {
             monitor.checkCancelled();
             codeBlocks.add(mem.getBlock(i.getAddress()));
+            noteCsData(i);
             if (i.hasFallthrough()) continue;
             Address n = i.getMaxAddress().next();
             if (n == null || tried.contains(n)) continue;
@@ -241,6 +245,8 @@ final class WSGapCode {
                 if (c instanceof Instruction || (c instanceof Data d && d.isDefined()) || body.contains(q)) return fail("OVERLAP@" + q);
             }
             if (!blk.contains(end)) return fail("LEAVES_BLOCK@" + a);
+            for (Address q = a; q != null && q.compareTo(end) <= 0; q = q.next())
+                if (readAsData(q)) return fail("DATA_READ@" + q);
             body.add(a, end);
             depthAt.put(a, depth);
             String mn = pi.getMnemonicString().toUpperCase();
@@ -322,6 +328,7 @@ final class WSGapCode {
         for (Address a : starts) if (listing.getInstructionContaining(a) == null) ctx.setValue(csval, a, a, BigInteger.valueOf(cs));
         new DisassembleCommand(s, null, true).applyTo(p, monitor);
         for (Address c : w.internal()) if (listing.getInstructionAt(c) == null) new DisassembleCommand(c, null, true).applyTo(p, monitor);
+        for (Instruction i : listing.getInstructions(w.body(), true)) noteCsData(i);   // U1c for later candidates of this pass
         // internal subroutines first, so the caller's body stops at them
         for (Address c : w.internal()) if (p.getFunctionManager().getFunctionAt(c) == null) {
             new CreateFunctionCmd(c).applyTo(p, monitor);
@@ -330,6 +337,31 @@ final class WSGapCode {
                 emit.accept(String.format("{\"rule\":\"U1\",\"start\":\"%s\",\"after\":\"called from candidate %s\",\"outcome\":\"UNREFERENCED_FUNCTION\"}", c, s)); }
         }
         if (function) new CreateFunctionCmd(s).applyTo(p, monitor);
+    }
+
+    /** U1c: bytes existing code addresses through a constant CS-relative memory operand (CS:[imm], no index register),
+     *  collected each pass: their data references may not exist yet (operand references are made by later analysis). */
+    final Set<Address> csData = new HashSet<>();
+    static final java.util.regex.Pattern CS_ABS = java.util.regex.Pattern.compile("CS:\\[0X([0-9A-F]+)\\]");
+    void noteCsData(Instruction i) {
+        String t = i.toString().toUpperCase().replace(" ", "");
+        java.util.regex.Matcher m = CS_ABS.matcher(t);
+        if (!m.find()) return;
+        String mn = i.getMnemonicString().toUpperCase();
+        int len = mn.equals("LES") || mn.equals("LDS") || t.contains("DWORDPTR") ? 4 : t.contains("BYTEPTR") || t.matches("^[A-Z]+[ABCD][LH],.*|.*,[ABCD][LH]$") ? 1 : 2;
+        int off = Integer.parseInt(m.group(1), 16) & 0xFFFF;
+        SegmentedAddressSpace sp = (SegmentedAddressSpace) p.getAddressFactory().getDefaultAddressSpace();
+        int cs = csOf(i.getAddress());
+        for (int k = 0; k < len; k++) csData.add(sp.getAddress(cs, (off + k) & 0xFFFF));
+    }
+
+    /** U1c: a byte that an existing instruction reads or writes as data (a data reference from an instruction, or a
+     *  constant CS-relative operand such as LES SI,CS:[0347h]) is data, not code the walk may claim. */
+    boolean readAsData(Address q) {
+        if (csData.contains(q)) return true;
+        for (Reference r : p.getReferenceManager().getReferencesTo(q))
+            if (r.getReferenceType().isData() && listing.getInstructionAt(r.getFromAddress()) != null) return true;
+        return false;
     }
 
     /** U1a: an instruction start that an existing instruction outside the candidate calls directly. */
