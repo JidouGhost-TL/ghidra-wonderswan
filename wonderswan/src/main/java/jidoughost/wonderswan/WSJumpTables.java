@@ -853,12 +853,12 @@ public final class WSJumpTables {
         }
         int dataSlots = 0;
         if (r.maskOffsets == null) {
-            if (r.slots > 0 && WSInlineTables.words(p, seg(cs, r.table), r.slots)) dataSlots = r.slots;
+            if (r.slots > 0 && WSInlineTables.words(p, seg(cs, r.table), r.slots, ins.getAddress(), emit)) dataSlots = r.slots;
         } else {
             int scanned = 0;
             for (int offset : r.maskOffsets) {
                 if (scanned++ >= r.slots) break;
-                if (WSInlineTables.words(p, seg(cs, (r.table + offset) & 0xffff), 1)) dataSlots++;
+                if (WSInlineTables.words(p, seg(cs, (r.table + offset) & 0xffff), 1, ins.getAddress(), emit)) dataSlots++;
             }
         }
         if (dataSlots > 0)

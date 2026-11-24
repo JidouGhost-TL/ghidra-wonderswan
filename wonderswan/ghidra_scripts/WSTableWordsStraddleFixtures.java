@@ -12,7 +12,7 @@ import ghidra.program.model.mem.*;
 /**
  * Rule J1w: proven table slots become word data unless an existing instruction that starts before the first slot
  * runs into it (a straddling instruction vetoes; the call returns false, nothing is cleared and nothing throws).
- * A clean table in the same program still becomes words. Synthetic program; run as a headless post script.
+ * The veto writes one J1w STRADDLE_VETO evidence line. A clean table in the same program still becomes words. Synthetic program; run as a headless post script.
  */
 public class WSTableWordsStraddleFixtures extends GhidraScript {
     private int checks;
@@ -42,14 +42,24 @@ public class WSTableWordsStraddleFixtures extends GhidraScript {
             p.getListing().createInstruction(decoded.getAddress(), decoded.getPrototype(), decoded, decoded.getProcessorContext(), 0);
             String before = p.getListing().getInstructionAt(ins).toString();
             Method words = Class.forName("jidoughost.wonderswan.WSInlineTables").getMethod("words", Program.class, Address.class, int.class);
+            Method logged = Class.forName("jidoughost.wonderswan.WSInlineTables").getMethod("words", Program.class, Address.class, int.class,
+                Address.class, java.util.function.Consumer.class);
+            Address site = b.getStart().add(0x40);
+            List<String> log = new ArrayList<>();
+            java.util.function.Consumer<String> emit = log::add;
             boolean made;
-            try { made = (Boolean) words.invoke(null, p, table, 2); }
+            try { made = (Boolean) logged.invoke(null, p, table, 2, site, emit); }
             catch (InvocationTargetException x) { throw new AssertionError("straddled table threw " + x.getCause(), x.getCause()); }
             check(!made, "straddled table vetoed");
             check(p.getListing().getInstructionAt(ins) != null && p.getListing().getInstructionAt(ins).toString().equals(before),
                 "straddling instruction untouched");
             check(p.getListing().getDefinedDataContaining(table.add(2)) == null, "no words created behind the veto");
-            check((Boolean) words.invoke(null, p, table2, 2), "clean table accepted");
+            for (String l : log) println("EVIDENCE " + l);
+            check(log.size() == 1 && log.get(0).contains("\"rule\":\"J1w\"") && log.get(0).contains("STRADDLE_VETO")
+                && log.get(0).contains("\"site\":\"" + site + "\"") && log.get(0).contains("\"slot\":\"" + table + "\"")
+                && log.get(0).contains("\"instruction_start\":\"" + ins + "\"") && log.get(0).contains("\"bytes\":\"21521e\""),
+                "veto evidence line names site, slot and straddling instruction");
+            check((Boolean) logged.invoke(null, p, table2, 2, site, emit) && log.size() == 1, "clean table accepted without a veto line");
             check(p.getListing().getDefinedDataAt(table2) != null && p.getListing().getDefinedDataAt(table2.add(2)) != null, "clean table words");
             println("WSTableWordsStraddleFixtures: PASS checks=" + checks);
         } finally { p.endTransaction(tx, false); p.release(this); }

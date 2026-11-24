@@ -83,11 +83,24 @@ public final class WSInlineTables {
     }
     /** Shared data precedence for a structurally proven word table. Existing data stays. */
     public static boolean words(Program p, Address start, int count) throws Exception {
+        return words(p, start, count, null, null);
+    }
+
+    /** As {@link #words(Program, Address, int)}; a veto by a straddling instruction is reported through
+     *  {@code emit} (rule J1w STRADDLE_VETO: site, first slot, straddling instruction) when it is given. */
+    public static boolean words(Program p, Address start, int count, Address site, Consumer<String> emit) throws Exception {
         if (count <= 0 || WSRamCode.isRam(p, start)) return false;
         Address end = start.add(2L * count - 1);
-        // an instruction that starts before the first slot and runs into it straddles the table: veto
+        // J1w: an instruction that starts before the first slot and runs into it straddles the table: veto.
+        // The instruction stays as it is (H2); the table words are not created.
         Instruction head = p.getListing().getInstructionContaining(start);
-        if (head != null && head.getAddress().compareTo(start) < 0) return false;
+        if (head != null && head.getAddress().compareTo(start) < 0) {
+            if (emit != null)
+                emit.accept(String.format("{\"rule\":\"J1w\",\"site\":\"%s\",\"slot\":\"%s\",\"slots\":%d,\"outcome\":\"STRADDLE_VETO\",\"instruction\":\"%s\",\"instruction_start\":\"%s\",\"instruction_end\":\"%s\",\"bytes\":\"%s\"}",
+                    site, start, count, head.toString().replace("\"", "'"), head.getAddress(), head.getMaxAddress(),
+                    HexFormat.of().formatHex(head.getBytes())));
+            return false;
+        }
         for (Address a : new AddressSet(start, end).getAddresses(true)) {
             if (played(p, a) || explicit(p.getFunctionManager().getFunctionContaining(a))) return false;
             for (Reference r : p.getReferenceManager().getReferencesTo(a))
@@ -287,7 +300,7 @@ public final class WSInlineTables {
             }
             Address start = i.getDefaultFallThrough();
             if (!availableModel(p, segment, interrupt, cases.size())) continue;
-            if (!words(p, start, cases.size())) continue;
+            if (!words(p, start, cases.size(), i.getAddress(), emit)) continue;
             Function delegate = model(p, segment, interrupt, cases.size(), monitor);
             if (delegate == null) continue;
             // Direct calls prioritize their primary ordinary call reference. Keep
