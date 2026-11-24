@@ -140,7 +140,8 @@ public final class WSAsmAxLiveThrough {
             if (fallThrough == null || !body.contains(fallThrough)) return List.of();
 
             for (PcodeOp op : ins.getPcode()) {
-                switch (op.getOpcode()) {
+                // DX-port userops keep their former LOAD/STORE classification (port_out is a store).
+                switch (WSPortAccess.legacyOpcode(program.getLanguage(), op)) {
                     case PcodeOp.CALLOTHER -> {
                         if (!"segment".equals(program.getLanguage().getUserDefinedOpName((int) op.getInput(0).getOffset())))
                             return List.of();

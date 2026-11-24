@@ -4,6 +4,9 @@
 <processor_spec>
   <properties>
     <property key="useOperandReferenceAnalyzerSwitchTables" value="true"/>
+    <!-- Supplies the port_in8/16 and port_out8/16 userops (DX-port IN/OUT/INS/OUTS) to Ghidra's
+         PcodeEmulator as io-space loads/stores; see V30PortPcodeUseropLibraryFactory. -->
+    <property key="useropLibs" value="jidoughost.v30mz.port-access"/>
   </properties>
   <programcounter register="IP"/>
   <segmented_address space="ram" type="real" />
@@ -24,7 +27,8 @@
       <register name="DS"/>
     </constresolve>
   </segmentop>
-  <!-- I/O ports have side effects. See README for indirect access limits in the decompiler. -->
+  <!-- I/O ports have side effects: keep every direct (immediate-port) io access. DX-port accesses
+       use the port_* userops instead (see README "I/O ports"). -->
   <volatile outputop="write_volatile" inputop="read_volatile">
     <range space="io" first="0x0" last="0xffff"/>
   </volatile>

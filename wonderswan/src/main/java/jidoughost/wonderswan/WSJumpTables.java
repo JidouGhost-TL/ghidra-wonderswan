@@ -1981,7 +1981,7 @@ public final class WSJumpTables {
                 || writesReg(q, t, "SP", p.getRegister("SP"))
                 || writesReg(q, t, "SS", p.getRegister("SS"))) return null;
             for (var op : q.getPcode())
-                if (op.getOpcode() == ghidra.program.model.pcode.PcodeOp.STORE) return null;
+                if (WSPortAccess.legacyOpcode(p.getLanguage(), op) == ghidra.program.model.pcode.PcodeOp.STORE) return null;
             after = q;
         }
         return null;

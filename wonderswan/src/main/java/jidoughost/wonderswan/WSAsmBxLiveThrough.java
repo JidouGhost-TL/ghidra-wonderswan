@@ -84,7 +84,9 @@ final class WSAsmBxLiveThrough {
                 for (var ref : refs.getReferencesTo(ins.getAddress()))
                     if (ref.getReferenceType().isFlow()) return null;
             for (var op : ins.getPcode()) {
-                if (op.getOpcode() == PcodeOp.LOAD && (!op.getInput(0).isConstant()
+                // A DX-port read (port_in userop) counts as the non-RAM LOAD it used to be.
+                if (WSPortAccess.legacyOpcode(program.getLanguage(), op) == PcodeOp.LOAD
+                        && (op.getOpcode() == PcodeOp.CALLOTHER || !op.getInput(0).isConstant()
                         || op.getInput(0).getOffset() != defaultSpace.getSpaceID())) return null;
                 for (var input : op.getInputs()) {
                     var reg = WSAsmAxLiveThrough.register(function, input);

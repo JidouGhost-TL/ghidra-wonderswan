@@ -57,7 +57,7 @@ never faults. As in x86, `.LOCK` is shown only on the read-modify-write memory f
 - IRET unpacks FLAGS.
 - XLAT and nested ENTER frames go through the correct segment.
 - The PUSHF image has bits 15-12 and bit 1 set (F002h).
-- IN/OUT/INS/OUTS use the io space (see below).
+- IN/OUT/INS/OUTS use the io space: direct io varnodes for immediate ports, `port_*` userops for DX (see below).
 
 **Left to the emulator (no p-code effect):** interrupt shadows (STI/POPF/IRET/MOV SS/POP SS),
 the TF single-step trap, prefix-resume rules (REP iterates with `goto inst_start`, so an
@@ -74,6 +74,8 @@ implements them (`wonderswan/README.md`).
 | `divtrap()` | do the same entry for vector 0 and redirect the PC to the handler itself (in Ghidra's emulator: `overrideCounter` + `PcodeFrame.finishAsBranch()`); the p-code falls through so static analysis sees "handler returns to the next instruction" |
 | `halt()` | stop executing until an interrupt is requested (also with IF=0) |
 | `LOCK()` / `UNLOCK()` | nothing |
+| `port_in8(port)` / `port_in16(port)` | return the byte / word read at `port` (16 bits) in the `io` space (a word reads port and port+1). Ghidra's PcodeEmulator gets this from the pspec `useropLibs` library |
+| `port_out8(port, v)` / `port_out16(port, v)` | write the byte / word `v` at `port` in the `io` space (same library) |
 | `v30mz_undefined(...)` | fail (only emitted for 62 mod=11 under `hwundef=1`) |
 | `MULOV` register | nothing; it is CPU state (0 at reset) |
 | context `hwundef`, `colorsoc` | set `hwundef=1` and `colorsoc` = the SoC (1 on a WonderSwan Color/Crystal) |
@@ -133,24 +135,40 @@ selection and the applicable SS and DS values before treating those accesses as 
 
 ## I/O ports: the `io` space
 
-`define space io type=ram_space size=2 wordsize=1`. IN, OUT, INS and OUTS are plain loads and
-stores in `io`. A word access at port p touches p and p+1. The WonderSwan's 8-bit port decode is
-**not** masked here; that belongs to the platform model.
+`define space io type=ram_space size=2 wordsize=1`. A word access at port p touches p and p+1.
+The WonderSwan's 8-bit port decode is **not** masked here; that belongs to the platform model.
 
-- The pspec marks `io:0000-FFFF` **volatile**. Ghidra 12.1.3 preserves accesses to immediate-form
-  port addresses, including a read whose result is discarded.
-- With a port address passed in DX, raw p-code records the `io` space and the access width. The stock C
-  printer displays surviving reads and writes as pointer dereferences, and the decompiler may
-  remove reads whose results it can prove unused. For runtime port accesses, check the
-  instruction listing or raw p-code.
+| Instructions | P-code | C |
+|---|---|---|
+| `IN AL/AX,imm8`, `OUT imm8,AL/AX` (E4-E7) | a direct `io` varnode (`AL = *[io]:1 0xa0`) | the port's label (`IO_A0`) |
+| `IN AL/AX,DX`, `OUT DX,AL/AX` (EC-EF) | `AL = port_in8(DX)`, `AX = port_in16(DX)`, `port_out8(DX, AL)`, `port_out16(DX, AX)` | `port_in8(port)` / `port_out8(port, value)` |
+| `INSB/INSW`, `OUTSB/OUTSW` (6C-6F, with or without REP) | the same userops, combined with the ES:DI / seg:SI memory access | the same |
+
+- The pspec marks `io:0000-FFFF` **volatile**, so the decompiler keeps every immediate-port
+  access, including a read whose result is discarded.
+- The DX forms are userops rather than `io` loads and stores, because the stock C printer does
+  not show the address space of a LOAD or STORE whose address is computed at run time
+  ([printc.cc `opLoad`/`opStore`](https://github.com/NationalSecurityAgency/ghidra/blob/8b4c91d4d5bd1549622bfbade0df199585b98365/Ghidra/Features/Decompiler/src/decompile/cpp/printc.cc#L506-L537)).
+  Such an access printed exactly like a RAM pointer access (`*(byte *)(port & 0xff)`). The
+  decompiler could also print one port read twice, as two dereferences of the same pointer, and
+  delete a port read whose value is unused. A userop call is never duplicated or removed.
+  Ghidra's x86 spec also uses userops (`in`, `out`) for its port instructions.
+- Cost: when DX holds a known constant (`MOV DX,0xc3; OUT DX,AL`), C shows `port_out8(0xc3, value)`
+  instead of the port's label.
 - The cspec puts `io` in `<global>`. Without this, the decompiler ignores labels on io addresses
   (it prints `Io00a0` instead of the label). This follows Ghidra's Z80 spec.
 - A loader creates an `io` memory block (volatile, uninitialized) and puts labels and data types
   on it.
-- **Emulator:** Ghidra's PcodeEmulator runs IN/OUT as ordinary loads and stores in the `io`
-  space; no userop is involved. Intercept accesses whose address space is `io`. You can use
+- **Emulator:** Ghidra's PcodeEmulator runs the immediate forms as ordinary loads and stores in
+  the `io` space. For the four `port_*` userops the pspec property `useropLibs` registers a userop
+  library (`V30PortPcodeUseropLibraryFactory`, in this extension) that runs each of them as the
+  same `io` LOAD or STORE through the executor, so all port accesses reach the same load/store
+  callbacks. To emulate I/O, intercept accesses whose address space is `io`. You can use
   load/store callbacks (`beforeLoad`/`afterStore`), or a state piece that overrides
-  `getVar`/`setVar` for that space.
+  `getVar`/`setVar` for that space. Another p-code runtime must implement the four userops itself
+  (see the emulator contract above).
+- **P-code consumers:** code that recognises port accesses by an `io` LOAD/STORE must also accept
+  the four `port_*` CALLOTHERs (input 1: the 16-bit port; input 2 of `port_out*`: the value).
 - **Display:** `IN AL,imm8` prints the port as an io address (`IN AL,0x00a0`), so references
   and labels work in the listing. Ghidra x86 prints `IN AL,0xa0`. This is the harness category
   `IO_PORT_OPERAND`.

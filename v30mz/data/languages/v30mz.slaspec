@@ -50,7 +50,8 @@ define alignment=1;
 
 define space ram      type=ram_space      size=4 default;
 define space register type=register_space size=4;
-# I/O port space. IN/OUT/INS/OUTS are plain loads/stores here (16-bit port numbers, byte
+# I/O port space. Immediate-port IN/OUT are direct io varnodes; the DX forms and INS/OUTS use
+# the port_* userops below, whose effect is a load/store here (16-bit port numbers, byte
 # addressed; a word access at port p touches p and p+1 -- the high byte goes to port+1
 # [ST:4929-4931], [ST:5246-5249]). The WonderSwan SoC decodes only the low 8 bits of the port
 # number; that aliasing is NOT modelled here (no masking) -- it belongs to the platform model.
@@ -572,6 +573,24 @@ macro rcr16(dest, rotate_count) {
 :^instruction is over=0xf2; instruction [ repneprefx=1; repprefx=0; ] {}
 :^instruction is over=0xf3; instruction [ repneprefx=0; repprefx=1; ] {}
 :^instruction is over=0xf0; instruction [ lockprefx=1; ] {}
+
+# Placeholder for an effect the sources do not agree on. A p-code emulator must supply this
+# userop; it fails fast instead of silently running a guessed effect. Defined here, ahead of the
+# port userops, so that it keeps the userop ID it had when it was the last one defined.
+define pcodeop v30mz_undefined;
+
+# Port I/O with the port number in DX (IN/OUT EC-EF, INS/OUTS 6C-6F). port_in8/16(port) return
+# the byte/word read at `port`; port_out8/16(port, value) write it. The p-code effect is a load or
+# store of 1/2 bytes at `port` in the io space (a word touches port and port+1). These are
+# userops instead of *[io] loads/stores because the decompiler prints a LOAD/STORE through a
+# runtime address as a plain pointer dereference with no address space, can print one read
+# twice, and can delete a read whose value is unused (see README "I/O ports"). Immediate-port
+# forms (E4-E7) stay direct io varnodes. Emulators: the pspec `useropLibs` factory supplies
+# these to Ghidra's PcodeEmulator as io-space loads/stores (same callbacks as before).
+define pcodeop port_in8;
+define pcodeop port_in16;
+define pcodeop port_out8;
+define pcodeop port_out16;
 
 @include "v30mz_insn.sinc"
 @include "v30mz_hwundef.sinc"

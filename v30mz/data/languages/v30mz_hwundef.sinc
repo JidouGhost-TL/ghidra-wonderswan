@@ -28,9 +28,7 @@
 #                     as undefined [ST:13653]. No hardware evidence for its length -> no
 #                     constructor.
 
-# Placeholder for an effect the sources do not agree on. A p-code emulator must supply this
-# userop; it fails fast instead of silently running a guessed effect.
-define pcodeop v30mz_undefined;
+# v30mz_undefined is defined in v30mz.slaspec (before the port userops, to keep its userop ID).
 
 # --- mod=11 "register" effective addresses of LEA / LES / LDS / CALLF / JMPF -----------------
 # RESOLVED (CT hardware test + AV + MS + AR): with mod=11 these instructions do not use the
