@@ -14,12 +14,12 @@ import jidoughost.wonderswan.WonderSwanLoader;
  * does not execute, so execution evidence observes neither the dispatch nor the handler at F000:0200; the handler
  * sits between erased bytes, so nothing but the stored pointer names it.
  *
- * retf:      MOV SI,[BX+9Ch]; MOV AX,F000h; MOV [BX+SI+9Eh],AX; MOV AX,0200h; MOV [BX+SI+0A0h],AX, dispatched by
- *            MOV AX,[BX+SI+9Eh]; PUSH AX; MOV AX,[BX+SI+0A0h]; PUSH AX; RETF (segment word first, as pushed):
+ * retf:      MOV SI,[BX+2Eh]; MOV AX,F000h; MOV [BX+SI+30h],AX; MOV AX,0200h; MOV [BX+SI+32h],AX, dispatched by
+ *            MOV AX,[BX+SI+30h]; PUSH AX; MOV AX,[BX+SI+32h]; PUSH AX; RETF (segment word first, as pushed):
  *            the handler is decoded and becomes a function with an F6 evidence bookmark.
  * callf:     offset to [BX+SI+20h], segment to [BX+SI+22h], dispatched by CALLF [BX+SI+20h]: same expectations.
  * clobber:   the retf store routine with INC SI between the two stores: no pair, the handler stays undecoded.
- * mismatch:  the retf stores, but the dispatcher reads [BX+DI+9Eh]/[BX+DI+0A0h]: another field, nothing decoded.
+ * mismatch:  the retf stores, but the dispatcher reads [BX+DI+30h]/[BX+DI+32h]: another field, nothing decoded.
  * ramseg:    the retf pair with segment 1000h (RAM): rejected, nothing decoded at F000:0200.
  * u1call:    retf, with the handler calling a subroutine at F000:0240 (decoded through the handler's flow, no function
  *            yet), and unreferenced code after the store routine's RET (F000:0056: PUSH AX; PUSH CX; CALL 0240h;
@@ -55,18 +55,18 @@ public class WSFieldPointerFixtures extends GhidraScript {
         put(rom, 0x00, "fa31c08ed8a000013c5a7506e83100e86e00ebfe");
         String seg = variant.equals("ramseg") ? "0010" : "00f0";
         if (variant.equals("callf")) {
-            // MOV BX,0400h; MOV SI,[BX+9Ch]; MOV AX,0200h; MOV [BX+SI+20h],AX; MOV AX,F000h; MOV [BX+SI+22h],AX; RET
-            put(rom, STORE, "bb00048bb79c00b80002898020" + "00" + "b8" + seg + "898022" + "00" + "c3");
-            // MOV BX,0400h; MOV SI,[BX+9Ch]; CALLF [BX+SI+20h]; RET
-            put(rom, DISPATCH, "bb00048bb79c00ff982000c3");
+            // MOV BX,0400h; MOV SI,[BX+2Eh]; MOV AX,0200h; MOV [BX+SI+20h],AX; MOV AX,F000h; MOV [BX+SI+22h],AX; RET
+            put(rom, STORE, "bb00048bb72e00b80002898020" + "00" + "b8" + seg + "898022" + "00" + "c3");
+            // MOV BX,0400h; MOV SI,[BX+2Eh]; CALLF [BX+SI+20h]; RET
+            put(rom, DISPATCH, "bb00048bb72e00ff982000c3");
         } else {
-            // MOV BX,0400h; MOV SI,[BX+9Ch]; MOV AX,seg; MOV [BX+SI+9Eh],AX; [INC SI;] MOV AX,0200h; MOV [BX+SI+0A0h],AX; RET
-            put(rom, STORE, "bb00048bb79c00b8" + seg + "89809e00" + (variant.equals("clobber") ? "46" : "")
-                + "b800028980a000c3");
-            // MOV BX,0400h; MOV SI,[BX+9Ch]; MOV AX,[BX+SI+9Eh]; PUSH AX; MOV AX,[BX+SI+0A0h]; PUSH AX; RETF
+            // MOV BX,0400h; MOV SI,[BX+2Eh]; MOV AX,seg; MOV [BX+SI+30h],AX; [INC SI;] MOV AX,0200h; MOV [BX+SI+32h],AX; RET
+            put(rom, STORE, "bb00048bb72e00b8" + seg + "89803000" + (variant.equals("clobber") ? "46" : "")
+                + "b8000289803200c3");
+            // MOV BX,0400h; MOV SI,[BX+2Eh]; MOV AX,[BX+SI+30h]; PUSH AX; MOV AX,[BX+SI+32h]; PUSH AX; RETF
             // (mismatch: the same through BX+DI)
-            put(rom, DISPATCH, variant.equals("mismatch") ? "bb00048bbf9c008b819e00508b81a00050cb"
-                : "bb00048bb79c008b809e00508b80a00050cb");
+            put(rom, DISPATCH, variant.equals("mismatch") ? "bb00048bbf2e008b813000508b81320050cb"
+                : "bb00048bb72e008b803000508b80320050cb");
         }
         if (variant.equals("u1call") || variant.equals("u1data")) {
             if (variant.equals("u1data")) put(rom, HANDLER, "2ec4365600b80100e83500cb");   // LES SI,CS:[0056h]; MOV AX,1; CALL 0240h; RETF

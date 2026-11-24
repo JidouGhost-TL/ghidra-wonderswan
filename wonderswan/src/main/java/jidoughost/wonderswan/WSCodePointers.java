@@ -45,7 +45,7 @@ import ghidra.util.task.TaskMonitor;
  *     a word pair at a low DS offset under a defaulted DS is an ordinary variable, not a vector. F3 setters into
  *     vector slots follow the same rule.
  * F6  far code-pointer fields: a far pointer held in a register-relative word pair (an array or structure slot such as
- *     [BX+SI+9Eh]/[BX+SI+0A0h], whose address is not constant) that kept code transfers to: PUSH of the two words
+ *     [BX+SI+30h]/[BX+SI+32h], whose address is not constant) that kept code transfers to: PUSH of the two words
  *     (directly or through register loads) then RETF, or CALLF/JMPF dword ptr [field]. The dispatch fixes which word
  *     is the segment (pushed first for RETF; the high word for CALLF/JMPF). A constant segment and a constant offset
  *     stored into exactly that field pair (same segment register, same index registers, same displacements) in one
