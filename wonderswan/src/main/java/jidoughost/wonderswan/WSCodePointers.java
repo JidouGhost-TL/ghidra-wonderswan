@@ -36,6 +36,13 @@ import ghidra.util.task.TaskMonitor;
  *     push-return dispatch is where the dispatched code returns: code (no function, it continues the caller).
  * F5  unreferenced short data that an accepted target's straight-line flow runs through is cleared first (see
  *     clearWeakDataInFlow), so a loose analysis guess cannot cut a pointer-proven routine down to one instruction.
+ * F2v (vector proof): a pair stored into an interrupt-vector slot (0000:0000-03FF, not otherwise known as a far
+ *     variable by F1) seeds a handler only when the segment register of both stores is proven 0000 in the same chain
+ *     (set by an instruction of the chain, not the DS/ES context default) and the vector is one the hardware or the
+ *     program uses: CPU vectors 00-07, the eight vectors from each constant written to the interrupt base port 0xB0,
+ *     or the number of an immediate INT in the listing. Other pairs are rejected (IVT_UNPROVEN, one F2v line each):
+ *     a word pair at a low DS offset under a defaulted DS is an ordinary variable, not a vector. F3 setters into
+ *     vector slots follow the same rule.
  * A target is accepted only when it lies in an initialised executable block, does not fall inside an existing
  * instruction or defined data, and decodes; otherwise it is reported (OFFCUT, DATA, UNDECODABLE, WINDOW (bank
  * unknown), RAM, OUT_OF_ROM). The rule repeats until no new targets appear (new code can hold more stores).
@@ -109,13 +116,53 @@ final class WSCodePointers {
     final Map<Long, Address> farPairSite = new HashMap<>();
     final List<Target> returns = new ArrayList<>();
 
+    /** F2v: true for an interrupt-vector slot not otherwise known as a far variable. */
+    boolean ivtOnly(long m) { return m < 0x400 && (m & 3) == 0 && !farVars.containsKey(m); }
+
+    /** F2v: vectors the hardware or the program uses (CPU 00-07, port 0xB0 bases + 0..7, immediate INT numbers). */
+    Set<Integer> usedVectors() {
+        Set<Integer> v = new TreeSet<>();
+        for (int k = 0; k < 8; k++) v.add(k);
+        for (Instruction i : listing.getInstructions(true)) {
+            String t = norm(i);
+            if (t.startsWith("INT0X")) { try { v.add(Integer.parseInt(t.substring(5), 16)); } catch (Exception e) { } }
+            if (t.equals("OUT0XB0,AL") || t.equals("OUT0X00B0,AL")) {
+                Address ff = i.getFallFrom();
+                Instruction q = ff == null ? null : listing.getInstructionAt(ff);
+                String qt = q == null ? "" : norm(q);
+                if (qt.startsWith("MOVAL,0X")) {
+                    try { int b = Integer.parseInt(qt.substring(8), 16) & 0xF8; for (int k = 0; k < 8; k++) v.add(b + k); }
+                    catch (Exception e) { }
+                }
+            }
+        }
+        return v;
+    }
+
+    boolean vectorRejected(long m, boolean proven, Set<Integer> used, Address site, String via) {
+        if (!ivtOnly(m) || proven && used.contains((int) (m >> 2))) return false;
+        String why = !proven ? "SEGMENT_NOT_PROVEN_0000" : "VECTOR_NOT_USED";
+        if (ivtRejected.add(site + ":" + m)) {
+            rejected++;
+            rejects.merge("IVT_UNPROVEN", 1, Integer::sum);
+            emit.accept(String.format("{\"rule\":\"F2v\",\"var\":\"IVT[%02x]\",\"site\":\"%s\",\"via\":\"%s\",\"outcome\":\"IVT_UNPROVEN\",\"why\":\"%s\"}",
+                m >> 2, site, via, why));
+        }
+        return true;
+    }
+    final Set<String> ivtRejected = new HashSet<>();
+    final Map<Long, Boolean> segProven = new HashMap<>();
+    boolean lastSegProven;
+
     int pass() throws Exception {
         stores.clear(); callState.clear(); farPairs.clear(); farPairSite.clear(); returns.clear();
         track();
+        Set<Integer> used = usedVectors();
         List<Target> targets = new ArrayList<>();
         // F2: constant pairs / near constants stored into code-pointer variables
         for (long[] fp : farPairs) {
-            if (isFarVar(fp[0]))
+            Address site = farPairSite.get(fp[0] << 20 ^ fp[1] << 16 ^ fp[2]);
+            if (isFarVar(fp[0]) && !vectorRejected(fp[0], fp[3] != 0, used, site, "F2 store " + varName(fp[0])))
                 targets.add(new Target((int) fp[1], (int) fp[2], farPairSite.get(fp[0] << 20 ^ fp[1] << 16 ^ fp[2]), "F2 store " + varName(fp[0]), true));
         }
         for (Store s : stores) {
@@ -132,6 +179,8 @@ final class WSCodePointers {
                 String offReg = e.getValue(), segReg = in.get(m + 2);
                 boolean far = isFarVar(m) && segReg != null, near = nearVars.containsKey(m);
                 if (!far && !near) continue;
+                if (far && vectorRejected(m, segProven.getOrDefault(m, false) && segProven.getOrDefault(m + 2, false), used,
+                        f.getEntryPoint(), "F3 setter " + f.getEntryPoint())) continue;
                 for (Reference r : p.getReferenceManager().getReferencesTo(f.getEntryPoint())) {
                     if (!r.getReferenceType().isCall()) continue;
                     Map<String, Val> st = callState.get(r.getFromAddress());
@@ -221,7 +270,7 @@ final class WSCodePointers {
             monitor.checkCancelled();
             boolean cont = prev != null && ins.getAddress().equals(prev.getFallThrough()) && !joins(ins);
             if (!cont) {
-                regs.clear(); stack.clear(); chainStores.clear();
+                regs.clear(); stack.clear(); chainStores.clear(); segProven.clear();
                 contextDs(ins.getAddress(), regs);
             }
             prev = ins;
@@ -299,6 +348,7 @@ final class WSCodePointers {
                     else if (v.c() != null && v.def() == null) v = Val.konst(v.c(), a);
                     stores.add(new Store(a, m, v));
                     chainStores.put(m, v);
+                    segProven.put(m, lastSegProven);
                     pair(m, chainStores, a);
                 }
             }
@@ -374,7 +424,8 @@ final class WSCodePointers {
         for (long lo : new long[] { m, m - 2 }) {
             Val off = chainStores.get(lo), seg = chainStores.get(lo + 2);
             if (off == null || seg == null || off.c() == null || seg.c() == null) continue;
-            farPairs.add(new long[] { lo, seg.c(), off.c() });
+            farPairs.add(new long[] { lo, seg.c(), off.c(),
+                segProven.getOrDefault(lo, false) && segProven.getOrDefault(lo + 2, false) ? 1 : 0 });
             farPairSite.put(lo << 20 ^ (long) seg.c() << 16 ^ off.c(), off.def() != null ? off.def() : site);
         }
     }
@@ -384,6 +435,7 @@ final class WSCodePointers {
         String segName = d.group(1) != null ? d.group(1) : d.group(2).contains("BP") ? "SS" : "DS";
         Val seg = regs.get(segName);
         if (seg == null || seg.c() == null) return null;
+        lastSegProven = seg.def() != null && seg.c() == 0;   // F2v: set to 0000 by an instruction of this chain
         long off = 0;
         Matcher term = Pattern.compile("([+-]?)(0X[0-9A-F]+|AX|BX|CX|DX|SI|DI|BP)").matcher(d.group(2));
         int pos = 0;
@@ -409,6 +461,7 @@ final class WSCodePointers {
         Instruction ins = listing.getInstructionAt(f.getEntryPoint());
         Deque<Val> stack = new ArrayDeque<>();
         Map<Long, Val> chain = new HashMap<>();
+        segProven.clear();
         int before = stores.size();
         for (int n = 0; ins != null && n < 48; n++) {
             if (n > 0 && joins(ins)) break;
