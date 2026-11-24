@@ -436,14 +436,15 @@ public final class WSJumpTables {
      *  the value for the stock recovery (CMP AL,n; JA before MOV BL,AL, or before an AND mask), so such sites stay
      *  with it; a join at the load cannot constrain a value read from memory there. The index is followed back
      *  through register copies (MOV BX,AX; MOV BL,AL) to its load; without a load in the slice, any branch or join
-     *  in the whole slice counts as a possible guard. */
+     *  in the whole slice counts as a possible guard. JZ/JNZ after CMP x,imm (one value excluded) is no guard. */
     boolean unguardedByteIndex(Instruction site, Rec r) {
         if (r == null || !r.byteBound && r.maskOffsets == null) return false;
         String reg = r.idx == null ? null : (r.scaledBy == null ? r.idx : r.scaledBy);
         if (reg == null || reg.length() != 2) return false;
         List<Instruction> slice = new ArrayList<>(predecessors(site, 16));
         slice.add(0, site);
-        for (Instruction q : slice) {
+        for (int qi = 0; qi < slice.size(); qi++) {
+            Instruction q = slice.get(qi);
             String t = q.toString().toUpperCase().replace(" ", "");
             String w = reg.charAt(1) == 'X' ? reg : null, lo = w == null ? reg : w.charAt(0) + "L";
             if (w != null && t.startsWith("MOV" + w + ",")) {
@@ -456,11 +457,21 @@ public final class WSJumpTables {
                 if (src.contains("[")) return true;                              // index byte loaded here
                 if (src.matches("[ABCD][LH]")) { reg = src.charAt(1) == 'L' ? src.charAt(0) + "X" : src; continue; }
             }
-            if (q != site && q.getFlowType().isConditional()) return false;
+            if (q != site && q.getFlowType().isConditional() && !equalityExclusion(q, qi + 1 < slice.size() ? slice.get(qi + 1) : null))
+                return false;
             for (Reference ref : p.getReferenceManager().getReferencesTo(q.getAddress()))
                 if (ref.getReferenceType().isJump() || ref.getReferenceType().isConditional()) return false;
         }
         return true;
+    }
+
+    /** JZ/JNZ on the flags of CMP x,imm excludes one value (e.g. an end marker FFFFh); it bounds no range, so it is
+     *  no guard for switch recovery. Every other conditional branch (ordered compares, TEST masks, ...) may be one. */
+    static boolean equalityExclusion(Instruction branch, Instruction flags) {
+        String m = branch.getMnemonicString().toUpperCase();
+        if (!(m.equals("JZ") || m.equals("JNZ") || m.equals("JE") || m.equals("JNE")) || flags == null) return false;
+        String t = flags.toString().toUpperCase().replace(" ", "");
+        return t.startsWith("CMP") && t.matches("CMP[^,]+,-?0X[0-9A-F]+");
     }
 
     /**
