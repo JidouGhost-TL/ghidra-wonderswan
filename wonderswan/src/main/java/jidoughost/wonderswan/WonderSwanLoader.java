@@ -240,6 +240,9 @@ public class WonderSwanLoader extends AbstractProgramWrapperLoader {
         // WonderSwan programs; WSEvidenceRepairAnalyzer rule N1 still clears contradicted flags. Users can
         // re-enable it in Analysis Options.
         program.getOptions(Program.ANALYSIS_PROPERTIES).setBoolean("Non-Returning Functions - Discovered", false);
+        // Stock switch analysis decompiles in hash order and applies results from worker threads as they finish, so
+        // identical imports differ; the extension's copy makes the same decisions in a fixed order (rule SW1).
+        program.getOptions(Program.ANALYSIS_PROPERTIES).setBoolean(WSDecompilerSwitchAnalyzer.STOCK, false);
 
         Options o = program.getOptions(OPTIONS_CATEGORY);
         o.setBoolean("Color", colorHw);               // hardware model used by WSMachine and the analyzers
