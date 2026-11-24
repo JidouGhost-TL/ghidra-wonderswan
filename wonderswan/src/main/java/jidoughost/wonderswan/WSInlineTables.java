@@ -85,6 +85,9 @@ public final class WSInlineTables {
     public static boolean words(Program p, Address start, int count) throws Exception {
         if (count <= 0 || WSRamCode.isRam(p, start)) return false;
         Address end = start.add(2L * count - 1);
+        // an instruction that starts before the first slot and runs into it straddles the table: veto
+        Instruction head = p.getListing().getInstructionContaining(start);
+        if (head != null && head.getAddress().compareTo(start) < 0) return false;
         for (Address a : new AddressSet(start, end).getAddresses(true)) {
             if (played(p, a) || explicit(p.getFunctionManager().getFunctionContaining(a))) return false;
             for (Reference r : p.getReferenceManager().getReferencesTo(a))
