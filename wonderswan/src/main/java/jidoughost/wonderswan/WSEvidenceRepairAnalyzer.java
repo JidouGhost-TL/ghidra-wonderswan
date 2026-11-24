@@ -107,6 +107,7 @@ public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
             // a table): alternate until neither adds code.
             WSJumpTables j = jumpTables ? new WSJumpTables(program, ev, line -> s.emit("%s", line)) : null;
             WSCodePointers cp = codePointers ? new WSCodePointers(program, line -> s.emit("%s", line), monitor) : null;
+            if (cp != null) cp.evidence = ev;   // F2v: observed DS at vector stores
             WSGapCode gc = gapCode ? new WSGapCode(program, line -> s.emit("%s", line), monitor) : null;
             // IT1c: a newly proven inline dispatch (J3) adds code that the reference-driven rules must see in turn,
             // so the rounds repeat after J3 until J3 recovers nothing new (bounded)

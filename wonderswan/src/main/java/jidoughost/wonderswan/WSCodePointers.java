@@ -37,8 +37,9 @@ import ghidra.util.task.TaskMonitor;
  * F5  unreferenced short data that an accepted target's straight-line flow runs through is cleared first (see
  *     clearWeakDataInFlow), so a loose analysis guess cannot cut a pointer-proven routine down to one instruction.
  * F2v (vector proof): a pair stored into an interrupt-vector slot (0000:0000-03FF, not otherwise known as a far
- *     variable by F1) seeds a handler only when the segment register of both stores is proven 0000 in the same chain
- *     (set by an instruction of the chain, not the DS/ES context default) and the vector is one the hardware or the
+ *     variable by F1) seeds a handler only when the segment register of both stores is proven 0000: set to 0000 by
+ *     an instruction of the same chain, or (DS) every DS value the execution evidence observed at the store is 0000 -
+ *     the DS/ES context default alone is no proof - and the vector is one the hardware or the
  *     program uses: CPU vectors 00-07, the eight vectors from each constant written to the interrupt base port 0xB0,
  *     or the number of an immediate INT in the listing. Other pairs are rejected (IVT_UNPROVEN, one F2v line each):
  *     a word pair at a low DS offset under a defaulted DS is an ordinary variable, not a vector. F3 setters into
@@ -153,6 +154,16 @@ final class WSCodePointers {
     final Set<String> ivtRejected = new HashSet<>();
     final Map<Long, Boolean> segProven = new HashMap<>();
     boolean lastSegProven;
+    String lastSegName;
+    /** F2v: execution evidence (observed DS at a store), when the repair analyzer has it. */
+    WSEvidence evidence;
+
+    /** F2v: every DS value observed at this executed address is 0000. */
+    boolean observedDs0(Address a) {
+        if (evidence == null) return false;
+        Set<Integer> v = evidence.ds.get(a.getOffset());
+        return v != null && !v.isEmpty() && v.equals(Set.of(0));
+    }
 
     int pass() throws Exception {
         stores.clear(); callState.clear(); farPairs.clear(); farPairSite.clear(); returns.clear();
@@ -348,7 +359,7 @@ final class WSCodePointers {
                     else if (v.c() != null && v.def() == null) v = Val.konst(v.c(), a);
                     stores.add(new Store(a, m, v));
                     chainStores.put(m, v);
-                    segProven.put(m, lastSegProven);
+                    segProven.put(m, lastSegProven || "DS".equals(lastSegName) && observedDs0(a));
                     pair(m, chainStores, a);
                 }
             }
@@ -436,6 +447,7 @@ final class WSCodePointers {
         Val seg = regs.get(segName);
         if (seg == null || seg.c() == null) return null;
         lastSegProven = seg.def() != null && seg.c() == 0;   // F2v: set to 0000 by an instruction of this chain
+        lastSegName = segName;
         long off = 0;
         Matcher term = Pattern.compile("([+-]?)(0X[0-9A-F]+|AX|BX|CX|DX|SI|DI|BP)").matcher(d.group(2));
         int pos = 0;

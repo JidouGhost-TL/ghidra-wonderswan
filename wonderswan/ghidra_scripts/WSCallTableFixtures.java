@@ -291,6 +291,25 @@ public class WSCallTableFixtures extends GhidraScript {
         } finally { done(p); }
     }
 
+    /** F2v: a hardware vector (interrupt base 0x20 written to port 0xB0) stored under a context DS that the execution
+     *  evidence observed as 0000 at both stores seeds its handler; without that observation it does not. */
+    void vectorObservedDs(boolean observed) throws Exception {
+        byte[] m = fill(0x1000);
+        put(m, 0x40, "b020e6b0c70680000003c70682000040c3");    // MOV AL,0x20; OUT 0xB0,AL; [0x80]=4000:0300 (IVT[20])
+        put(m, 0x300, "b80100cf");
+        ProgramDB p = make(observed ? "f2v-observed" : "f2v-unobserved", m, null);
+        try {
+            p.getProgramContext().setValue(p.getRegister("DS"), at(p, 0), at(p, 0xfff), BigInteger.ZERO);
+            code(p, 0x40, true);
+            WSEvidence ev = new WSEvidence();
+            if (observed) for (int a : new int[] { 0x44, 0x4a }) ev.ds.put(0x40000L + a, new HashSet<>(Set.of(0)));
+            evidence(p, ev);
+            new WSEvidenceRepairAnalyzer().added(p, p.getMemory(), monitor, new ghidra.app.util.importer.MessageLog());
+            if (observed) check(insn(p, at(p, 0x300)), "F2v hardware vector under an observed DS 0000 seeds its handler");
+            else check(!insn(p, at(p, 0x300)), "F2v hardware vector under an unobserved, defaulted DS is not seeded");
+        } finally { done(p); }
+    }
+
     /** IT1 program: INT n site at 0x40, two inline words, handler at 0x200 with an F2 IVT[n] bookmark. */
     ProgramDB interrupt(String name, int vector, String handler, String words, boolean csBase, boolean dataRef) throws Exception {
         byte[] m = fill(0x1000);
@@ -396,6 +415,8 @@ public class WSCallTableFixtures extends GhidraScript {
         all.put("CT1g-record-stride", this::recordStride);
         all.put("F2v-default-ds-not-vector", () -> vectorProof(false));
         all.put("F2v-control-proven-vector", () -> vectorProof(true));
+        all.put("F2v-observed-ds-hardware-vector", () -> vectorObservedDs(true));
+        all.put("F2v-unobserved-ds-hardware-vector", () -> vectorObservedDs(false));
         all.put("IT1a-general-handler", this::interruptGeneral);
         all.put("IT1b-data-reference-end", this::interruptDataRefEnd);
         all.put("IT1b-control-no-end", this::interruptNoEnd);
