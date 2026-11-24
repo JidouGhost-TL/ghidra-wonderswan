@@ -94,12 +94,23 @@ public final class WSInlineTables {
     }
     /** Shared data precedence for a structurally proven word table. Existing data stays. */
     public static boolean words(Program p, Address start, int count) throws Exception {
-        return words(p, start, count, null, null);
+        return words(p, start, count, false, null, null);
     }
 
     /** As {@link #words(Program, Address, int)}; a veto by a straddling instruction is reported through
      *  {@code emit} (rule J1w STRADDLE_VETO: site, first slot, straddling instruction) when it is given. */
     public static boolean words(Program p, Address start, int count, Address site, Consumer<String> emit) throws Exception {
+        return words(p, start, count, false, site, emit);
+    }
+
+    static boolean words(Program p, Address start, int count, boolean straddle) throws Exception {
+        return words(p, start, count, straddle, null, null);
+    }
+
+    /** {@code straddle} (IT1b, inline interrupt words only): an unplayed speculative fall-through instruction that
+     *  starts inside the proven words but runs past their end is superseded too (its start is a proven word byte);
+     *  its bytes after the words return to undefined, and it is tagged WSHypothesis:IT1-superseded (H2 record). */
+    static boolean words(Program p, Address start, int count, boolean straddle, Address site, Consumer<String> emit) throws Exception {
         if (count <= 0 || WSRamCode.isRam(p, start)) return false;
         Address end = start.add(2L * count - 1);
         // J1w: an instruction that starts before the first slot and runs into it straddles the table: veto.
@@ -112,6 +123,14 @@ public final class WSInlineTables {
                     HexFormat.of().formatHex(head.getBytes())));
             return false;
         }
+        Instruction over = p.getListing().getInstructionContaining(end);
+        if (over != null && over.getMaxAddress().compareTo(end) > 0) {
+            if (!straddle || over.getAddress().compareTo(start) < 0) return false;
+            for (Address a : new AddressSet(end.next(), over.getMaxAddress()).getAddresses(true)) {
+                if (played(p, a)) return false;
+                for (Reference r : p.getReferenceManager().getReferencesTo(a)) if (r.getReferenceType().isFlow()) return false;
+            }
+        } else over = null;
         for (Address a : new AddressSet(start, end).getAddresses(true)) {
             if (played(p, a) || explicit(p.getFunctionManager().getFunctionContaining(a))) return false;
             for (Reference r : p.getReferenceManager().getReferencesTo(a))
@@ -119,7 +138,13 @@ public final class WSInlineTables {
         }
         // Speculative fallthrough into inline words is superseded by the proven dispatch.
         for (Instruction i : p.getListing().getInstructions(new AddressSet(start, end), true))
-            if (i.getMaxAddress().compareTo(end) > 0 || explicit(p.getFunctionManager().getFunctionContaining(i.getAddress()))) return false;
+            if (i != null && (i.getMaxAddress().compareTo(end) > 0 && (over == null || !i.getAddress().equals(over.getAddress()))
+                || explicit(p.getFunctionManager().getFunctionContaining(i.getAddress())))) return false;
+        if (over != null)
+            p.getBookmarkManager().setBookmark(over.getAddress(), BookmarkType.ANALYSIS, "WSHypothesis:IT1-superseded:" + over.getAddress(),
+                "IT1 H2 RECORD: unplayed fall-through instruction " + over + " (bytes "
+                + HexFormat.of().formatHex(over.getBytes()) + ") started inside proven inline words " + start + ".." + end
+                + " and was superseded by them; its bytes past the words are left undefined");
         for (Function f : p.getFunctionManager().getFunctions(new AddressSet(start, end), true))
             if (new AddressSet(start, end).contains(f.getEntryPoint())) p.getFunctionManager().removeFunction(f.getEntryPoint());
         for (Instruction i : p.getListing().getInstructions(new AddressSet(start, end), true))
@@ -454,7 +479,10 @@ public final class WSInlineTables {
                 }
                 Address start = i.getDefaultFallThrough();
                 if (!availableModel(p, segment, interrupt, cases.size())) continue;
-                if (!words(p, start, cases.size(), i.getAddress(), emit)) continue;
+                if (!words(p, start, cases.size(), interrupt, i.getAddress(), emit)) {
+                    emit.accept(String.format("{\"rule\":\"J3\",\"site\":\"%s\",\"outcome\":\"UNRESOLVED\",\"why\":\"WORDS_VETOED\",\"words\":%d}", i.getAddress(), cases.size()));
+                    continue;
+                }
                 Function delegate = model(p, segment, interrupt, cases.size(), monitor);
                 if (delegate == null) continue;
                 // Direct calls prioritize their primary ordinary call reference. Keep

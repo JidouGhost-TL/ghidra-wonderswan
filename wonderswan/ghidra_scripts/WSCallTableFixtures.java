@@ -280,6 +280,18 @@ public class WSCallTableFixtures extends GhidraScript {
             check(!WSInlineTables.modeled(p, at(p, 0x40)), "IT1a control: handler writing the stacked CS is not an inline dispatcher");
         } finally { done(p); }
     }
+    /** IT1b: speculative fall-through decoded from the INT straddles the end of the proven words (0x44-0x46). */
+    void interruptStraddle() throws Exception {
+        ProgramDB p = interrupt("it1b-straddle", 0x41, GENERAL, "10008000", true, false);
+        try {
+            new DisassembleCommand(at(p, 0x42), null, true).applyTo(p, monitor);
+            check(p.getListing().getInstructionContaining(at(p, 0x46)) != null, "IT1b straddle setup: fall-through decode covers 0x46");
+            repair(p, new WSEvidence());
+            check(WSInlineTables.modeled(p, at(p, 0x40)), "IT1b straddling speculative instruction superseded, site modeled");
+            check(p.getListing().getInstructionContaining(at(p, 0x46)) == null, "IT1b bytes after the words left undefined");
+            check(bookmark(p, at(p, 0x44), "WSHypothesis:IT1-superseded"), "IT1b superseded instruction recorded");
+        } finally { done(p); }
+    }
     /** IT1c: case 1 of the first dispatch holds a second inline dispatch, only reachable through it. */
     void interruptNested() throws Exception {
         byte[] m = fill(0x1000);
@@ -318,6 +330,7 @@ public class WSCallTableFixtures extends GhidraScript {
         all.put("IT1b-control-no-end", this::interruptNoEnd);
         all.put("IT1a-control-writes-cs", this::interruptWritesCs);
         all.put("IT1c-nested", this::interruptNested);
+        all.put("IT1b-straddling-fallthrough", this::interruptStraddle);
         for (var e : all.entrySet()) {
             if (!only.isEmpty() && !e.getKey().equals(only)) continue;
             int before = failures;
