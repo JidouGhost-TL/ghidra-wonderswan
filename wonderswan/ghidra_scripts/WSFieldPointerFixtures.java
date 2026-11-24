@@ -21,6 +21,10 @@ import jidoughost.wonderswan.WonderSwanLoader;
  * clobber:   the retf store routine with INC SI between the two stores: no pair, the handler stays undecoded.
  * mismatch:  the retf stores, but the dispatcher reads [BX+DI+9Eh]/[BX+DI+0A0h]: another field, nothing decoded.
  * ramseg:    the retf pair with segment 1000h (RAM): rejected, nothing decoded at F000:0200.
+ * u1call:    retf, with the handler calling a subroutine at F000:0240 (decoded through the handler's flow, no function
+ *            yet), and unreferenced code after the store routine's RET (F000:0056: PUSH AX; PUSH CX; CALL 0240h;
+ *            POP CX; POP AX; RET): rule U1 accepts it, because a call to an instruction kept code already calls is a
+ *            call to a subroutine entry (U1a), whether or not its function exists yet.
  *
  * Usage: headless post script on any program (it imports its own cartridges into a temporary project).
  */
@@ -62,7 +66,12 @@ public class WSFieldPointerFixtures extends GhidraScript {
             put(rom, DISPATCH, variant.equals("mismatch") ? "bb00048bbf9c008b819e00508b81a00050cb"
                 : "bb00048bb79c008b809e00508b80a00050cb");
         }
-        put(rom, HANDLER, "b80100a30003cb");                       // MOV AX,1; MOV [0300h],AX; RETF
+        if (variant.equals("u1call")) {
+            put(rom, HANDLER, "b80100e83a00cb");                   // MOV AX,1; CALL 0240h; RETF
+            put(rom, 0x240, "a30003c3");                           // MOV [0300h],AX; RET
+            put(rom, 0x56, "5051e8e5015958c3");                    // PUSH AX; PUSH CX; CALL 0240h; POP CX; POP AX; RET
+        } else
+            put(rom, HANDLER, "b80100a30003cb");                   // MOV AX,1; MOV [0300h],AX; RETF
         int f = rom.length - 16;
         Arrays.fill(rom, f, rom.length, (byte) 0);
         rom[f] = (byte) 0xea; rom[f + 4] = (byte) 0xf0;                 // JMP F000:0000
@@ -92,7 +101,7 @@ public class WSFieldPointerFixtures extends GhidraScript {
                 && (variant.equals("callf") ? last.toString().startsWith("CALLF") : last.toString().equals("RETF")),
                 "store routine and dispatcher decoded: " + last);
             Instruction h = l.getInstructionAt(at(p, HANDLER));
-            boolean positive = variant.equals("retf") || variant.equals("callf");
+            boolean positive = variant.equals("retf") || variant.equals("callf") || variant.equals("u1call");
             if (!positive) {
                 check(variant, h == null, "handler at F000:0200 not decoded: " + h);
                 return;
@@ -105,6 +114,14 @@ public class WSFieldPointerFixtures extends GhidraScript {
                 if (b.getCategory().equals("WSEvidence")) why = b.getComment();
             check(variant, why != null && why.startsWith("F6 field store"), "F6 evidence bookmark: " + why);
             check(variant, p.getBookmarkManager().getBookmarkCount(BookmarkType.ERROR) == 0, "no ERROR bookmarks");
+            if (variant.equals("u1call")) {
+                Instruction u = l.getInstructionAt(at(p, 0x56));
+                String u1 = null;
+                for (Bookmark b : p.getBookmarkManager().getBookmarks(at(p, 0x56)))
+                    if (b.getCategory().equals("WSEvidence")) u1 = b.getComment();
+                check(variant, u != null && l.getInstructionAt(at(p, 0x5d)) != null, "unreferenced code at F000:0056 decoded: " + u);
+                check(variant, u1 != null && u1.startsWith("U1"), "U1 bookmark: " + u1);
+            }
         } finally {
             project.close();
         }
@@ -114,7 +131,7 @@ public class WSFieldPointerFixtures extends GhidraScript {
     public void run() throws Exception {
         File dir = Files.createTempDirectory("ws-field-pointer").toFile();
         String[] args = getScriptArgs();
-        List<String> variants = args.length > 0 ? List.of(args) : List.of("retf", "callf", "clobber", "mismatch", "ramseg");
+        List<String> variants = args.length > 0 ? List.of(args) : List.of("retf", "callf", "clobber", "mismatch", "ramseg", "u1call");
         for (String v : variants) {
             try { fixture(dir, v); }
             catch (Exception e) { check(v, false, "fixture raised " + e); }

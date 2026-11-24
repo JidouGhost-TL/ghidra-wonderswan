@@ -39,6 +39,9 @@ import ghidra.util.task.TaskMonitor;
  *    absolute memory operand / I/O port that existing code also uses, or -- worth two -- at least two pushes whose
  *    stack depth returns to zero at every return on every path) and at least 3 instructions. Disassembled
  *    and made a function (tag WS_UNREFERENCED). Candidates with fewer anchors are reported (WEAK) and left as bytes.
+ * U1a: a direct call to the start of an existing instruction that existing code already reaches by a CALL counts as
+ *    a call to a function entry (the function is created by later analysis; code a phase-2 rule just disassembled
+ *    has none yet), so whether a candidate is accepted does not depend on when that function appears.
  * Both repeat until no new candidate is accepted (an accepted function exposes the bytes after its own end).
  */
 final class WSGapCode {
@@ -258,6 +261,9 @@ final class WSGapCode {
             if (ft.isCall()) {
                 for (Address c : pi.getFlows()) {
                     if (p.getFunctionManager().getFunctionAt(c) != null) { calls.add(c); anchors++; continue; }
+                    // U1a: an existing instruction that kept code already calls is a subroutine entry whose function
+                    // later analysis creates (code a phase-2 rule just disassembled has no function yet)
+                    if (calledEntry(c)) { calls.add(c); anchors++; continue; }
                     // a call into undefined bytes of the same block: an internal subroutine, walked as part of the candidate
                     CodeUnit cc = listing.getCodeUnitContaining(c);
                     if (blk.contains(c) && cc instanceof Data cd && !cd.isDefined()) { internal.add(c); work.push(new Object[] { c, 0 }); continue; }
@@ -324,5 +330,13 @@ final class WSGapCode {
                 emit.accept(String.format("{\"rule\":\"U1\",\"start\":\"%s\",\"after\":\"called from candidate %s\",\"outcome\":\"UNREFERENCED_FUNCTION\"}", c, s)); }
         }
         if (function) new CreateFunctionCmd(s).applyTo(p, monitor);
+    }
+
+    /** U1a: an instruction start that an existing instruction outside the candidate calls directly. */
+    boolean calledEntry(Address c) {
+        if (listing.getInstructionAt(c) == null) return false;
+        for (Reference r : p.getReferenceManager().getReferencesTo(c))
+            if (r.getReferenceType().isCall() && listing.getInstructionAt(r.getFromAddress()) != null) return true;
+        return false;
     }
 }
