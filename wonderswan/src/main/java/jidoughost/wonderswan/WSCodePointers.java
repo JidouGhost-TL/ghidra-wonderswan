@@ -51,7 +51,7 @@ import ghidra.util.task.TaskMonitor;
  *     stored into exactly that field pair (same segment register, same index registers, same displacements) in one
  *     fall-through chain, with none of those registers written between the two stores, is a code pointer (as F2).
  *     Fields are matched by their addressing form, so the rule runs after F1 and never applies to CS-relative words
- *     (CS tables are rule J1's). Return points pushed below a field dispatch are F4 return points as well.
+ *     (CS tables are rule J1's) or to BP-based words (stack-frame slots: [BP+6] of one function is not another's). Return points pushed below a field dispatch are F4 return points as well.
  * A target is accepted only when it lies in an initialised executable block, does not fall inside an existing
  * instruction or defined data, and decodes; otherwise it is reported (OFFCUT, DATA, UNDECODABLE, WINDOW (bank
  * unknown), RAM, OUT_OF_ROM). The rule repeats until no new targets appear (new code can hold more stores).
@@ -542,6 +542,7 @@ final class WSCodePointers {
             else regsUsed.add(term.group(2));
         }
         if (pos != expr.length() || regsUsed.isEmpty()) return null;
+        if (regsUsed.contains("BP")) return null;   // a stack-frame slot: [BP+d] of one function is not another's
         Collections.sort(regsUsed);
         return new Field(segName, String.join("+", regsUsed), disp & 0xFFFF);
     }
