@@ -1,0 +1,126 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+import java.io.File;
+import java.nio.file.*;
+import java.util.*;
+import ghidra.app.script.GhidraScript;
+import ghidra.base.project.GhidraProject;
+import ghidra.program.model.address.*;
+import ghidra.program.model.listing.*;
+import jidoughost.wonderswan.WonderSwanLoader;
+
+/**
+ * Rule F6 (far code-pointer fields) on synthetic cartridges, through the real import and default auto-analysis.
+ * The store routine (F000:0040) and the dispatcher (F000:0080) are reached only through CALLs behind a branch that
+ * does not execute, so execution evidence observes neither the dispatch nor the handler at F000:0200; the handler
+ * sits between erased bytes, so nothing but the stored pointer names it.
+ *
+ * retf:      MOV SI,[BX+9Ch]; MOV AX,F000h; MOV [BX+SI+9Eh],AX; MOV AX,0200h; MOV [BX+SI+0A0h],AX, dispatched by
+ *            MOV AX,[BX+SI+9Eh]; PUSH AX; MOV AX,[BX+SI+0A0h]; PUSH AX; RETF (segment word first, as pushed):
+ *            the handler is decoded and becomes a function with an F6 evidence bookmark.
+ * callf:     offset to [BX+SI+20h], segment to [BX+SI+22h], dispatched by CALLF [BX+SI+20h]: same expectations.
+ * clobber:   the retf store routine with INC SI between the two stores: no pair, the handler stays undecoded.
+ * mismatch:  the retf stores, but the dispatcher reads [BX+DI+9Eh]/[BX+DI+0A0h]: another field, nothing decoded.
+ * ramseg:    the retf pair with segment 1000h (RAM): rejected, nothing decoded at F000:0200.
+ *
+ * Usage: headless post script on any program (it imports its own cartridges into a temporary project).
+ */
+public class WSFieldPointerFixtures extends GhidraScript {
+    int checks, failures;
+
+    void check(String fixture, boolean ok, String message) {
+        checks++;
+        if (!ok) failures++;
+        String line = (ok ? "ok   " : "FAIL ") + fixture + ": " + message;
+        if (ok) println(line); else printerr(line);
+    }
+
+    static void put(byte[] rom, int off, String hex) {
+        byte[] v = HexFormat.of().parseHex(hex);
+        System.arraycopy(v, 0, rom, 0x10000 + off, v.length);
+    }
+
+    static final int STORE = 0x40, DISPATCH = 0x80, HANDLER = 0x200;
+
+    /** 128 KiB cartridge: code at F000:0000 (file 0x10000), everything else erased (FF). */
+    static byte[] rom(String variant) {
+        byte[] rom = new byte[0x20000];
+        Arrays.fill(rom, (byte) 0xff);
+        // CLI; XOR AX,AX; MOV DS,AX; MOV AL,[0100h]; CMP AL,5Ah; JNZ spin; CALL 0040h; CALL 0080h; spin: JMP spin
+        put(rom, 0x00, "fa31c08ed8a000013c5a7506e83100e86e00ebfe");
+        String seg = variant.equals("ramseg") ? "0010" : "00f0";
+        if (variant.equals("callf")) {
+            // MOV BX,0400h; MOV SI,[BX+9Ch]; MOV AX,0200h; MOV [BX+SI+20h],AX; MOV AX,F000h; MOV [BX+SI+22h],AX; RET
+            put(rom, STORE, "bb00048bb79c00b80002898020" + "00" + "b8" + seg + "898022" + "00" + "c3");
+            // MOV BX,0400h; MOV SI,[BX+9Ch]; CALLF [BX+SI+20h]; RET
+            put(rom, DISPATCH, "bb00048bb79c00ff982000c3");
+        } else {
+            // MOV BX,0400h; MOV SI,[BX+9Ch]; MOV AX,seg; MOV [BX+SI+9Eh],AX; [INC SI;] MOV AX,0200h; MOV [BX+SI+0A0h],AX; RET
+            put(rom, STORE, "bb00048bb79c00b8" + seg + "89809e00" + (variant.equals("clobber") ? "46" : "")
+                + "b800028980a000c3");
+            // MOV BX,0400h; MOV SI,[BX+9Ch]; MOV AX,[BX+SI+9Eh]; PUSH AX; MOV AX,[BX+SI+0A0h]; PUSH AX; RETF
+            // (mismatch: the same through BX+DI)
+            put(rom, DISPATCH, variant.equals("mismatch") ? "bb00048bbf9c008b819e00508b81a00050cb"
+                : "bb00048bb79c008b809e00508b80a00050cb");
+        }
+        put(rom, HANDLER, "b80100a30003cb");                       // MOV AX,1; MOV [0300h],AX; RETF
+        int f = rom.length - 16;
+        Arrays.fill(rom, f, rom.length, (byte) 0);
+        rom[f] = (byte) 0xea; rom[f + 4] = (byte) 0xf0;                 // JMP F000:0000
+        rom[f + 7] = 0x01;                                              // colour
+        int sum = 0;
+        for (int i = 0; i < rom.length - 2; i++) sum += rom[i] & 0xff;
+        rom[f + 14] = (byte) sum; rom[f + 15] = (byte) (sum >> 8);
+        return rom;
+    }
+
+    Address at(Program p, int off) {
+        return ((SegmentedAddressSpace) p.getAddressFactory().getDefaultAddressSpace()).getAddress(0xf000, off);
+    }
+
+    void fixture(File dir, String variant) throws Exception {
+        Path file = dir.toPath().resolve(variant + ".ws");
+        Files.write(file, rom(variant));
+        GhidraProject project = GhidraProject.createProject(dir.getAbsolutePath(), "field-pointer-" + variant, true);
+        try {
+            Program p = project.importProgram(file.toFile(), WonderSwanLoader.class, currentProgram.getLanguage(),
+                currentProgram.getCompilerSpec());
+            int tx = p.startTransaction("analysis");
+            try { analyzeAll(p); } finally { p.endTransaction(tx, true); }
+            Listing l = p.getListing();
+            Instruction last = l.getInstructionAt(at(p, variant.equals("callf") ? DISPATCH + 7 : DISPATCH + 17));
+            check(variant, l.getInstructionAt(at(p, STORE)) != null && last != null
+                && (variant.equals("callf") ? last.toString().startsWith("CALLF") : last.toString().equals("RETF")),
+                "store routine and dispatcher decoded: " + last);
+            Instruction h = l.getInstructionAt(at(p, HANDLER));
+            boolean positive = variant.equals("retf") || variant.equals("callf");
+            if (!positive) {
+                check(variant, h == null, "handler at F000:0200 not decoded: " + h);
+                return;
+            }
+            check(variant, h != null && h.toString().startsWith("MOV AX"), "handler at F000:0200 decoded: " + h);
+            Function fn = p.getFunctionManager().getFunctionAt(at(p, HANDLER));
+            check(variant, fn != null, "handler is a function: " + fn);
+            String why = null;
+            for (Bookmark b : p.getBookmarkManager().getBookmarks(at(p, HANDLER)))
+                if (b.getCategory().equals("WSEvidence")) why = b.getComment();
+            check(variant, why != null && why.startsWith("F6 field store"), "F6 evidence bookmark: " + why);
+            check(variant, p.getBookmarkManager().getBookmarkCount(BookmarkType.ERROR) == 0, "no ERROR bookmarks");
+        } finally {
+            project.close();
+        }
+    }
+
+    @Override
+    public void run() throws Exception {
+        File dir = Files.createTempDirectory("ws-field-pointer").toFile();
+        String[] args = getScriptArgs();
+        List<String> variants = args.length > 0 ? List.of(args) : List.of("retf", "callf", "clobber", "mismatch", "ramseg");
+        for (String v : variants) {
+            try { fixture(dir, v); }
+            catch (Exception e) { check(v, false, "fixture raised " + e); }
+        }
+        println("WSFieldPointerFixtures: checks=" + checks + " failures=" + failures);
+        if (failures != 0) throw new AssertionError("WSFieldPointerFixtures failures=" + failures);
+        println("WSFieldPointerFixtures: PASS checks=" + checks);
+    }
+}

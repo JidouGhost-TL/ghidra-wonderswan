@@ -44,6 +44,14 @@ import ghidra.util.task.TaskMonitor;
  *     or the number of an immediate INT in the listing. Other pairs are rejected (IVT_UNPROVEN, one F2v line each):
  *     a word pair at a low DS offset under a defaulted DS is an ordinary variable, not a vector. F3 setters into
  *     vector slots follow the same rule.
+ * F6  far code-pointer fields: a far pointer held in a register-relative word pair (an array or structure slot such as
+ *     [BX+SI+9Eh]/[BX+SI+0A0h], whose address is not constant) that kept code transfers to: PUSH of the two words
+ *     (directly or through register loads) then RETF, or CALLF/JMPF dword ptr [field]. The dispatch fixes which word
+ *     is the segment (pushed first for RETF; the high word for CALLF/JMPF). A constant segment and a constant offset
+ *     stored into exactly that field pair (same segment register, same index registers, same displacements) in one
+ *     fall-through chain, with none of those registers written between the two stores, is a code pointer (as F2).
+ *     Fields are matched by their addressing form, so the rule runs after F1 and never applies to CS-relative words
+ *     (CS tables are rule J1's). Return points pushed below a field dispatch are F4 return points as well.
  * A target is accepted only when it lies in an initialised executable block, does not fall inside an existing
  * instruction or defined data, and decodes; otherwise it is reported (OFFCUT, DATA, UNDECODABLE, WINDOW (bank
  * unknown), RAM, OUT_OF_ROM). The rule repeats until no new targets appear (new code can hold more stores).
@@ -54,13 +62,27 @@ final class WSCodePointers {
 
     /** A tracked value: a constant (with the instruction that defined it), a load from a constant linear
      *  address, or the value a register had at the function entry (setter detection). */
-    record Val(Integer c, Address def, Long load, String input) {
+    record Val(Integer c, Address def, Long load, String input, Field fld) {
+        Val(Integer c, Address def, Long load, String input) { this(c, def, load, input, null); }
+        static Val field(Field f) { return new Val(null, null, null, null, f); }
         static Val konst(int v, Address d) { return new Val(v & 0xFFFF, d, null, null); }
         static Val load(long m) { return new Val(null, null, m, null); }
         static Val in(String r) { return new Val(null, null, null, r); }
     }
 
     record Store(Address site, long m, Val v) { }
+    /** F6: a register-relative memory word by its addressing form: segment register, sorted index registers,
+     *  16-bit displacement. */
+    record Field(String seg, String regs, int disp) {
+        Field plus(int d) { return new Field(seg, regs, (disp + d) & 0xFFFF); }
+        boolean sameBase(Field o) { return o != null && seg.equals(o.seg) && regs.equals(o.regs); }
+        boolean uses(String reg) { return seg.equals(reg) || Arrays.asList(regs.split("\\+")).contains(reg); }
+        @Override public String toString() { return String.format("%s:[%s+0x%x]", seg, regs, disp); }
+    }
+    /** F6: the segment word of a far code-pointer field and the dispatch that proved it. */
+    record FieldUse(Field seg, Address site) { }
+    /** F6: a constant segment and offset stored into a candidate field pair in one chain. */
+    record FieldPair(Field off, Field seg, int segValue, int offValue, Address site) { }
     record Target(int seg, int off, Address from, String via, boolean function) { }
 
     final Program p;
@@ -74,6 +96,7 @@ final class WSCodePointers {
 
     final Map<Long, String> farVars = new TreeMap<>(), nearVars = new TreeMap<>();   // M -> evidence (use site)
     final Map<Long, Integer> nearVarCs = new HashMap<>();
+    final Map<Field, FieldUse> farFields = new LinkedHashMap<>();   // F6: offset word -> segment word + use site
     /** Accepted code-pointer targets installed through the interrupt vector table (for rules V1/M1/T1). */
     final Set<Address> ivtHandlers = new HashSet<>();
     final Set<String> done = new HashSet<>();
@@ -105,8 +128,8 @@ final class WSCodePointers {
     }
 
     String summary() {
-        return String.format("F1-F5 code pointers: far variables %d, near variables %d, passes %d, new functions %d, new code %d, return points %d, existing %d, rejected %d %s, weak data cleared %d",
-            farVars.size(), nearVars.size(), passes, newFunctions, newCode, returnPoints, existing, rejected, rejects, weakDataCleared);
+        return String.format("F1-F6 code pointers: far variables %d, near variables %d, far fields %d, field targets %d, passes %d, new functions %d, new code %d, return points %d, existing %d, rejected %d %s, weak data cleared %d",
+            farVars.size(), nearVars.size(), farFields.size(), fieldTargets, passes, newFunctions, newCode, returnPoints, existing, rejected, rejects, weakDataCleared);
     }
 
     // ---- one pass ------------------------------------------------------------------------------------------
@@ -116,6 +139,10 @@ final class WSCodePointers {
     final List<long[]> farPairs = new ArrayList<>();                     // {M, seg, off} from constant store pairs
     final Map<Long, Address> farPairSite = new HashMap<>();
     final List<Target> returns = new ArrayList<>();
+    final List<FieldPair> fieldPairs = new ArrayList<>();
+    /** F6: field stores of the current fall-through chain (dropped when a register of the field is written). */
+    final Map<Field, Val> chainFields = new HashMap<>();
+    int fieldTargets;
 
     /** F2v: true for an interrupt-vector slot not otherwise known as a far variable. */
     boolean ivtOnly(long m) { return m < 0x400 && (m & 3) == 0 && !farVars.containsKey(m); }
@@ -166,7 +193,7 @@ final class WSCodePointers {
     }
 
     int pass() throws Exception {
-        stores.clear(); callState.clear(); farPairs.clear(); farPairSite.clear(); returns.clear();
+        stores.clear(); callState.clear(); farPairs.clear(); farPairSite.clear(); returns.clear(); fieldPairs.clear();
         track();
         Set<Integer> used = usedVectors();
         List<Target> targets = new ArrayList<>();
@@ -175,6 +202,16 @@ final class WSCodePointers {
             Address site = farPairSite.get(fp[0] << 20 ^ fp[1] << 16 ^ fp[2]);
             if (isFarVar(fp[0]) && !vectorRejected(fp[0], fp[3] != 0, used, site, "F2 store " + varName(fp[0])))
                 targets.add(new Target((int) fp[1], (int) fp[2], farPairSite.get(fp[0] << 20 ^ fp[1] << 16 ^ fp[2]), "F2 store " + varName(fp[0]), true));
+        }
+        // F6: constant pairs stored into far code-pointer fields
+        Set<String> seen = new HashSet<>();
+        for (FieldPair fp : fieldPairs) {
+            FieldUse u = farFields.get(fp.off());
+            if (u == null || !u.seg().equals(fp.seg())) continue;
+            if (!seen.add(fp.site() + "/" + fp.segValue() + ":" + fp.offValue())) continue;
+            fieldTargets++;
+            targets.add(new Target(fp.segValue(), fp.offValue(), fp.site(),
+                "F6 field store " + fp.seg() + "/" + fp.off() + " (dispatch " + u.site() + ")", true));
         }
         for (Store s : stores) {
             if (s.v().c() == null || !nearVars.containsKey(s.m())) continue;
@@ -281,7 +318,7 @@ final class WSCodePointers {
             monitor.checkCancelled();
             boolean cont = prev != null && ins.getAddress().equals(prev.getFallThrough()) && !joins(ins);
             if (!cont) {
-                regs.clear(); stack.clear(); chainStores.clear(); segProven.clear();
+                regs.clear(); stack.clear(); chainStores.clear(); segProven.clear(); chainFields.clear();
                 contextDs(ins.getAddress(), regs);
             }
             prev = ins;
@@ -312,10 +349,19 @@ final class WSCodePointers {
         if (mn.equals("RETF") && stack.size() >= 2) {
             Iterator<Val> it = stack.iterator();
             Val off = it.next(), seg = it.next();
+            boolean dispatch = false;
             if (off != null && seg != null && off.load() != null && seg.load() != null && seg.load() == off.load() + 2) {
                 long m = off.load();
+                dispatch = true;
                 if (farVars.putIfAbsent(m, a.toString()) == null)
                     emit.accept(String.format("{\"rule\":\"F1\",\"var\":\"%05x\",\"kind\":\"far\",\"use\":\"%s\",\"shape\":\"PUSH_RETF\"}", m, a));
+            }
+            else if (off != null && seg != null && off.fld() != null && off.fld().sameBase(seg.fld())
+                    && (seg.fld().equals(off.fld().plus(2)) || seg.fld().equals(off.fld().plus(-2)))) {
+                dispatch = true;
+                addFarField(off.fld(), seg.fld(), a, "PUSH_RETF");
+            }
+            if (dispatch) {
                 if (it.hasNext()) {                                                    // F4: return address below the pair
                     Val roff = it.next(), rseg = it.hasNext() ? it.next() : null;
                     if (roff != null && rseg != null && roff.c() != null && rseg.c() != null)
@@ -332,6 +378,8 @@ final class WSCodePointers {
             Long m = ea(mm, regs);
             if (m != null && farVars.putIfAbsent(m, a.toString()) == null)
                 emit.accept(String.format("{\"rule\":\"F1\",\"var\":\"%05x\",\"kind\":\"far\",\"use\":\"%s\",\"shape\":\"%s_MEM\"}", m, a, mn));
+            Field f = m == null ? field(mm) : null;
+            if (f != null) addFarField(f, f.plus(2), a, mn + "_MEM");
         }
         else if ((mn.equals("CALL") || mn.equals("JMP")) && mm.find() && !"CS".equals(mm.group(1))) {
             Long m = ea(mm, regs);
@@ -342,6 +390,7 @@ final class WSCodePointers {
         if (mn.startsWith("CALL") || mn.startsWith("INT")) {
             callState.put(a, new HashMap<>(regs));
             regs.clear();
+            chainFields.clear();   // the callee may change any register of a field
             contextDs(ins.getFallThrough(), regs);   // the DS the analysis assumes after the call (context)
             return;
         }
@@ -362,6 +411,15 @@ final class WSCodePointers {
                     segProven.put(m, lastSegProven || "DS".equals(lastSegName) && observedDs0(a));
                     pair(m, chainStores, a);
                 }
+                else {
+                    Field f = field(d);
+                    if (f != null) {
+                        Val v = src.startsWith("0X") ? Val.konst(Integer.parseInt(src.substring(2), 16), a) : regs.get(src);
+                        if (v != null && v.c() != null && v.def() == null) v = Val.konst(v.c(), a);
+                        if (v == null || v.c() == null) chainFields.remove(f);
+                        else { chainFields.put(f, v); pairField(f, a); }
+                    }
+                }
             }
         }
         // register / stack effects
@@ -370,14 +428,15 @@ final class WSCodePointers {
             Matcher d = MEMOP.matcher(op);
             if (R16.contains(op)) stack.push(orNull(regs.get(op)));
             else if (op.startsWith("0X")) stack.push(Val.konst(Integer.parseInt(op.substring(2), 16), a));
-            else if (d.matches()) { Long m = ea(d, regs); stack.push(m == null ? new Val(null, null, null, null) : Val.load(m)); }
+            else if (d.matches()) { Long m = ea(d, regs); Field f = m == null ? field(d) : null;
+                stack.push(m != null ? Val.load(m) : f != null ? Val.field(f) : new Val(null, null, null, null)); }
             else stack.push(new Val(null, null, null, null));
             return;
         }
         if (mn.equals("POP")) {
             String op = t.substring(3);
             Val v = stack.isEmpty() ? null : stack.pop();
-            if (R16.contains(op)) { if (v == null || isUnknown(v)) regs.remove(op); else regs.put(op, v); }
+            if (R16.contains(op)) { dropFields(op); if (v == null || isUnknown(v)) regs.remove(op); else regs.put(op, v); }
             return;
         }
         if (mn.equals("PUSHA")) { for (int k = 0; k < 8; k++) stack.push(new Val(null, null, null, null)); return; }
@@ -395,7 +454,8 @@ final class WSCodePointers {
             Matcher d = MEMOP.matcher(src);
             if (src.startsWith("0X")) nv = Val.konst(Integer.parseInt(src.substring(2), 16), a);
             else if (R16.contains(src)) nv = regs.get(src);
-            else if (d.matches()) { Long m = ea(d, regs); nv = m == null ? null : Val.load(m); }
+            else if (d.matches()) { Long m = ea(d, regs); Field f = m == null ? field(d) : null;
+                nv = m != null ? Val.load(m) : f != null ? Val.field(f) : null; }
         }
         else if (z.matches()) { set = z.group(1); nv = Val.konst(0, a); }
         else {
@@ -416,11 +476,75 @@ final class WSCodePointers {
             if (n.length() == 3 && n.startsWith("E")) n = n.substring(1);   // EAX-style bases, if any
             regs.remove(n.toUpperCase());
             regs.remove(r.getName().toUpperCase());
+            dropFields(n.toUpperCase());
+            dropFields(r.getName().toUpperCase());
         }
+        if (set != null) dropFields(set);
         if (set != null) { if (nv == null) regs.remove(set); else regs.put(set, nv); }
     }
 
-    static boolean isUnknown(Val v) { return v.c() == null && v.load() == null && v.input() == null; }
+    static boolean isUnknown(Val v) { return v.c() == null && v.load() == null && v.input() == null && v.fld() == null; }
+
+    /** F6: a far code-pointer field proven by a dispatch (first proof wins; a second, different segment word for
+     *  the same offset word is reported and the field is dropped as ambiguous). */
+    final Set<Field> ambiguousFields = new HashSet<>();
+    void addFarField(Field off, Field seg, Address a, String shape) {
+        if (ambiguousFields.contains(off)) return;
+        FieldUse old = farFields.get(off);
+        if (old != null) {
+            if (old.seg().equals(seg)) return;
+            farFields.remove(off);
+            ambiguousFields.add(off);
+            emit.accept(String.format("{\"rule\":\"F6\",\"field\":\"%s\",\"use\":\"%s\",\"shape\":\"%s\",\"outcome\":\"AMBIGUOUS\",\"other\":\"%s\"}", off, a, shape, old.site()));
+            return;
+        }
+        farFields.put(off, new FieldUse(seg, a));
+        emit.accept(String.format("{\"rule\":\"F6\",\"field\":\"%s\",\"segment\":\"%s\",\"kind\":\"far\",\"use\":\"%s\",\"shape\":\"%s\"}", off, seg, a, shape));
+    }
+
+    /** F6: a register write ends the chain's knowledge of every field addressed through it. */
+    void dropFields(String reg) {
+        if (chainFields.isEmpty()) return;
+        String r = reg.length() == 2 && (reg.endsWith("L") || reg.endsWith("H")) && "ABCD".indexOf(reg.charAt(0)) >= 0
+            ? reg.charAt(0) + "X" : reg;
+        chainFields.keySet().removeIf(f -> f.uses(r));
+    }
+
+    /** F6 pairing: a constant stored at a field and one at the same base, displacement +-2, in this chain. Both
+     *  orientations are kept; the dispatch decides which word is the segment. */
+    void pairField(Field f, Address site) {
+        for (int dd : new int[] { 2, -2 }) {
+            Field o = f.plus(dd);
+            Val here = chainFields.get(f), there = chainFields.get(o);
+            if (here == null || there == null || here.c() == null || there.c() == null) continue;
+            Address s = here.def() != null ? here.def() : site;
+            fieldPairs.add(new FieldPair(f, o, there.c(), here.c(), s));   // offset here, segment there
+            fieldPairs.add(new FieldPair(o, f, here.c(), there.c(), s));   // offset there, segment here
+        }
+    }
+
+    /** F6: the addressing form of a memory operand with at least one index register (CS-relative: none, rule J1). */
+    Field field(Matcher d) {
+        String expr = d.group(2);
+        String segName = d.group(1) != null ? d.group(1) : expr.contains("BP") ? "SS" : "DS";
+        if (segName.equals("CS")) return null;
+        Matcher term = Pattern.compile("([+-]?)(0X[0-9A-F]+|AX|BX|CX|DX|SI|DI|BP)").matcher(expr);
+        int pos = 0, disp = 0;
+        List<String> regsUsed = new ArrayList<>();
+        while (term.find()) {
+            if (term.start() != pos) return null;
+            pos = term.end();
+            if (term.group(2).startsWith("0X")) {
+                int v = Integer.parseInt(term.group(2).substring(2), 16);
+                disp += term.group(1).equals("-") ? -v : v;
+            }
+            else if (term.group(1).equals("-")) return null;
+            else regsUsed.add(term.group(2));
+        }
+        if (pos != expr.length() || regsUsed.isEmpty()) return null;
+        Collections.sort(regsUsed);
+        return new Field(segName, String.join("+", regsUsed), disp & 0xFFFF);
+    }
     static Val orNull(Val v) { return v == null ? new Val(null, null, null, null) : v; }
 
     void addNear(long m, int cs, Address a, String shape) {
@@ -474,7 +598,9 @@ final class WSCodePointers {
         Deque<Val> stack = new ArrayDeque<>();
         Map<Long, Val> chain = new HashMap<>();
         segProven.clear();
+        chainFields.clear();
         int before = stores.size();
+        int pairsBefore = fieldPairs.size();
         for (int n = 0; ins != null && n < 48; n++) {
             if (n > 0 && joins(ins)) break;
             String mn = ins.getMnemonicString().toUpperCase();
@@ -486,6 +612,8 @@ final class WSCodePointers {
         }
         for (Store s : stores.subList(before, stores.size())) if (s.v().input() != null) out.put(s.m(), s.v().input());
         stores.subList(before, stores.size()).clear();
+        fieldPairs.subList(pairsBefore, fieldPairs.size()).clear();   // setter chains carry inputs, not pointers
+        chainFields.clear();
         return out;
     }
 
