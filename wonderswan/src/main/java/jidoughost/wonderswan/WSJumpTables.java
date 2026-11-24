@@ -111,6 +111,25 @@ import ghidra.util.task.TaskMonitor;
  * Stop rules: EXECUTED_CODE (entry slot executed), TABLE_BOUNDARY (next recovered table), OWN_TARGET (J1j), OUT_OF_ROM,
  *   MID_INSTRUCTION (inside an executed instruction), DEFINED_DATA, UNDECODABLE (J1k), SELF; cap 64.
  * Evidence check: observed targets must be a subset; missing ones are added and reported.
+ * CT1a: far call tables. CALLF CS:[reg(+d)] (or a two-register form, CT1b) reads 4-byte slots (offset word, segment
+ *   word); the index slice, bounds and stop rules are those of J1 with 4-byte slots (a byte index bounds the table at
+ *   256 << (shift-2) entries). A 0000:0000 slot is empty (J1d). A slot whose segment is RAM/SRAM (< 0x2000) or a bank
+ *   window (0x2000-0x3FFF) other than the site's own segment ends the table (FAR_RAM / FAR_BANK_WINDOW): the bank of a
+ *   window target is unknown. Each target is decoded with its own segment as CS. CALLF sites without a CS-relative
+ *   operand (pointer from RAM, e.g. ES:[DI+4]) are not table sites. Unresolved CALLF sites are reported only (never
+ *   quarantined: J1l applies to near sites as before).
+ * CT1b: two-register CS operands [BX|BP + SI|DI (+d)] (direct site or the MOV reg load of a CALL/JMP reg site): when
+ *   exactly one of the two registers holds a constant at the access (its last write is MOV reg,imm / LEA reg,[imm],
+ *   reached by fall-through only, no CALL/INT in between, as J1i), that constant plus d is the table base and the
+ *   other register is the index; every J1 index rule then applies to it.
+ * CT1c: observed span. A table whose end is not proven (J1b unbounded index or J1c byte index with a weak stop) is
+ *   still a contiguous array starting at its proven constant base: every slot from the base up to the slot of the
+ *   farthest observed target of this site is a table slot. When every observed target of the site is found in a slot
+ *   before the weak stop, slots 0..span are kept (decoded like any recovered table); slots after the span up to the
+ *   weak stop are H2 hypotheses (tagged WSHypothesis:CT1c on the slot, not decoded). No observed target: unresolved
+ *   as before.
+ * CT1d (J1o extended to the segment end): a near slot 0xFFFF (last byte of the code segment, where the IP wraps) and a
+ *   far slot FFFF:FFFF (past 1 MiB) are skipped like empty slots: no routine entry can live there.
  */
 public final class WSJumpTables {
     static final Pattern MEM = Pattern.compile("word ptr CS:\\[(BX|SI|DI|BP)(?: ?([+-]) ?0x([0-9a-f]+))?\\]", Pattern.CASE_INSENSITIVE);
@@ -123,6 +142,8 @@ public final class WSJumpTables {
         List<Integer> slotOf = new ArrayList<>(); // slot index of each target
         List<Integer> emptySlots = new ArrayList<>();
         int base, disp, table, cap = 64;
+        int width = 2;                          // CT1a: 4 for far (offset, segment) slots
+        String ct1;                             // CT1a/b/c provenance (null: plain J1)
         TreeSet<Integer> maskOffsets;
         Set<Address> baseAdds = new HashSet<>();  // J1i: ADD idx,reg2 instructions that added a constant base
         String baseVia = "direct", j1iMiss;       // J1i provenance / why a candidate base register was not constant
@@ -361,8 +382,8 @@ public final class WSJumpTables {
             if (tb.equals(tableStart)) continue;
             long off;
             try { off = tb.subtract(tableStart); } catch (Exception e) { continue; }
-            if (off <= 0 || off >= 2L * r.slots || (off & 1) != 0) continue;
-            int lim = (int) (off / 2);
+            if (off <= 0 || off >= (long) r.width * r.slots || off % r.width != 0) continue;
+            int lim = (int) (off / r.width);
             r.slots = lim;
             r.targets = trimToSlots(r, lim);
             r.empty = (int) r.emptySlots.stream().filter(k -> k < lim).count();
@@ -381,7 +402,8 @@ public final class WSJumpTables {
             monitor.checkCancelled();
             if (!ins.getFlowType().isComputed()) continue;
             String mn = ins.getMnemonicString().toUpperCase();
-            if (!(mn.equals("JMP") || mn.equals("CALL"))) continue;
+            // CT1a: a far call through a CS-relative operand is a table site; other far calls are not
+            if (!(mn.equals("JMP") || mn.equals("CALL") || mn.equals("CALLF") && csPrefixed(ins))) continue;
             if (done.contains(ins.getAddress())) continue;
             seen.add(ins.getAddress());
             recs.put(ins, recover(ins));
@@ -419,9 +441,9 @@ public final class WSJumpTables {
             if (ra.tableAddress == null || rb.tableAddress == null ||
                     !ra.tableAddress.getAddressSpace().equals(rb.tableAddress.getAddressSpace())) continue;
             long distance = rb.tableAddress.subtract(ra.tableAddress);
-            if (distance > 0 && distance < 2L * ra.slots) {
+            if (distance > 0 && distance < (long) ra.width * ra.slots) {
                 // keep only targets read from slots before the next table
-                int lim = (int) (distance / 2);
+                int lim = (int) (distance / ra.width);
                 ra.slots = lim;
                 ra.targets = trimToSlots(ra, lim);
                 ra.empty = (int) ra.emptySlots.stream().filter(k -> k < lim).count();
@@ -672,6 +694,11 @@ public final class WSJumpTables {
      *  sites stay out of `done' so every later pass re-attempts them with the guessed references removed. */
     void handleUnresolved(Instruction ins, Rec r) throws Exception {
         Address site = ins.getAddress();
+        if (ins.getMnemonicString().equalsIgnoreCase("CALLF")) {   // CT1a: report only, never quarantine
+            done.add(site);
+            if (reported.add(site)) emitUnresolved(ins, r);
+            return;
+        }
         if (!quarantined.containsKey(site) && quarantineTrigger(ins)) {
             quarantine(ins);
             if (reported.add(site)) emitUnresolved(ins, r);
@@ -749,11 +776,13 @@ public final class WSJumpTables {
         int cs = csOf(ins.getAddress());
         for (long o : obs) if (!got.contains(o)) {
             missing.add(String.format("%05x", o));
-            r.targets.add(seg(cs, (int) ((o - ((long) cs << 4)) & 0xFFFF)));
+            // CT1a: a far target's segment is not the site's; use the canonical linear-window segment
+            r.targets.add(r.width == 4 ? space.getAddress((int) ((o >> 4) & 0xF000), (int) (o & 0xFFFF))
+                : seg(cs, (int) ((o - ((long) cs << 4)) & 0xFFFF)));
         }
         // J1z: a CALL table publishes no switch override; each slot is its own call entry. A conflicted slot
         // stays unresolved (its preserved interpretation untouched) without withholding the other proven slots.
-        boolean callTable = ins.getMnemonicString().equalsIgnoreCase("CALL");
+        boolean callTable = ins.getMnemonicString().equalsIgnoreCase("CALL") || ins.getMnemonicString().equalsIgnoreCase("CALLF");
         List<Address> unresolvedTargets = new ArrayList<>();
         for (Address t : r.targets) {
             Instruction conflict = listing.getInstructionContaining(t);
@@ -794,8 +823,9 @@ public final class WSJumpTables {
                 // cleared (user data and multi-byte data stay, keeping today's behavior there)
                 if (listing.getDataAt(t) != null) deshadow(ins.getAddress(), t);
                 // a fresh disassembly start has no flowing context: give the target the site's decode
-                // context (CS-relative table -> same CS), else near branches resolve with CS=0 (into RAM)
-                copyContext(ins.getAddress(), t, cs);
+                // context (CS-relative table -> same CS), else near branches resolve with CS=0 (into RAM);
+                // CT1a: a far slot's own segment is the target's CS
+                copyContext(ins.getAddress(), t, targetCs(r, t, cs));
                 new DisassembleCommand(t, null, true).applyTo(p, monitor);
                 if (listing.getInstructionAt(t) == null) {
                     reportTargetConflict(ins, t);
@@ -853,25 +883,45 @@ public final class WSJumpTables {
         }
         int dataSlots = 0;
         if (r.maskOffsets == null) {
-            if (r.slots > 0 && WSInlineTables.words(p, seg(cs, r.table), r.slots, ins.getAddress(), emit)) dataSlots = r.slots;
+            if (r.slots > 0 && WSInlineTables.words(p, seg(cs, r.table), r.slots * r.width / 2, ins.getAddress(), emit)) dataSlots = r.slots;
         } else {
             int scanned = 0;
             for (int offset : r.maskOffsets) {
                 if (scanned++ >= r.slots) break;
-                if (WSInlineTables.words(p, seg(cs, (r.table + offset) & 0xffff), 1, ins.getAddress(), emit)) dataSlots++;
+                if (WSInlineTables.words(p, seg(cs, (r.table + offset) & 0xffff), r.width / 2, ins.getAddress(), emit)) dataSlots++;
             }
         }
         if (dataSlots > 0)
             emit.accept(String.format("{\"rule\":\"J1w\",\"site\":\"%s\",\"outcome\":\"TABLE_WORDS\",\"slots\":%d}", ins.getAddress(), dataSlots));
+        // CT1c: slots after the observed span are H2 hypotheses: tagged on the slot, never decoded
+        List<Address[]> hyp = spanHypotheses.remove(ins.getAddress());
+        if (hyp != null) {
+            spanSites++;
+            for (Address[] h : hyp) {
+                spanHypothesisSlots++;
+                p.getBookmarkManager().setBookmark(h[0], BookmarkType.ANALYSIS, "WSHypothesis:CT1c:" + ins.getAddress() + ":" + h[1],
+                    "CT1c H2 HYPOTHESIS: slot after the observed span of site " + ins.getAddress() + " (table end unproven: "
+                    + r.ct1 + "); candidate target " + h[1] + " not decoded");
+                emit.accept(String.format("{\"rule\":\"CT1c\",\"site\":\"%s\",\"slot\":\"%s\",\"target\":\"%s\",\"outcome\":\"HYPOTHESIS_NOT_DECODED\"}",
+                    ins.getAddress(), h[0], h[1]));
+            }
+        }
+        if (r.width == 4) ct1Far++;
+        if (r.ct1 != null && r.ct1.contains("CT1b")) ct1Two++;
         observedMissing += missing.size();
         recovered++;
         recoveredSites.add(ins.getAddress());
         if (!r.baseAdds.isEmpty()) computedBases++;
-        emit.accept(String.format("{\"rule\":\"J1\",\"site\":\"%s\",\"insn\":\"%s\",\"outcome\":\"RECOVERED\",\"shape\":\"%s\",\"index\":\"%s\",\"scaled_by\":\"%s\",\"table\":\"%04x\",\"bound\":\"%s\",\"stop\":\"%s\",\"entries\":%d,\"superseded_refs\":%d,\"slots\":%d,\"empty_slots\":%d,\"observed\":%d,\"base_via\":\"%s\",\"observed_missing_added\":%s}",
+        emit.accept(String.format("{\"rule\":\"J1\",\"site\":\"%s\",\"insn\":\"%s\",\"outcome\":\"RECOVERED\",\"shape\":\"%s\",\"index\":\"%s\",\"scaled_by\":\"%s\",\"table\":\"%04x\",\"bound\":\"%s\",\"stop\":\"%s\",\"entries\":%d,\"superseded_refs\":%d,\"slots\":%d,\"empty_slots\":%d,\"observed\":%d,\"base_via\":\"%s\",\"width\":%d,\"ct1\":\"%s\",\"observed_missing_added\":%s}",
             ins.getAddress(), ins, r.shape, r.idx, r.scaledBy, r.table, r.bound.replace("\"", "'"), r.stop, r.targets.size(), superseded, r.slots, r.empty, obs.size(),
-            r.baseVia.replace("\"", "'"),
+            r.baseVia.replace("\"", "'"), r.width, r.ct1 == null ? "-" : r.ct1.replace("\"", "'"),
             missing.isEmpty() ? "[]" : "[\"" + String.join("\",\"", missing) + "\"]"));
         return true;
+    }
+
+    /** CT1a: the CS a target runs with: its slot's segment for a far table, else the site's CS. */
+    static int targetCs(Rec r, Address t, int cs) {
+        return r.width == 4 && t instanceof SegmentedAddress sa ? sa.getSegment() : cs;
     }
 
     void copyContext(Address site, Address target, int cs) throws Exception {
@@ -930,8 +980,9 @@ public final class WSJumpTables {
     }
 
     String summary() {
-        return String.format("J1 jump/call table sites %d (passes %d): recovered %d (J1i register base %d), unresolved %d, quarantined %d (refs dropped %d), new code %d, observed targets added %d, offcut targets %d, deshadowed %d, superseded refs %d, hypothesis bytes preserved %d, dispatches restored %d (recovered %d), site errors %d",
-            seen.size(), passes, recovered, computedBases, reported.size(), quarantines, droppedRefs, newCode, observedMissing, offcut, deshadowed, supersededRefs, preservedHypotheses.getNumAddresses(), restoredDispatches, restoredRecovered, errors);
+        return String.format("J1 jump/call table sites %d (passes %d): recovered %d (J1i register base %d), unresolved %d, quarantined %d (refs dropped %d), new code %d, observed targets added %d, offcut targets %d, deshadowed %d, superseded refs %d, hypothesis bytes preserved %d, dispatches restored %d (recovered %d), site errors %d, CT1 far %d two-register %d observed-span %d (hypothesis slots %d)",
+            seen.size(), passes, recovered, computedBases, reported.size(), quarantines, droppedRefs, newCode, observedMissing, offcut, deshadowed, supersededRefs, preservedHypotheses.getNumAddresses(), restoredDispatches, restoredRecovered, errors,
+            ct1Far, ct1Two, spanSites, spanHypothesisSlots);
     }
 
     /** J1n: only a single byte without user/imported symbols or references may be superseded by a
@@ -1512,10 +1563,20 @@ public final class WSJumpTables {
         siteSpace = site.getAddress().getAddressSpace();
         Rec r = new Rec();
         r.site = site.getAddress();
+        spanHypotheses.remove(r.site);
         int cs = csOf(site.getAddress());
         List<Instruction> back = predecessors(site, 16);
-        Matcher mm = MEM.matcher(site.toString());
-        if (mm.find()) { r.shape = "MEM"; r.idx = mm.group(1).toUpperCase(); r.disp = disp(mm); }
+        boolean far = site.getMnemonicString().equalsIgnoreCase("CALLF");
+        if (far) r.width = 4;
+        Matcher mm = (far ? FARMEM : MEM).matcher(site.toString());
+        if (far && !csPrefixed(site)) { r.shape = "FAR_NOT_CS"; return r; }
+        if (mm.find()) { r.shape = far ? "FAR_MEM" : "MEM"; r.idx = mm.group(1).toUpperCase(); r.disp = disp(mm); if (far) r.ct1 = "CT1a"; }
+        else if (TWOREG.matcher(site.toString()).find() && (far || site.toString().contains("CS:["))) {
+            r.shape = far ? "FAR_MEM2" : "MEM2";
+            if (!twoRegister(site, back, r)) return r;
+            if (far) r.ct1 = "CT1a+" + r.ct1;
+        }
+        else if (far) { r.shape = "FAR_SHAPE"; return r; }
         else {
             if (site.getNumOperands() != 1 || site.getRegister(0) == null) return null;
             String reg = site.getRegister(0).getName().toUpperCase();
@@ -1527,9 +1588,14 @@ public final class WSJumpTables {
             }
             if (load == null) { r.shape = "REG_NOLOAD"; return r; }
             Matcher lm = MEM.matcher(load.toString());
-            if (!lm.find()) { r.shape = "REG_NOT_CS_TABLE"; return r; }
-            r.shape = "REG"; r.idx = lm.group(1).toUpperCase(); r.disp = disp(lm);
-            back = predecessors(load, 16);
+            List<Instruction> loadBack = predecessors(load, 16);
+            if (lm.find()) { r.shape = "REG"; r.idx = lm.group(1).toUpperCase(); r.disp = disp(lm); }
+            else if (load.toString().contains("CS:[") && TWOREG.matcher(load.toString()).find()) {
+                r.shape = "REG2";
+                if (!twoRegister(load, loadBack, r)) return r;
+            }
+            else { r.shape = "REG_NOT_CS_TABLE"; return r; }
+            back = loadBack;
         }
         for (int qi = 0; qi < back.size(); qi++) {
             Instruction q = back.get(qi);
@@ -1595,7 +1661,7 @@ public final class WSJumpTables {
         boolean bounded = !r.bound.equals("none");
         for (int i = 0; i < r.cap; i++) {
             Address ea;
-            try { ea = seg(cs, (r.table + 2 * i) & 0xFFFF); } catch (Exception e) { r.stop = "OUT_OF_ROM"; break; }
+            try { ea = seg(cs, (r.table + r.width * i) & 0xFFFF); } catch (Exception e) { r.stop = "OUT_OF_ROM"; break; }
             String why = scanSlot(cs, ea, r);
             if (why == null) continue;
             r.stop = why;
@@ -1607,14 +1673,58 @@ public final class WSJumpTables {
         // the extent; running into data or the cap does not (observed targets stay via rule E3).
         if (!bounded && !strong) {
             r.shape += "/UNBOUNDED_WEAK_STOP:" + r.stop;
-            r.targets.clear();
+            observedSpan(r);
         }
         // J1c: a byte-width bound is proven only by a strong stop or by reaching the bound itself.
-        if (r.byteBound && !strong && !r.stop.equals("BOUND")) {
+        else if (r.byteBound && !strong && !r.stop.equals("BOUND")) {
             r.shape += "/BYTE_INDEX_WEAK_STOP:" + r.stop;
-            r.targets.clear();
+            observedSpan(r);
         }
         return r;
+    }
+
+    /** CT1c slots after the observed span, up to the weak stop: H2 hypotheses (recorded by applySite's caller). */
+    final Map<Address, List<Address[]>> spanHypotheses = new HashMap<>();
+    int spanSites, spanHypothesisSlots, ct1Far, ct1Two;
+
+    /**
+     * CT1c: keep the slots from the base through the farthest observed target's first slot (a contiguous array
+     * proven used at both ends); clear the table when an observed target is not among the scanned slots or the
+     * site has no observed target. Slots after the span are kept aside as hypotheses (never decoded).
+     */
+    void observedSpan(Rec r) {
+        Set<Long> obs = observed.getOrDefault(r.site.getOffset(), Set.of());
+        int span = -1;
+        for (long o : obs) {
+            int first = -1;
+            for (int k = 0; k < r.targets.size(); k++)
+                if (r.targets.get(k).getOffset() == o) { first = r.slotOf.get(k); break; }
+            if (first < 0) { span = -1; break; }
+            span = Math.max(span, first);
+        }
+        if (span < 0) {
+            if (!obs.isEmpty()) r.shape += "/CT1c_OBSERVED_OUTSIDE";
+            r.targets.clear();
+            return;
+        }
+        List<Address> keep = new ArrayList<>();
+        List<Address[]> rest = new ArrayList<>();
+        List<Integer> keepSlots = new ArrayList<>();
+        int cs = csOf(r.site);
+        for (int k = 0; k < r.targets.size(); k++) {
+            if (r.slotOf.get(k) <= span) { keep.add(r.targets.get(k)); keepSlots.add(r.slotOf.get(k)); }
+            else rest.add(new Address[] { seg(cs, (r.table + r.width * r.slotOf.get(k)) & 0xFFFF), r.targets.get(k) });
+        }
+        int lim = span + 1;
+        r.ct1 = (r.ct1 == null ? "" : r.ct1 + "+") + "CT1c span " + lim + " of " + r.slots + " scanned slots ("
+            + obs.size() + " observed targets; weak stop " + r.stop + ")";
+        r.targets = keep;
+        r.slotOf = keepSlots;
+        r.slots = lim;
+        r.emptySlots.removeIf(k -> k >= lim);
+        r.empty = r.emptySlots.size();
+        r.stop = "OBSERVED_SPAN";
+        spanHypotheses.put(r.site, rest);
     }
 
     List<Address> trimToSlots(Rec r, int lim) {
@@ -1628,10 +1738,23 @@ public final class WSJumpTables {
         String why = slotStop(ea, r);
         if (why != null) return why;
         r.slots++;
+        Address t;
         try {
-            if ((mem.getShort(ea) & 0xFFFF) == 0) { r.empty++; r.emptySlots.add(r.slots - 1); return null; }
-        } catch (Exception e) { return "OUT_OF_ROM"; }
-        Address t = read(cs, ea);
+            if (r.width == 4) {
+                int off = mem.getShort(ea) & 0xFFFF, sg = mem.getShort(ea.add(2)) & 0xFFFF;
+                if (off == 0 && sg == 0) { r.empty++; r.emptySlots.add(r.slots - 1); return null; }
+                if (off == 0xFFFF && sg == 0xFFFF) { segmentEndSlot(r, "FFFF:FFFF"); return null; }   // CT1d
+                // CT1a: a RAM/SRAM segment, or another bank window (bank unknown), ends the table
+                if (sg < 0x2000) { r.slots--; return "FAR_RAM"; }
+                if (sg < 0x4000 && sg != cs) { r.slots--; return "FAR_BANK_WINDOW"; }
+                t = sg == cs ? seg(cs, off) : space.getAddress(sg, off);
+            }
+            else {
+                if ((mem.getShort(ea) & 0xFFFF) == 0) { r.empty++; r.emptySlots.add(r.slots - 1); return null; }
+                if ((mem.getShort(ea) & 0xFFFF) == 0xFFFF) { segmentEndSlot(r, "FFFF"); return null; }   // CT1d
+                t = read(cs, ea);
+            }
+        } catch (Exception e) { if (r.width == 4) r.slots--; return "OUT_OF_ROM"; }
         // J1o: a slot targeting the last byte of a bank overlay is skipped like an empty slot (no
         // case entry can live there: any instruction either overruns the block or falls out of its
         // address space, which neither the listing nor the decompiler can follow); the scan continues.
@@ -1647,6 +1770,16 @@ public final class WSJumpTables {
         r.slotOf.add(r.slots - 1);
         r.targets.add(t);
         return null;
+    }
+
+    /** CT1d (J1o at the segment end): a near slot holding 0xFFFF targets the last byte of its code segment, where no
+     *  routine can start (the IP wraps to 0000 after it, so any instruction longer than one byte cannot decode
+     *  there); a far slot FFFF:FFFF lies past the 1 MiB space. Such a slot is skipped like an empty slot. */
+    void segmentEndSlot(Rec r, String value) {
+        r.empty++;
+        r.emptySlots.add(r.slots - 1);
+        emit.accept(String.format("{\"rule\":\"CT1d\",\"site\":\"%s\",\"slot\":%d,\"value\":\"%s\",\"outcome\":\"SKIPPED\"}",
+            r.site, r.slots - 1, value));
     }
 
     /** J1c: index register loaded from a byte (zero- or sign-extended) before scaling. */
@@ -1676,7 +1809,7 @@ public final class WSJumpTables {
         }
         if (!(hiClear && loByte)) { if (r.bound.startsWith("via ")) r.bound = "none"; return; }
         int bytes = (cbw ? 128 : 256) << shift;           // CBW: only the 0..127 half lies at or after the base
-        r.cap = Math.max(1, bytes / 2);
+        r.cap = Math.max(1, bytes / r.width);
         r.byteBound = true;
         String via = r.bound.startsWith("via ") ? " (" + r.bound + ")" : "";
         r.bound = (cbw ? "byte index (CBW, forward half)" : "byte index") + " << " + shift + " -> " + r.cap + " entries" + via;
@@ -1732,13 +1865,18 @@ public final class WSJumpTables {
     String slotStop(Address ea, Rec r) {
         if (!mem.contains(ea) || !mem.getBlock(ea).isInitialized()) return "OUT_OF_ROM";
         if (ea.equals(r.returnEnd)) return "PUSH_RETURN_ENTRY";
-        if (executed(ea.getOffset()) || executed(ea.getOffset() + 1)) return "EXECUTED_CODE";
-        if (p.getFunctionManager().getFunctionAt(ea) != null || p.getFunctionManager().getFunctionAt(ea.add(1)) != null) return "FUNCTION_ENTRY";
+        // every byte of the slot (2, or 4 for a CT1a far slot) is checked
+        List<Address> bytes = new ArrayList<>();
+        for (int k = 0; k < r.width; k++) {
+            try { bytes.add(ea.add(k)); } catch (Exception e) { return "OUT_OF_ROM"; }
+        }
+        for (Address b : bytes) if (executed(b.getOffset())) return "EXECUTED_CODE";
+        for (Address b : bytes) if (p.getFunctionManager().getFunctionAt(b) != null) return "FUNCTION_ENTRY";
         // A merge may remove a callee's function object without removing its code
         // or direct call. Its bytes still cannot be read as further table slots.
-        if (directCallEntry(ea) || directCallEntry(ea.add(1))) return "DIRECT_CALL_ENTRY";
+        for (Address b : bytes) if (directCallEntry(b)) return "DIRECT_CALL_ENTRY";
         if (!ea.equals(tableStart) && tableBases.contains(ea)) return "TABLE_BASE";
-        if (r.targets.contains(ea) || r.targets.contains(ea.add(1))) return "OWN_TARGET";   // J1j
+        for (Address b : bytes) if (r.targets.contains(b)) return "OWN_TARGET";   // J1j
         return null;
     }
 
@@ -1805,6 +1943,73 @@ public final class WSJumpTables {
         return true;
     }
 
+    /** CT1a: a far call through memory renders without its segment prefix (CALLF [BX + 0x7e]); the prefix is read
+     *  from the bytes ({@link #csPrefixed}). */
+    static final Pattern FARMEM = Pattern.compile("^CALLF \\[(BX|SI|DI|BP)(?: ?([+-]) ?0x([0-9a-f]+))?\\]$", Pattern.CASE_INSENSITIVE);
+    /** CT1b: base + index register operand, optional displacement. */
+    static final Pattern TWOREG = Pattern.compile("\\[(BX|BP) \\+ (SI|DI)(?: ?([+-]) ?0x([0-9a-f]+))?\\]", Pattern.CASE_INSENSITIVE);
+
+    /** The last segment-override prefix of the instruction is CS (0x2E). */
+    static boolean csPrefixed(Instruction i) {
+        int segment = -1;
+        try {
+            for (byte b : i.getBytes()) {
+                int v = b & 0xFF;
+                if (v == 0x26 || v == 0x2E || v == 0x36 || v == 0x3E) segment = v;
+                else if (v != 0xF0 && v != 0xF2 && v != 0xF3) break;
+            }
+        } catch (Exception e) { return false; }
+        return segment == 0x2E;
+    }
+
+    /**
+     * CT1b: resolve a [B + I (+d)] operand of {@code access} (the site or its load): exactly one register must hold a
+     * constant there. Sets base, index and provenance; false (with the shape amended) when neither or both are constant.
+     */
+    boolean twoRegister(Instruction access, List<Instruction> back, Rec r) {
+        Matcher m = TWOREG.matcher(access.toString());
+        if (!m.find()) { r.shape += "/CT1b_SHAPE"; return false; }
+        String a = m.group(1).toUpperCase(), b = m.group(2).toUpperCase();
+        int d = m.group(4) == null ? 0 : Integer.parseInt(m.group(4), 16) * (m.group(3).equals("-") ? -1 : 1);
+        String[] wa = new String[1], wb = new String[1];
+        Integer ca = constAt(access, back, a, wa), cb = constAt(access, back, b, wb);
+        if (ca != null && cb != null) { r.shape += "/CT1b_BOTH_CONSTANT"; return false; }
+        if (ca == null && cb == null) { r.shape += "/CT1b_NO_CONSTANT:" + a + "_" + wa[0] + ":" + b + "_" + wb[0]; return false; }
+        r.idx = ca == null ? a : b;
+        r.base = ca == null ? cb : ca;
+        r.disp = d;
+        r.baseFound = true;
+        r.baseVia = "CT1b " + (ca == null ? b : a) + " from " + (ca == null ? wb[0] : wa[0]);
+        r.ct1 = "CT1b " + (ca == null ? b : a) + "=" + String.format("%04x", r.base) + " index " + r.idx;
+        return true;
+    }
+
+    /** CT1b: the constant {@code reg} holds at {@code access}: its last write before it (fall-through chain
+     *  {@code back}) is MOV reg,imm / LEA reg,[imm], no flow joins the chain after that write (nor at the access),
+     *  and no CALL/INT lies in between. Null otherwise, with the reason in why[0]. */
+    Integer constAt(Instruction access, List<Instruction> back, String reg, String[] why) {
+        ghidra.program.model.lang.Register r16 = p.getRegister(reg);
+        Instruction after = access;
+        for (Instruction d : back) {
+            for (Reference ref : p.getReferenceManager().getReferencesTo(after.getAddress()))
+                if (ref.getReferenceType().isFlow()) { why[0] = "JOIN@" + after.getAddress(); return null; }
+            String t = d.toString().toUpperCase().replace(" ", "");
+            String mn = d.getMnemonicString().toUpperCase();
+            if (mn.startsWith("CALL") || mn.startsWith("INT")) { why[0] = "CALL_BETWEEN@" + d.getAddress(); return null; }
+            if (writesReg(d, t, reg, r16)) {
+                Matcher c = CONSTDEF.matcher(t);
+                if (c.matches() && reg.equals(c.group(1) != null ? c.group(1) : c.group(3))) {
+                    why[0] = d.toString();
+                    return Integer.parseInt(c.group(2) != null ? c.group(2) : c.group(4), 16) & 0xFFFF;
+                }
+                why[0] = "NOT_CONST@" + d.getAddress();
+                return null;
+            }
+            after = d;
+        }
+        why[0] = "NO_DEF";
+        return null;
+    }
     static final Pattern ADDREG = Pattern.compile("ADD(AX|BX|CX|DX|SI|DI|BP),(AX|BX|CX|DX|SI|DI|BP)");
     static final Pattern CONSTDEF = Pattern.compile("(?:MOV(AX|BX|CX|DX|SI|DI|BP),0X([0-9A-F]+)|LEA(AX|BX|CX|DX|SI|DI|BP),\\[0X([0-9A-F]+)\\])");
 

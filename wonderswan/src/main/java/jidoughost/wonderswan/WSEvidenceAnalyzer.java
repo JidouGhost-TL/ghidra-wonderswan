@@ -294,6 +294,11 @@ public class WSEvidenceAnalyzer extends AbstractAnalyzer {
             WSInlineTables.apply(program, line -> s.emit("%s", line), monitor);
             WSJumpTables tables = new WSJumpTables(program, ev, line -> s.emit("%s", line));
             tables.apply(monitor);
+            // IT1c: J1 code can hold new inline dispatches and their cases new tables (bounded)
+            for (int outer = 0; outer < 4; outer++) {
+                if (WSInlineTables.applyResult(program, line -> s.emit("%s", line), monitor).fresh() == 0) break;
+                tables.apply(monitor);
+            }
             tables.restoreClearedSites(monitor);
             tables.finish();
             try { tables.tagHazards(line -> ghidra.util.Msg.warn(WSEvidenceAnalyzer.class, line)); }

@@ -16,13 +16,24 @@ import ghidra.util.task.TaskMonitor;
 
 /** J3: finite inline word dispatch through a proven return-address helper.
  * The injected semantics affect decompilation only; CPU instruction bytes stay intact.
- * Arbitrary stack manipulation and interrupt handlers with other side effects stay unknown. */
+ * Arbitrary stack manipulation and interrupt handlers with other side effects stay unknown.
+ * IT1 (interrupt inline-table dispatch, general form):
+ *   IT1a: any INT n whose vector has exactly one installed handler (F2 IVT[n]) is a site; the handler is proven an
+ *     inline-table dispatcher from its own code by a symbolic walk ({@link #inlineInterruptHandler}): straight-line
+ *     code that zero-extends AL, doubles it, loads the stacked return IP and CS (LES/LDS r,[BP+k] with BP framed so
+ *     that [BP+k] is the IP slot), adds the doubled AL, reads the word at CS:table[AL] (MOV reg,ES/DS:[r] or LODSW),
+ *     writes it back over the stacked IP and IRETs with the stack balanced. Register choices, saved-register order
+ *     and ENTER/LEAVE framing are free; any other instruction, branch, call or stack write rejects the handler.
+ *   IT1b: the table length is proven by the first forward case (as J3) or by an adjacent proven object at the next
+ *     slot: the base of a CS-relative operand used anywhere (CS:[disp] / CS:[reg+disp]), a data reference from code
+ *     outside the table, a flow reference from outside the table, a function entry, or executed (played) bytes. The
+ *     words before that object are the table. A site still without a proven end is an H2 hypothesis: its candidate
+ *     words are tagged (WSHypothesis:IT1) and nothing beyond already-decoded code is decoded.
+ *   IT1c: J3 repeats until no new site is recovered: a recovered case can hold the next inline dispatch. */
 public final class WSInlineTables {
     public static final String CATEGORY = "WSInlineTable";
     public static final String CONTINUATION = "WSContinuation";
     private static final String CALL = "POPDI;MOVAH,0;ADDAX,AX;ADDDI,AX;MOVDI,WORDPTRCS:[DI];JMPDI";
-    private static final String INT_ES = "PUSHBP;MOVBP,SP;PUSHES;PUSHBX;MOVAH,0;SHLAX,1;LESBX,[BP+2];ADDBX,AX;MOVAX,WORDPTRES:[BX];MOVWORDPTR[BP+2],AX;POPBX;POPES;POPBP;IRET";
-    private static final String INT_DS = "ENTER0,0;PUSHDS;PUSHSI;MOVAH,0;SHLAX,1;LDSSI,[BP+2];ADDSI,AX;LODSWSI;MOVWORDPTR[BP+2],AX;POPSI;POPDS;LEAVE;IRET";
     private static final String SAVE_RETURN = "POPAX;MOVWORDPTR[SI],AX;RET";
     private static final String SAVE_CONTINUE = "POPAX;MOVWORDPTR[SI],AX;JMPAX";
 
@@ -121,15 +132,46 @@ public final class WSInlineTables {
         }
         return true;
     }
-    private static List<Address> table(Program p, Instruction site) throws Exception {
+    /** IT1b: a proven object starts at this table slot (it cannot be a further dispatch word). */
+    private static String boundary(Program p, Address slot, Address start, Set<Address> csBases) {
+        if (csBases.contains(slot)) return "CS_OPERAND_BASE";
+        if (p.getFunctionManager().getFunctionAt(slot) != null) return "FUNCTION_ENTRY";
+        if (played(p, slot) || played(p, slot.add(1))) return "EXECUTED";
+        for (Reference r : p.getReferenceManager().getReferencesTo(slot)) {
+            Address from = r.getFromAddress();
+            if (!from.isMemoryAddress() || from.compareTo(start) >= 0 && from.compareTo(slot) < 0) continue;
+            if (p.getListing().getInstructionAt(from) == null) continue;
+            if (r.getReferenceType().isFlow()) return "FLOW_REFERENCE";
+            if (r.getReferenceType().isData()) return "DATA_REFERENCE";
+        }
+        return null;
+    }
+    /** IT1b: every CS-relative operand displacement (CS:[disp] or CS:[reg+disp]) in the program, as an address. */
+    private static final java.util.regex.Pattern CS_DISP = java.util.regex.Pattern.compile(
+        "CS:\\[(?:(?:BX|SI|DI|BP)(?: \\+ (?:SI|DI))? \\+ )?0x([0-9a-f]+)\\]", java.util.regex.Pattern.CASE_INSENSITIVE);
+    private static Set<Address> csBases(Program p) {
+        Set<Address> out = new HashSet<>();
+        for (Instruction i : p.getListing().getInstructions(true)) {
+            String t = i.toString();
+            if (!t.contains("CS:[")) continue;
+            var m = CS_DISP.matcher(t);
+            if (m.find()) out.add(near(p, i.getAddress(), cs(p, i.getAddress()), Integer.parseInt(m.group(1), 16)));
+        }
+        return out;
+    }
+    private static List<Address> table(Program p, Instruction site, Set<Address> csBases, List<Address> candidates, String[] why) throws Exception {
         Address start = site.getDefaultFallThrough();
+        why[0] = "NO_START";
         if (start == null || WSRamCode.isRam(p, start)) return List.of();
         List<Address> cases = new ArrayList<>();
         long firstForward = Long.MAX_VALUE;
         PseudoDisassembler decoder = new PseudoDisassembler(p);
         for (int k = 0; k < 256; k++) {
             Address slot = start.add(2L * k);
-            if (slot.getOffset() == firstForward) return cases.size() >= 2 ? cases : List.of();
+            if (slot.getOffset() == firstForward) { why[0] = "FIRST_FORWARD_CASE"; return cases.size() >= 2 ? cases : List.of(); }
+            String end = k == 0 ? null : boundary(p, slot, start, csBases);
+            if (end != null) { why[0] = end; return cases; }   // IT1b: adjacent proven object ends the words
+            why[0] = "BREAK_AT_SLOT_" + k;
             if (slot.getOffset() > firstForward || !p.getMemory().contains(slot.add(1))) break;
             int ip = p.getMemory().getShort(slot) & 0xffff;
             Address target = near(p, site.getAddress(), cs(p, site.getAddress()), ip);
@@ -145,6 +187,7 @@ public final class WSInlineTables {
                 if (i == null || i.getMnemonicString().contains("UNDEF") || i.getMnemonicString().equals("INT3")) break;
             } catch (Exception e) { break; }
             cases.add(target);
+            candidates.add(target);
             if (target.compareTo(start) > 0) firstForward = Math.min(firstForward, target.getOffset());
         }
         return List.of(); // No guessed end: require the first forward case to bound the words.
@@ -209,11 +252,12 @@ public final class WSInlineTables {
         install(p, f, name, fixup(segment, interrupt, count), monitor);
         return f;
     }
-    private static boolean sameCallers(Program p, Address entry, int segment, boolean interrupt) {
+    private static boolean sameCallers(Program p, Address entry, int segment, int vector) {
+        boolean interrupt = vector >= 0;
         for (Reference r : p.getReferenceManager().getReferencesTo(entry)) if (r.getReferenceType().isCall()) {
             Instruction from = p.getListing().getInstructionAt(r.getFromAddress());
             if (from == null || cs(p, from.getAddress()) != segment
-                || interrupt && !text(from).equals("INT40")
+                || interrupt && intNumber(from) != vector
                 || !interrupt && !from.getMnemonicString().equals("CALL")) return false;
         }
         return true;
@@ -235,7 +279,7 @@ public final class WSInlineTables {
             Function owner = p.getFunctionManager().getFunctionContaining(i.getAddress());
             int segment = cs(p, i.getAddress());
             if (helper == null || owner == null || explicit(helper) || explicit(owner)
-                || segment != cs(p, entry) || !sameCallers(p, entry, segment, false)
+                || segment != cs(p, entry) || !sameCallers(p, entry, segment, -1)
                 || helper.getCallFixup() != null && !helper.getCallFixup().startsWith("ws_saved_")) continue;
             String base = String.format("0x%x", (long)segment << 4);
             String name = String.format("ws_saved_%s_%04x", yield ? "yield" : "continue", segment);
@@ -261,73 +305,190 @@ public final class WSInlineTables {
         }
         return changed;
     }
+    /** IT1a: the vector number of an immediate software interrupt (CD nn), or -1. */
+    static int intNumber(Instruction i) {
+        try {
+            byte[] b = i.getBytes();
+            return i.getMnemonicString().equals("INT") && b.length == 2 && (b[0] & 0xff) == 0xcd ? b[1] & 0xff : -1;
+        } catch (Exception e) { return -1; }
+    }
+    private static final java.util.regex.Pattern IVT = java.util.regex.Pattern.compile("IVT\\[([0-9a-f]{2})\\]");
+
+    /**
+     * IT1a: the handler at {@code entry} returns into an inline word table at its caller's return IP, indexed by AL:
+     * proven by a symbolic walk of its straight-line code (see the class comment). Offsets are relative to the SP at
+     * handler entry, where the stacked IP is at +0, CS at +2 and FLAGS at +4.
+     */
+    static boolean inlineInterruptHandler(Program p, Address entry) {
+        Map<String, String> v = new HashMap<>();
+        v.put("AL", "SEL");
+        int depth = 0;           // bytes pushed since entry
+        Integer bp = null;       // BP = entrySP - bp
+        boolean replaced = false;
+        Address a = entry;
+        for (int n = 0; n < 32; n++) {
+            Instruction i = p.getListing().getInstructionAt(a);
+            if (i == null) return false;
+            String t = text(i);
+            String mn = i.getMnemonicString();
+            java.util.regex.Matcher m;
+            if (t.equals("IRET")) return replaced && depth == 0;
+            if (i.getFlowType().isJump() || i.getFlowType().isCall() || i.getFlowType().isTerminal()) return false;
+            if ((m = java.util.regex.Pattern.compile("PUSH(AX|BX|CX|DX|SI|DI|BP|ES|DS)").matcher(t)).matches()) {
+                depth += 2;
+            } else if ((m = java.util.regex.Pattern.compile("POP(AX|BX|CX|DX|SI|DI|BP|ES|DS)").matcher(t)).matches()) {
+                if (depth < 2) return false;
+                depth -= 2;
+                String r = m.group(1);
+                v.put(r, "SAVED");
+                if (r.equals("AX")) v.remove("AL");
+                if (r.equals("BP")) bp = null;
+            } else if (t.equals("MOVBP,SP")) {
+                bp = depth;
+            } else if (t.equals("ENTER0,0")) {
+                depth += 2; bp = depth;
+            } else if (t.equals("LEAVE")) {
+                if (bp == null || bp < 2) return false;
+                depth = bp - 2; bp = null;
+            } else if (t.equals("MOVAH,0") || t.equals("XORAH,AH") || t.equals("SUBAH,AH")) {
+                if (!"SEL".equals(v.get("AL"))) return false;
+                v.put("AX", "ZSEL");
+            } else if (t.equals("SHLAX,1") || t.equals("ADDAX,AX")) {
+                if (!"ZSEL".equals(v.get("AX"))) return false;
+                v.put("AX", "IDX2"); v.remove("AL");
+            } else if ((m = java.util.regex.Pattern.compile("L(ES|DS)(BX|SI|DI),\\[BP\\+([0-9A-F]+)\\]").matcher(t)).matches()) {
+                if (bp == null || Integer.parseInt(m.group(3), 16) != bp) return false;   // must be the stacked IP slot
+                v.put(m.group(2), "RETIP"); v.put(m.group(1), "RETCS");
+            } else if ((m = java.util.regex.Pattern.compile("ADD(BX|SI|DI),AX").matcher(t)).matches()) {
+                if (!"RETIP".equals(v.get(m.group(1))) || !"IDX2".equals(v.get("AX"))) return false;
+                v.put(m.group(1), "TABLE");
+            } else if ((m = java.util.regex.Pattern.compile("MOV(AX|CX|DX),WORDPTR(ES|DS):\\[(BX|SI|DI)\\]").matcher(t)).matches()) {
+                if (!"TABLE".equals(v.get(m.group(3))) || !"RETCS".equals(v.get(m.group(2)))) return false;
+                v.put(m.group(1), "WORD"); if (m.group(1).equals("AX")) v.remove("AL");
+            } else if (mn.equals("LODSW")) {
+                if (!t.equals("LODSWSI") && !t.equals("LODSWDS:SI")) return false;
+                if (!"TABLE".equals(v.get("SI")) || !"RETCS".equals(v.get("DS"))) return false;
+                v.put("AX", "WORD"); v.remove("AL"); v.put("SI", "TABLE+2");
+            } else if ((m = java.util.regex.Pattern.compile("MOVWORDPTR(?:SS:)?\\[BP\\+([0-9A-F]+)\\],(AX|CX|DX)").matcher(t)).matches()) {
+                if (bp == null || Integer.parseInt(m.group(1), 16) != bp || !"WORD".equals(v.get(m.group(2)))) return false;
+                replaced = true;
+            } else return false;
+            if (i.getFallThrough() == null) return false;
+            a = i.getFallThrough();
+        }
+        return false;
+    }
+
+    /** J3/IT1 result: sites recovered, J4 continuations, summary text. */
+    public record Result(int recovered, int fresh, int saved, String summary) { }
+
     public static String apply(Program p, Consumer<String> emit, TaskMonitor monitor) throws Exception {
-        List<Instruction> sites = new ArrayList<>();
-        for (Instruction i : p.getListing().getInstructions(true))
-            if (i.getMnemonicString().equals("CALL") || text(i).equals("INT40")) sites.add(i);
-        Set<Address> vectors = new HashSet<>();
+        return applyResult(p, emit, monitor).summary();
+    }
+
+    public static Result applyResult(Program p, Consumer<String> emit, TaskMonitor monitor) throws Exception {
+        Map<Integer, Set<Address>> vectors = new HashMap<>();
         var bookmarks = p.getBookmarkManager().getBookmarksIterator();
         while (bookmarks.hasNext()) {
             Bookmark b = bookmarks.next();
-            if (b.getComment() != null && b.getComment().startsWith("F2 ") && b.getComment().contains("IVT[40]")) vectors.add(b.getAddress());
+            if (b.getComment() == null || !b.getComment().startsWith("F2 ")) continue;
+            var m = IVT.matcher(b.getComment());
+            if (m.find()) vectors.computeIfAbsent(Integer.parseInt(m.group(1), 16), k -> new HashSet<>()).add(b.getAddress());
         }
-        int recovered = 0;
-        for (Instruction i : sites) {
-            monitor.checkCancelled();
-            boolean interrupt = text(i).equals("INT40");
-            Address entry = interrupt ? vectors.size() == 1 ? vectors.iterator().next() : null
-                : i.getDefaultFlows().length == 1 ? i.getDefaultFlows()[0] : null;
-            if (entry == null || WSRamCode.isRam(p, entry)) continue;
-            boolean matches = interrupt ? shape(p, entry, INT_ES) || shape(p, entry, INT_DS) : shape(p, entry, CALL);
-            if (!matches) continue;
-            Function owner = p.getFunctionManager().getFunctionContaining(i.getAddress());
-            Function helper = p.getFunctionManager().getFunctionAt(entry);
-            if (owner == null || helper == null || explicit(owner) || explicit(helper)
-                || helper.getCallFixup() != null && !helper.getCallFixup().startsWith("ws_inline_")) continue;
-            boolean protectedReference = false;
-            for (Reference r : p.getReferenceManager().getReferencesFrom(i.getAddress()))
-                if (r.isPrimary() && r.getReferenceType().isFlow()
-                    && (r.getSource() == SourceType.USER_DEFINED || r.getSource() == SourceType.IMPORTED)) protectedReference = true;
-            if (protectedReference) continue;
-            int segment = cs(p, i.getAddress());
-            if (segment != cs(p, entry)) continue;
-            // A function-level fixup must be correct for every caller of that helper.
-            if (!sameCallers(p, entry, segment, interrupt)) continue;
-            List<Address> cases = table(p, i);
-            if (cases.isEmpty()) {
-                emit.accept(String.format("{\"rule\":\"J3\",\"site\":\"%s\",\"outcome\":\"UNRESOLVED\",\"why\":\"NO_STRONG_TABLE_END\"}", i.getAddress()));
-                continue;
-            }
-            Address start = i.getDefaultFallThrough();
-            if (!availableModel(p, segment, interrupt, cases.size())) continue;
-            if (!words(p, start, cases.size(), i.getAddress(), emit)) continue;
-            Function delegate = model(p, segment, interrupt, cases.size(), monitor);
-            if (delegate == null) continue;
-            // Direct calls prioritize their primary ordinary call reference. Keep
-            // that original destination as a non-primary reference for analysis.
-            if (helper.getCallFixup() != null) helper.setCallFixup(null);
-            for (Reference r : p.getReferenceManager().getReferencesFrom(i.getAddress()))
-                if (r.getReferenceType().isCall() && r.isPrimary()) p.getReferenceManager().setPrimary(r, false);
-            Reference localRef = p.getReferenceManager().addMemoryReference(i.getAddress(), delegate.getEntryPoint(),
-                RefType.CALL_OVERRIDE_UNCONDITIONAL, SourceType.ANALYSIS, -1);
-            p.getReferenceManager().setPrimary(localRef, true);
-            for (Address target : new LinkedHashSet<>(cases)) {
-                if (p.getListing().getInstructionContaining(target) == null) {
-                    p.getProgramContext().setValue(p.getRegister("csval"), target, target, BigInteger.valueOf(segment));
-                    new DisassembleCommand(target, null, true).applyTo(p, monitor);
+        int recovered = 0, hypotheses = 0, freshTotal = 0;
+        Set<Address> unresolved = new HashSet<>();
+        List<Instruction> sites = List.of();
+        for (int iteration = 0; iteration < 8; iteration++) {   // IT1c
+            sites = new ArrayList<>();
+            for (Instruction i : p.getListing().getInstructions(true))
+                if (i.getMnemonicString().equals("CALL") || intNumber(i) >= 0) sites.add(i);
+            Set<Address> bases = null;
+            int fresh = 0;
+            for (Instruction i : sites) {
+                monitor.checkCancelled();
+                // iteration 0 re-applies modeled sites as before (repeat analysis repairs them after merges);
+                // later iterations only look for sites the previous ones made reachable
+                boolean wasModeled = modeled(p, i.getAddress());
+                if (iteration > 0 && wasModeled) continue;
+                int vector = intNumber(i);
+                boolean interrupt = vector >= 0;
+                Set<Address> handlers = interrupt ? vectors.getOrDefault(vector, Set.of()) : Set.of();
+                Address entry = interrupt ? handlers.size() == 1 ? handlers.iterator().next() : null
+                    : i.getDefaultFlows().length == 1 ? i.getDefaultFlows()[0] : null;
+                if (entry == null || WSRamCode.isRam(p, entry)) continue;
+                boolean matches = interrupt ? inlineInterruptHandler(p, entry) : shape(p, entry, CALL);
+                if (!matches) continue;
+                Function owner = p.getFunctionManager().getFunctionContaining(i.getAddress());
+                Function helper = p.getFunctionManager().getFunctionAt(entry);
+                if (owner == null || helper == null || explicit(owner) || explicit(helper)
+                    || helper.getCallFixup() != null && !helper.getCallFixup().startsWith("ws_inline_")) continue;
+                boolean protectedReference = false;
+                for (Reference r : p.getReferenceManager().getReferencesFrom(i.getAddress()))
+                    if (r.isPrimary() && r.getReferenceType().isFlow()
+                        && (r.getSource() == SourceType.USER_DEFINED || r.getSource() == SourceType.IMPORTED)) protectedReference = true;
+                if (protectedReference) continue;
+                int segment = cs(p, i.getAddress());
+                // the CALL helper reads its table through CS; an interrupt handler reads the caller's stacked CS
+                if (!interrupt && segment != cs(p, entry)) continue;
+                // A function-level fixup must be correct for every caller of that helper.
+                if (!sameCallers(p, entry, segment, interrupt ? vector : -1)) continue;
+                if (bases == null) bases = csBases(p);
+                List<Address> candidates = new ArrayList<>();
+                String[] why = new String[1];
+                List<Address> cases = table(p, i, bases, candidates, why);
+                if (cases.isEmpty()) {
+                    if (unresolved.add(i.getAddress())) {
+                        emit.accept(String.format("{\"rule\":\"J3\",\"site\":\"%s\",\"outcome\":\"UNRESOLVED\",\"why\":\"NO_STRONG_TABLE_END\",\"break\":\"%s\",\"candidates\":%d}",
+                            i.getAddress(), why[0], candidates.size()));
+                        if (interrupt && !candidates.isEmpty()) {
+                            // IT1b H2: candidate words stay a hypothesis; nothing is decoded from them
+                            hypotheses++;
+                            List<String> c = new ArrayList<>();
+                            for (Address t : candidates) c.add(t.toString());
+                            p.getBookmarkManager().setBookmark(i.getAddress(), BookmarkType.ANALYSIS, "WSHypothesis:IT1:" + i.getAddress(),
+                                "IT1 H2 HYPOTHESIS: inline-table interrupt dispatch (handler " + entry + "), table length unproven ("
+                                + why[0] + "); candidate words " + String.join(",", c) + " not decoded");
+                        }
+                    }
+                    continue;
                 }
-                i.addMnemonicReference(target, RefType.COMPUTED_JUMP, SourceType.ANALYSIS);
+                Address start = i.getDefaultFallThrough();
+                if (!availableModel(p, segment, interrupt, cases.size())) continue;
+                if (!words(p, start, cases.size(), i.getAddress(), emit)) continue;
+                Function delegate = model(p, segment, interrupt, cases.size(), monitor);
+                if (delegate == null) continue;
+                // Direct calls prioritize their primary ordinary call reference. Keep
+                // that original destination as a non-primary reference for analysis.
+                if (helper.getCallFixup() != null) helper.setCallFixup(null);
+                for (Reference r : p.getReferenceManager().getReferencesFrom(i.getAddress()))
+                    if (r.getReferenceType().isCall() && r.isPrimary()) p.getReferenceManager().setPrimary(r, false);
+                Reference localRef = p.getReferenceManager().addMemoryReference(i.getAddress(), delegate.getEntryPoint(),
+                    RefType.CALL_OVERRIDE_UNCONDITIONAL, SourceType.ANALYSIS, -1);
+                p.getReferenceManager().setPrimary(localRef, true);
+                for (Address target : new LinkedHashSet<>(cases)) {
+                    if (p.getListing().getInstructionContaining(target) == null) {
+                        p.getProgramContext().setValue(p.getRegister("csval"), target, target, BigInteger.valueOf(segment));
+                        new DisassembleCommand(target, null, true).applyTo(p, monitor);
+                    }
+                    i.addMnemonicReference(target, RefType.COMPUTED_JUMP, SourceType.ANALYSIS);
+                }
+                p.getBookmarkManager().removeBookmarks(new AddressSet(i.getAddress()), BookmarkType.ANALYSIS, "WSHypothesis:IT1:" + i.getAddress(), monitor);
+                p.getBookmarkManager().setBookmark(i.getAddress(), BookmarkType.ANALYSIS, CATEGORY,
+                    "J3 proven " + (interrupt ? "interrupt" : "CALL/pop") + " inline words; helper=" + entry + "; table=" + start + "; words=" + cases.size()
+                    + "; end=" + why[0]);
+                i.setFallThrough(cases.get(0));
+                CreateFunctionCmd.fixupFunctionBody(p, owner, monitor);
+                p.getListing().getInstructionAt(i.getAddress()).setFallThrough(cases.get(0));
+                recovered++;
+                if (!wasModeled) fresh++;
+                unresolved.remove(i.getAddress());
+                emit.accept(String.format("{\"rule\":\"J3\",\"site\":\"%s\",\"helper\":\"%s\",\"outcome\":\"RECOVERED\",\"table\":\"%s\",\"words\":%d,\"interrupt\":%b,\"vector\":%d,\"end\":\"%s\",\"iteration\":%d}",
+                    i.getAddress(), entry, start, cases.size(), interrupt, vector, why[0], iteration));
             }
-            p.getBookmarkManager().setBookmark(i.getAddress(), BookmarkType.ANALYSIS, CATEGORY,
-                "J3 proven " + (interrupt ? "interrupt" : "CALL/pop") + " inline words; helper=" + entry + "; table=" + start + "; words=" + cases.size());
-            i.setFallThrough(cases.get(0));
-            CreateFunctionCmd.fixupFunctionBody(p, owner, monitor);
-            p.getListing().getInstructionAt(i.getAddress()).setFallThrough(cases.get(0));
-            recovered++;
-            emit.accept(String.format("{\"rule\":\"J3\",\"site\":\"%s\",\"helper\":\"%s\",\"outcome\":\"RECOVERED\",\"table\":\"%s\",\"words\":%d,\"interrupt\":%b}",
-                i.getAddress(), entry, start, cases.size(), interrupt));
+            freshTotal += fresh;
+            if (fresh == 0) break;
         }
         int saved = continuations(p, sites, emit, monitor);
-        return "J3 inline tables recovered " + recovered + "; J4 saved continuations " + saved;
+        return new Result(recovered, freshTotal, saved, "J3 inline tables recovered " + recovered + "; IT1 hypotheses " + hypotheses + "; J4 saved continuations " + saved);
     }
 }

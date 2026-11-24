@@ -108,15 +108,26 @@ public class WSEvidenceRepairAnalyzer extends AbstractAnalyzer {
             WSJumpTables j = jumpTables ? new WSJumpTables(program, ev, line -> s.emit("%s", line)) : null;
             WSCodePointers cp = codePointers ? new WSCodePointers(program, line -> s.emit("%s", line), monitor) : null;
             WSGapCode gc = gapCode ? new WSGapCode(program, line -> s.emit("%s", line), monitor) : null;
-            for (int round = 0; round < 8; round++) {
-                long before = program.getListing().getNumInstructions();
-                if (j != null) rule("J1", s, program, log, failed, () -> j.apply(monitor));
-                if (cp != null) rule("F1-F4", s, program, log, failed, () -> cp.apply());
-                // G1/U1 only once the reference-driven rules are stable: a gap they explain is not "unreferenced"
-                if (gc != null && program.getListing().getNumInstructions() == before) rule("G1/U1", s, program, log, failed, () -> gc.apply());
-                if (program.getListing().getNumInstructions() == before) break;
+            // IT1c: a newly proven inline dispatch (J3) adds code that the reference-driven rules must see in turn,
+            // so the rounds repeat after J3 until J3 recovers nothing new (bounded)
+            int[] j3fresh = { 0 };
+            for (int outer = 0; outer < 4; outer++) {
+                for (int round = 0; round < 8; round++) {
+                    long before = program.getListing().getNumInstructions();
+                    if (j != null) rule("J1", s, program, log, failed, () -> j.apply(monitor));
+                    if (cp != null) rule("F1-F4", s, program, log, failed, () -> cp.apply());
+                    // G1/U1 only once the reference-driven rules are stable: a gap they explain is not "unreferenced"
+                    if (gc != null && program.getListing().getNumInstructions() == before) rule("G1/U1", s, program, log, failed, () -> gc.apply());
+                    if (program.getListing().getNumInstructions() == before) break;
+                }
+                j3fresh[0] = 0;
+                rule("J3", s, program, log, failed, () -> {
+                    WSInlineTables.Result r = WSInlineTables.applyResult(program, line -> s.emit("%s", line), monitor);
+                    parts.add(r.summary());
+                    j3fresh[0] = r.fresh();
+                });
+                if (j3fresh[0] == 0) break;
             }
-            rule("J3", s, program, log, failed, () -> parts.add(WSInlineTables.apply(program, line -> s.emit("%s", line), monitor)));
             if (j != null) rule("J1r", s, program, log, failed, () -> j.restoreClearedSites(monitor));
             if (j != null) rule("J1l-finish", s, program, log, failed, () -> j.finish());
             if (j != null) rule("J1uw", s, program, log, failed, () -> parts.add(j.withdrawUnproven(WSSwitchOrderAnalyzer.beforeSwitch(program), line -> {
