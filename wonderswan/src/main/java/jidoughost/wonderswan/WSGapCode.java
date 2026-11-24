@@ -42,8 +42,10 @@ import ghidra.util.task.TaskMonitor;
  * U1a: a direct call to the start of an existing instruction that existing code already reaches by a CALL counts as
  *    a call to a function entry (the function is created by later analysis; code a phase-2 rule just disassembled
  *    has none yet), so whether a candidate is accepted does not depend on when that function appears.
- * U1c: a candidate whose walk covers a byte that existing code reads or writes as data (a data reference from an
- *    instruction, e.g. LES SI,CS:[0347h] on a far-pointer table) is rejected: those bytes are data.
+ * U1c: a byte that existing code reads or writes as data (a data reference from an instruction, or a constant
+ *    CS-relative operand such as LES SI,CS:[0347h] on a far-pointer table) is data: a walk that covers one is
+ *    rejected, and when such data follows a terminator directly, the candidate starts at the first byte after it
+ *    (a U1 candidate only, like one after fill).
  * Both repeat until no new candidate is accepted (an accepted function exposes the bytes after its own end).
  */
 final class WSGapCode {
@@ -135,13 +137,27 @@ final class WSGapCode {
             Instruction before = term != null ? term : listing.getInstructionBefore(s);
             int cs = before != null && mem.getBlock(before.getAddress()).equals(mem.getBlock(s)) ? csOf(before.getAddress())
                 : mem.getBlock(s).getStart() instanceof SegmentedAddress bs ? bs.getSegment() : csOf(s);
+            String after = "fill";
+            if (term != null && readAsData(s)) {
+                // U1c: data that existing code reads sits right after the terminator; a candidate starts after it
+                Address q = s;
+                for (int k = 0; q != null && k < 256 && readAsData(q) && mem.getBlock(s).contains(q); k++) q = q.next();
+                boolean ok = q != null && mem.getBlock(s).contains(q) && !readAsData(q)
+                    && listing.getCodeUnitAt(q) instanceof Data dq && !dq.isDefined() && tried.add(q) && !allFill(q);
+                emit.accept(String.format("{\"rule\":\"U1c\",\"start\":\"%s\",\"after\":\"%s\",\"data_read_until\":\"%s\",\"outcome\":\"%s\"}",
+                    s, term.getAddress(), q, ok ? "SKIPPED_DATA" : "NO_CANDIDATE"));
+                if (!ok) continue;
+                after = "data read by code after " + term.getAddress();
+                s = q;
+                term = null;
+            }
             Walk w = walk(s, cs);
             if (term == null) {
                 if (w.fail() != null) { rejected++; rejects.merge(w.fail().replaceAll("@.*", ""), 1, Integer::sum);
-                    emit.accept(String.format("{\"rule\":\"U1\",\"start\":\"%s\",\"after\":\"fill\",\"outcome\":\"REJECTED\",\"why\":\"%s\"}", s, w.fail())); continue; }
+                    emit.accept(String.format("{\"rule\":\"U1\",\"start\":\"%s\",\"after\":\"%s\",\"outcome\":\"REJECTED\",\"why\":\"%s\"}", s, after, w.fail())); continue; }
                 if (w.anchors() < 2 || w.insns() < 3) { weak++;
-                    emit.accept(String.format("{\"rule\":\"U1\",\"start\":\"%s\",\"after\":\"fill\",\"instructions\":%d,\"anchors\":%d,\"outcome\":\"WEAK\"}", s, w.insns(), w.anchors())); continue; }
-                if (acceptUnreferenced(s, cs, w, "fill")) accepted++;
+                    emit.accept(String.format("{\"rule\":\"U1\",\"start\":\"%s\",\"after\":\"%s\",\"instructions\":%d,\"anchors\":%d,\"outcome\":\"WEAK\"}", s, after, w.insns(), w.anchors())); continue; }
+                if (acceptUnreferenced(s, cs, w, after)) accepted++;
                 continue;
             }
             Function f = p.getFunctionManager().getFunctionContaining(term.getAddress());

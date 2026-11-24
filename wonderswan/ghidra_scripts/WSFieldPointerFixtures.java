@@ -25,8 +25,9 @@ import jidoughost.wonderswan.WonderSwanLoader;
  *            yet), and unreferenced code after the store routine's RET (F000:0056: PUSH AX; PUSH CX; CALL 0240h;
  *            POP CX; POP AX; RET): rule U1 accepts it, because a call to an instruction kept code already calls is a
  *            call to a subroutine entry (U1a), whether or not its function exists yet.
- * u1data:    u1call, but the handler first reads F000:0056 as a far pointer (LES SI,CS:[0056h]; the reader is itself
- *            phase-2 code, so no analysis has typed the bytes yet): they are data, so U1 rejects the candidate (U1c).
+ * u1data:    u1call, but four data bytes at F000:0056 (the code moves to F000:005A) that the handler reads as a far
+ *            pointer (LES SI,CS:[0056h]; the reader is itself phase-2 code, so no analysis has typed them yet): they
+ *            are data (U1c), so U1 leaves them undecoded and starts its candidate at F000:005A, after them.
  *
  * Usage: headless post script on any program (it imports its own cartridges into a temporary project).
  */
@@ -72,7 +73,8 @@ public class WSFieldPointerFixtures extends GhidraScript {
             if (variant.equals("u1data")) put(rom, HANDLER, "2ec4365600b80100e83500cb");   // LES SI,CS:[0056h]; MOV AX,1; CALL 0240h; RETF
             else put(rom, HANDLER, "b80100e83a00cb");              // MOV AX,1; CALL 0240h; RETF
             put(rom, 0x240, "a30003c3");                           // MOV [0300h],AX; RET
-            put(rom, 0x56, "5051e8e5015958c3");                    // PUSH AX; PUSH CX; CALL 0240h; POP CX; POP AX; RET
+            if (variant.equals("u1data")) put(rom, 0x56, "11223344" + "5051e8e1015958c3");   // data; then the same code at 005Ah
+            else put(rom, 0x56, "5051e8e5015958c3");               // PUSH AX; PUSH CX; CALL 0240h; POP CX; POP AX; RET
         } else
             put(rom, HANDLER, "b80100a30003cb");                   // MOV AX,1; MOV [0300h],AX; RETF
         int f = rom.length - 16;
@@ -117,17 +119,19 @@ public class WSFieldPointerFixtures extends GhidraScript {
                 if (b.getCategory().equals("WSEvidence")) why = b.getComment();
             check(variant, why != null && why.startsWith("F6 field store"), "F6 evidence bookmark: " + why);
             check(variant, p.getBookmarkManager().getBookmarkCount(BookmarkType.ERROR) == 0, "no ERROR bookmarks");
-            if (variant.equals("u1call")) {
-                Instruction u = l.getInstructionAt(at(p, 0x56));
+            if (variant.equals("u1call") || variant.equals("u1data")) {
+                int start = variant.equals("u1data") ? 0x5a : 0x56;
+                Instruction u = l.getInstructionAt(at(p, start));
                 String u1 = null;
-                for (Bookmark b : p.getBookmarkManager().getBookmarks(at(p, 0x56)))
+                for (Bookmark b : p.getBookmarkManager().getBookmarks(at(p, start)))
                     if (b.getCategory().equals("WSEvidence")) u1 = b.getComment();
-                check(variant, u != null && l.getInstructionAt(at(p, 0x5d)) != null, "unreferenced code at F000:0056 decoded: " + u);
+                check(variant, u != null && u.toString().equals("PUSH AX") && l.getInstructionAt(at(p, start + 7)) != null,
+                    "unreferenced code at " + at(p, start) + " decoded: " + u);
                 check(variant, u1 != null && u1.startsWith("U1"), "U1 bookmark: " + u1);
             }
             if (variant.equals("u1data"))
-                check(variant, l.getInstructionContaining(at(p, 0x56)) == null && l.getInstructionContaining(at(p, 0x5d)) == null,
-                    "far-pointer bytes at F000:0056 read as data stay undecoded: " + l.getInstructionContaining(at(p, 0x56)));
+                check(variant, l.getInstructionContaining(at(p, 0x56)) == null && l.getInstructionContaining(at(p, 0x59)) == null,
+                    "far-pointer bytes F000:0056-0059 read as data stay undecoded: " + l.getInstructionContaining(at(p, 0x56)));
         } finally {
             project.close();
         }
