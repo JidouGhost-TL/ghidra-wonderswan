@@ -147,7 +147,7 @@ public final class WSJumpTables {
         String shape = "?", idx, scaledBy = null, bound = "none", stop = "BOUND";
         Address site, returnEnd, tableAddress;
         boolean baseFound, byteBound;
-        int slots, empty;                       // slots scanned (incl. empty 0000 slots), empty slots
+        int slots, empty, ffffRun;              // slots scanned (incl. empty 0000 slots), empty slots, consecutive CT1d 0xFFFF run
         List<Integer> slotOf = new ArrayList<>(); // slot index of each target
         List<Integer> emptySlots = new ArrayList<>();
         int base, disp, table, cap = 64;
@@ -1771,7 +1771,7 @@ public final class WSJumpTables {
         "TABLE_BASE", "OWN_TARGET", "PUSH_RETURN_ENTRY");
 
     static void resetScan(Rec r) {
-        r.slots = 0; r.empty = 0; r.emptySlots.clear(); r.slotOf.clear(); r.targets.clear(); r.stop = "BOUND";
+        r.slots = 0; r.empty = 0; r.ffffRun = 0; r.emptySlots.clear(); r.slotOf.clear(); r.targets.clear(); r.stop = "BOUND";
         r.placeholderSlots.clear(); r.placeholderTargets.clear();
     }
 
@@ -1802,16 +1802,18 @@ public final class WSJumpTables {
         try {
             if (r.width == 4) {
                 int off = mem.getShort(ea) & 0xFFFF, sg = mem.getShort(ea.add(2)) & 0xFFFF;
-                if (off == 0 && sg == 0) { r.empty++; r.emptySlots.add(r.slots - 1); return null; }
-                if (off == 0xFFFF && sg == 0xFFFF) { segmentEndSlot(r, "FFFF:FFFF"); return null; }   // CT1d
+                if (off == 0 && sg == 0) { r.ffffRun = 0; r.empty++; r.emptySlots.add(r.slots - 1); return null; }
+                if (off == 0xFFFF && sg == 0xFFFF) return segmentEndSlot(r, "FFFF:FFFF");   // CT1d
+                r.ffffRun = 0;
                 // CT1a: a RAM/SRAM segment, or another bank window (bank unknown), ends the table
                 if (sg < 0x2000) { r.slots--; return "FAR_RAM"; }
                 if (sg < 0x4000 && sg != cs) { r.slots--; return "FAR_BANK_WINDOW"; }
                 t = sg == cs ? seg(cs, off) : space.getAddress(sg, off);
             }
             else {
-                if ((mem.getShort(ea) & 0xFFFF) == 0) { r.empty++; r.emptySlots.add(r.slots - 1); return null; }
-                if ((mem.getShort(ea) & 0xFFFF) == 0xFFFF) { segmentEndSlot(r, "FFFF"); return null; }   // CT1d
+                if ((mem.getShort(ea) & 0xFFFF) == 0) { r.ffffRun = 0; r.empty++; r.emptySlots.add(r.slots - 1); return null; }
+                if ((mem.getShort(ea) & 0xFFFF) == 0xFFFF) return segmentEndSlot(r, "FFFF");   // CT1d
+                r.ffffRun = 0;
                 t = read(cs, ea);
             }
         } catch (Exception e) { if (r.width == 4) r.slots--; return "OUT_OF_ROM"; }
@@ -1847,12 +1849,22 @@ public final class WSJumpTables {
 
     /** CT1d (J1o at the segment end): a near slot holding 0xFFFF targets the last byte of its code segment, where no
      *  routine can start (the IP wraps to 0000 after it, so any instruction longer than one byte cannot decode
-     *  there); a far slot FFFF:FFFF lies past the 1 MiB space. Such a slot is skipped like an empty slot. */
-    void segmentEndSlot(Rec r, String value) {
+     *  there); a far slot FFFF:FFFF lies past the 1 MiB space. Up to 3 consecutive such slots are skipped like empty
+     *  slots; 4+ consecutive 0xFFFF slots are erased ROM fill and end the scan (weak stop ERASED_FILL). */
+    String segmentEndSlot(Rec r, String value) {
+        if (++r.ffffRun >= 4) {
+            int prior = r.ffffRun - 1;
+            r.slots -= r.ffffRun;
+            r.empty -= prior;
+            for (int j = 0; j < prior; j++) r.emptySlots.remove(r.emptySlots.size() - 1);
+            r.ffffRun = 0;
+            return "ERASED_FILL";
+        }
         r.empty++;
         r.emptySlots.add(r.slots - 1);
         emit.accept(String.format("{\"rule\":\"CT1d\",\"site\":\"%s\",\"slot\":%d,\"value\":\"%s\",\"outcome\":\"SKIPPED\"}",
             r.site, r.slots - 1, value));
+        return null;
     }
 
     /** CT1g: total left shift applied to the index along the slice (SHL idx,n / ADD idx,idx) back to its last other
