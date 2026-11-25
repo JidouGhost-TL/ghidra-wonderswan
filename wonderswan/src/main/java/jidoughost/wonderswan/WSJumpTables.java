@@ -446,16 +446,24 @@ public final class WSJumpTables {
         for (int qi = 0; qi < slice.size(); qi++) {
             Instruction q = slice.get(qi);
             String t = q.toString().toUpperCase().replace(" ", "");
-            String w = reg.charAt(1) == 'X' ? reg : null, lo = w == null ? reg : w.charAt(0) + "L";
-            if (w != null && t.startsWith("MOV" + w + ",")) {
+            String w = reg.matches("[ABCD][LHX]") ? reg.charAt(0) + "X" : reg;
+            String lo = reg.charAt(1) == 'X' ? reg.charAt(0) + "L" : reg;
+            String hi = reg.charAt(1) == 'X' ? reg.charAt(0) + "H" : null;
+            if (hi != null && (t.equals("XOR" + hi + "," + hi) || t.equals("SUB" + hi + "," + hi)
+                    || t.equals("MOV" + hi + ",0X0") || t.equals("CBW") && reg.equals("AX")
+                    || t.startsWith("AND" + reg + ",0X") && (hex(t) & 0xFF00) == 0)) {
+                reg = lo;                                                        // high byte cleared/derived: index lives in low byte
+            }
+            if (t.startsWith("MOV" + w + ",")) {
                 String src = t.substring(t.indexOf(',') + 1);
                 if (src.contains("[")) return true;                              // index word loaded here
-                if (src.matches("[ABCD]X|SI|DI|BP")) { reg = src; continue; }    // copied: follow the source
+                if (reg.equals(w) && src.matches("[ABCD]X|SI|DI|BP")) { reg = src; continue; }
+                if (!reg.equals(w) && src.matches("[ABCD]X")) { reg = src.charAt(0) + "" + reg.charAt(1); continue; }
             }
-            if (t.startsWith("MOV" + lo + ",") || t.startsWith("MOVZX" + (w == null ? lo : w) + ",")) {
+            if (t.startsWith("MOV" + lo + ",") || t.startsWith("MOVZX" + w + ",")) {
                 String src = t.substring(t.indexOf(',') + 1);
                 if (src.contains("[")) return true;                              // index byte loaded here
-                if (src.matches("[ABCD][LH]")) { reg = src.charAt(1) == 'L' ? src.charAt(0) + "X" : src; continue; }
+                if (src.matches("[ABCD][LH]")) { reg = src; continue; }
             }
             if (q != site && q.getFlowType().isConditional() && !equalityExclusion(q, qi + 1 < slice.size() ? slice.get(qi + 1) : null, reg))
                 return false;
@@ -467,23 +475,25 @@ public final class WSJumpTables {
 
     /** An equality test that bounds no range for switch recovery, so it is no guard: JZ/JE on the flags of
      *  CMP x,imm, whose taken edge leaves the fall-through slice, excludes one value (e.g. an end marker FFFFh) on the
-     *  path to the site; any JZ/JNZ on CMP reg,imm whose register is not the index's. JNZ/JNE on the index leaves the
-     *  index constant on the path to the site, so it stays a possible guard (phase-2 J1 handles such a site). */
+     *  path to the site; any JZ/JNZ on CMP reg,imm whose register does not overlap the index (e.g. another register
+     *  or the disjoint high byte AH when the index is AL). JNZ/JNE on the index leaves the index constant on the path
+     *  to the site, so it stays a possible guard (phase-2 J1 handles such a site). */
     static boolean equalityExclusion(Instruction branch, Instruction flags, String index) {
         String m = branch.getMnemonicString().toUpperCase();
         boolean jz = m.equals("JZ") || m.equals("JE"), jnz = m.equals("JNZ") || m.equals("JNE");
         if (!(jz || jnz) || flags == null) return false;
         java.util.regex.Matcher c = Pattern.compile("CMP([A-Z]{2}),-?0X[0-9A-F]+").matcher(flags.toString().toUpperCase().replace(" ", ""));
         if (!c.matches()) return false;
-        if (!sameRegisterFamily(c.group(1), index)) return true;       // another register: the index is unconstrained
+        if (!registersOverlap(c.group(1), index)) return true;         // disjoint register: the index is unconstrained
         return jz;                                                     // taken edge (equal) leaves the slice
     }
 
-    /** AL/AH/AX (and B, C, D) are one family; SI, DI, BP only match themselves. */
-    static boolean sameRegisterFamily(String a, String b) {
+    /** Whether two registers share any bits: AX overlaps AL and AH, but AL and AH are disjoint; SI/DI/BP only match themselves. */
+    static boolean registersOverlap(String a, String b) {
         if (a == null || b == null) return true;
+        if (a.equals(b)) return true;
         boolean ga = a.matches("[ABCD][LHX]"), gb = b.matches("[ABCD][LHX]");
-        return ga && gb ? a.charAt(0) == b.charAt(0) : a.equals(b);
+        return ga && gb && a.charAt(0) == b.charAt(0) && (a.charAt(1) == 'X' || b.charAt(1) == 'X');
     }
 
     /**

@@ -34,6 +34,8 @@ import jidoughost.wonderswan.WonderSwanLoader;
  * eqmask:     CMP AL,0FFh; JZ out before an AND mask: excluding one value is no range guard, so J1u applies.
  * eqjnz:      CMP AL,3; JNZ out before the scaling: the index is constant on the path to the site; J1u leaves it to
  *             phase-2 J1 (the equality exemption covers only JZ leaving the slice or a compare of another register).
+ * cmp_ah_jnz: MOV AL,[BP+4]; CMP AH,0FFh; JNZ out; XOR AH,AH; SHL AX,1; MOV BX,AX; JMP CS:[BX+tbl]: AH is disjoint
+ *             from the AL index (high byte cleared by XOR AH,AH), so JNZ does not constrain AL and J1u applies.
  * guarded:    CMP AL,6; JA out before the scaling: stock switch recovery bounds it itself and keeps it (unchanged).
  * guardmask:  CMP AL,6; JA out before SHL and an AND mask: guarded, left to stock recovery (unchanged).
  *
@@ -85,6 +87,10 @@ public class WSSwitchOrderFixtures extends GhidraScript {
             // IN AL,0B5h; CMP AL,3; JNZ 0053h; SHL AL,1; MOV BL,AL; MOV BH,0; ADD BX,0060h; JMP CS:[BX]; RET
             // (AL == 3 on the path to the site: a constant index, so the JNZ is a possible guard)
             put(rom, 0x40, "e4b53c03750dd0e088c3b70081c360002eff27c3");
+        } else if (variant.equals("cmp_ah_jnz")) {
+            // MOV AL,[BP+4]; CMP AH,0FFh; JNZ 0053h; XOR AH,AH; SHL AX,1; MOV BX,AX; JMP CS:[BX+0060h]; RET
+            // (AH is disjoint from AL; XOR AH,AH clears AH before scaling, so JNZ on AH does not guard AL)
+            put(rom, 0x40, "8a460480fcff750b32e4d1e08bd82effa76000c3");
         } else if (variant.equals("eqmask")) {
             // IN AL,0B5h; CMP AL,0FFh; JZ 0055h; MOV BL,AL; MOV BH,0; AND BX,00FEh; ADD BX,0060h; JMP CS:[BX]; RET
             put(rom, 0x40, "e4b53cff740f88c3b70081e3fe0081c360002eff27c3");
@@ -201,7 +207,7 @@ public class WSSwitchOrderFixtures extends GhidraScript {
             try { analyzeAll(p); } finally { p.endTransaction(tx, true); }
             long seconds = (System.nanoTime() - t0) / 1_000_000_000L;
             check(variant, seconds < 120, "analysis finished in " + seconds + " s");
-            Address site = at(p, guardedVariant(variant) ? SITE_GUARDED : variant.equals("masked") ? SITE_MASKED
+            Address site = at(p, guardedVariant(variant) ? SITE_GUARDED : variant.equals("masked") || variant.equals("cmp_ah_jnz") ? SITE_MASKED
                 : variant.equals("eqmask") ? 0x52 : SITE_PROVEN);
             Instruction ins = p.getListing().getInstructionAt(site);
             check(variant, ins != null && ins.toString().startsWith("JMP"), "dispatch site decoded: " + ins);
@@ -241,7 +247,7 @@ public class WSSwitchOrderFixtures extends GhidraScript {
             for (int h : ADJACENT) decoded &= p.getListing().getInstructionAt(at(p, h)) != null;
             check(variant, decoded, "all 7 handlers decoded");
             AddressSet code = new AddressSet(at(p, 0x00), at(p, 0x10));
-            code.add(at(p, 0x40), at(p, guardedVariant(variant) ? 0x57 : variant.equals("eqmask") ? 0x55 : 0x52));
+            code.add(at(p, 0x40), at(p, guardedVariant(variant) ? 0x57 : variant.equals("eqmask") || variant.equals("cmp_ah_jnz") ? 0x55 : 0x52));
             code.add(at(p, 0x6e), at(p, 0x9e));
             List<Address> stray = new ArrayList<>();
             for (Instruction i : p.getListing().getInstructions(true))
@@ -266,7 +272,7 @@ public class WSSwitchOrderFixtures extends GhidraScript {
     public void run() throws Exception {
         File dir = Files.createTempDirectory("ws-switch-order").toFile();
         String[] args = getScriptArgs();
-        List<String> variants = args.length > 0 ? List.of(args) : List.of("proven", "masked", "eqmask", "eqjnz", "copy", "unprovable", "npe", "conflict",
+        List<String> variants = args.length > 0 ? List.of(args) : List.of("proven", "masked", "eqmask", "eqjnz", "cmp_ah_jnz", "copy", "unprovable", "npe", "conflict",
             "withdraw", "guarded", "guardmask");
         for (String v : variants) {
             try { fixture(dir, v); }
