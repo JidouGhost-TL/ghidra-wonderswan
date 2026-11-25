@@ -83,6 +83,14 @@ final class WSCodePointers {
     record FieldUse(Field seg, Address site) { }
     /** F6: a constant segment and offset stored into a candidate field pair in one chain. */
     record FieldPair(Field off, Field seg, int segValue, int offValue, Address site) { }
+    /** F3s: a setter function's store of two entry-input registers into adjacent F6 field words. */
+    record SetterFieldPair(Field off, Field seg, String offReg, String segReg) { }
+    /** F3/F3s: entry-input stores discovered along a function's entry chain (constant RAM words and F6 field pairs). */
+    record SetterInfo(Map<Long, String> memInputs, List<SetterFieldPair> fieldPairs) { }
+    /** CT3: a constant seg:off pair written to a RAM word pair (mSeg, mOff) in one fall-through chain. */
+    record RamPtr(int seg, int off, Address site) { }
+    /** CT3: a strided CALLF/JMPF ES:[DI+field] / DS:[SI+field] site inside a function. */
+    record Ct3Site(Address site, Address addSite, String segReg, String idxReg, int fieldOff, int stride) { }
     record Target(int seg, int off, Address from, String via, boolean function) { }
 
     final Program p;
@@ -90,7 +98,7 @@ final class WSCodePointers {
     final Memory mem;
     final SegmentedAddressSpace space;
     final ProgramContext ctx;
-    final Register csval, rDS, colorsoc;
+    final Register csval, rDS, rSS, colorsoc;
     final Consumer<String> emit;
     final TaskMonitor monitor;
 
@@ -100,7 +108,8 @@ final class WSCodePointers {
     /** Accepted code-pointer targets installed through the interrupt vector table (for rules V1/M1/T1). */
     final Set<Address> ivtHandlers = new HashSet<>();
     final Set<String> done = new HashSet<>();
-    int passes, newFunctions, newCode, existing, rejected, returnPoints;
+    final Set<String> ct3Done = new HashSet<>();
+    int passes, newFunctions, newCode, existing, rejected, returnPoints, f3sTargets, ct3Tables, ct3Targets;
     final Map<String, Integer> rejects = new TreeMap<>();
 
     WSCodePointers(Program p, Consumer<String> emit, TaskMonitor monitor) {
@@ -111,10 +120,11 @@ final class WSCodePointers {
         ctx = p.getProgramContext();
         csval = ctx.getRegister("csval");
         rDS = ctx.getRegister("DS");
+        rSS = ctx.getRegister("SS");
         colorsoc = ctx.getRegister("colorsoc");
     }
 
-    /** Applies F1-F4 until no new targets appear; returns the number of targets accepted. */
+    /** Applies F1-F6, F3s, CT3 until no new targets appear; returns the number of targets accepted. */
     int apply() throws Exception {
         int total = 0;
         for (int pass = 0; pass < 16; pass++) {
@@ -128,8 +138,8 @@ final class WSCodePointers {
     }
 
     String summary() {
-        return String.format("F1-F6 code pointers: far variables %d, near variables %d, far fields %d, field targets %d, passes %d, new functions %d, new code %d, return points %d, existing %d, rejected %d %s, weak data cleared %d",
-            farVars.size(), nearVars.size(), farFields.size(), fieldTargets, passes, newFunctions, newCode, returnPoints, existing, rejected, rejects, weakDataCleared);
+        return String.format("F1-F6 code pointers: far variables %d, near variables %d, far fields %d, field targets %d, F3s targets %d, CT3 tables %d (targets %d), passes %d, new functions %d, new code %d, return points %d, existing %d, rejected %d %s, weak data cleared %d",
+            farVars.size(), nearVars.size(), farFields.size(), fieldTargets, f3sTargets, ct3Tables, ct3Targets, passes, newFunctions, newCode, returnPoints, existing, rejected, rejects, weakDataCleared);
     }
 
     // ---- one pass ------------------------------------------------------------------------------------------
@@ -138,6 +148,7 @@ final class WSCodePointers {
     final Map<Address, Map<String, Val>> callState = new HashMap<>();   // call site -> registers before the call
     final List<long[]> farPairs = new ArrayList<>();                     // {M, seg, off} from constant store pairs
     final Map<Long, Address> farPairSite = new HashMap<>();
+    final Map<Long, List<RamPtr>> ramPtrs = new HashMap<>();             // ((mSeg << 20) | mOff) -> constant pairs
     final List<Target> returns = new ArrayList<>();
     final List<FieldPair> fieldPairs = new ArrayList<>();
     /** F6: field stores of the current fall-through chain (dropped when a register of the field is written). */
@@ -193,7 +204,7 @@ final class WSCodePointers {
     }
 
     int pass() throws Exception {
-        stores.clear(); callState.clear(); farPairs.clear(); farPairSite.clear(); returns.clear(); fieldPairs.clear();
+        stores.clear(); callState.clear(); farPairs.clear(); farPairSite.clear(); ramPtrs.clear(); returns.clear(); fieldPairs.clear();
         track();
         Set<Integer> used = usedVectors();
         List<Target> targets = new ArrayList<>();
@@ -217,11 +228,12 @@ final class WSCodePointers {
             if (s.v().c() == null || !nearVars.containsKey(s.m())) continue;
             targets.add(new Target(nearVarCs.get(s.m()), s.v().c(), s.site(), "F2 near store " + varName(s.m()), true));
         }
-        // F3: setters
+        // F3 & F3s: setters (constant RAM variables and F6 indexed RAM arrays, including 1-based BASE - 4 dispatch)
+        Set<String> seenF3s = new HashSet<>();
         for (Function f : p.getFunctionManager().getFunctions(true)) {
             monitor.checkCancelled();
-            Map<Long, String> in = setterStores(f);
-            if (in.isEmpty()) continue;
+            SetterInfo info = setterStores(f);
+            Map<Long, String> in = info.memInputs();
             for (Map.Entry<Long, String> e : in.entrySet()) {
                 long m = e.getKey();
                 String offReg = e.getValue(), segReg = in.get(m + 2);
@@ -245,7 +257,30 @@ final class WSCodePointers {
                     }
                 }
             }
+            // F3s: setter writing two entry-input registers into an F6 indexed RAM array ([idx+BASE]/[idx+BASE+2])
+            for (SetterFieldPair sfp : info.fieldPairs()) {
+                for (int delta : new int[] { 0, -4 }) {
+                    Field dispOff = sfp.off().plus(delta);
+                    Field dispSeg = sfp.seg().plus(delta);
+                    FieldUse u = farFields.get(dispOff);
+                    if (u == null || !u.seg().equals(dispSeg)) continue;
+                    for (Reference r : p.getReferenceManager().getReferencesTo(f.getEntryPoint())) {
+                        if (!r.getReferenceType().isCall()) continue;
+                        Map<String, Val> st = callState.get(r.getFromAddress());
+                        if (st == null) continue;
+                        Val off = st.get(sfp.offReg()), seg = st.get(sfp.segReg());
+                        if (off == null || off.c() == null || seg == null || seg.c() == null) continue;
+                        if (!seenF3s.add(r.getFromAddress() + "/" + seg.c() + ":" + off.c())) continue;
+                        f3sTargets++;
+                        targets.add(new Target(seg.c(), off.c(), off.def() != null ? off.def() : r.getFromAddress(),
+                            "F3s setter " + f.getEntryPoint() + " " + sfp.segReg() + ":" + sfp.offReg() + " -> " + sfp.off()
+                            + (delta == 0 ? "" : " (1-based " + dispOff + ")") + " (dispatch " + u.site() + ")", true));
+                    }
+                }
+            }
         }
+        // CT3: RAM-pointed non-power-of-2 strided far-pointer record tables
+        detectCt3(targets);
         targets.addAll(returns);
         int accepted = 0;
         for (Target t : targets) if (accept(t)) accepted++;
@@ -326,10 +361,12 @@ final class WSCodePointers {
         }
     }
 
-    /** DS from the program context (rules D0/D1 and the loader default): the value the decompiler assumes too. */
+    /** DS and SS from the program context (rules D0/D1 and the loader default): the values the decompiler assumes too. */
     void contextDs(Address a, Map<String, Val> regs) {
         BigInteger ds = a == null || rDS == null ? null : ctx.getValue(rDS, a, false);
         if (ds != null) regs.put("DS", Val.konst(ds.intValue(), null));
+        BigInteger ss = a == null || rSS == null ? null : ctx.getValue(rSS, a, false);
+        if (ss != null) regs.put("SS", Val.konst(ss.intValue(), null));
     }
 
     boolean joins(Instruction ins) {
@@ -345,6 +382,7 @@ final class WSCodePointers {
         String mn = ins.getMnemonicString().toUpperCase();
         Address a = ins.getAddress();
         int cs = csOf(a);
+        regs.put("CS", Val.konst(cs, null));
         // uses of code-pointer variables (F1)
         if (mn.equals("RETF") && stack.size() >= 2) {
             Iterator<Val> it = stack.iterator();
@@ -437,6 +475,18 @@ final class WSCodePointers {
             String op = t.substring(3);
             Val v = stack.isEmpty() ? null : stack.pop();
             if (R16.contains(op)) { dropFields(op); if (v == null || isUnknown(v)) regs.remove(op); else regs.put(op, v); }
+            else {
+                Matcher d = MEMOP.matcher(op);
+                if (d.matches()) {
+                    Long m = ea(d, regs);
+                    if (m != null) {
+                        Val sv = v == null ? new Val(null, null, null, null) : (v.c() != null && v.def() == null ? Val.konst(v.c(), a) : v);
+                        stores.add(new Store(a, m, sv));
+                        chainStores.put(m, sv);
+                        pair(m, chainStores, a);
+                    }
+                }
+            }
             return;
         }
         if (mn.equals("PUSHA")) { for (int k = 0; k < 8; k++) stack.push(new Val(null, null, null, null)); return; }
@@ -525,7 +575,7 @@ final class WSCodePointers {
 
     /** F6: the addressing form of a memory operand with at least one index register (CS-relative: none, rule J1). */
     Field field(Matcher d) {
-        String expr = d.group(2);
+        String expr = d.group(2).replace("+-", "-");
         String segName = d.group(1) != null ? d.group(1) : expr.contains("BP") ? "SS" : "DS";
         if (segName.equals("CS")) return null;
         Matcher term = Pattern.compile("([+-]?)(0X[0-9A-F]+|AX|BX|CX|DX|SI|DI|BP)").matcher(expr);
@@ -546,6 +596,18 @@ final class WSCodePointers {
         Collections.sort(regsUsed);
         return new Field(segName, String.join("+", regsUsed), disp & 0xFFFF);
     }
+
+    /** F3s: signed 16-bit displacement of a [BP+d] / [BP-d] stack-frame slot (default/SS segment), or null. */
+    static Integer bpLocal(Matcher d) {
+        if (d.group(1) != null && !d.group(1).equals("SS")) return null;
+        String expr = d.group(2).replace("+-", "-");
+        Matcher m = Pattern.compile("^BP(?:([+-])0X([0-9A-F]+))?$").matcher(expr);
+        if (!m.matches()) return null;
+        if (m.group(2) == null) return 0;
+        int v = Integer.parseInt(m.group(2), 16);
+        return (int) (short) (m.group(1).equals("-") ? -v : v);
+    }
+
     static Val orNull(Val v) { return v == null ? new Val(null, null, null, null) : v; }
 
     void addNear(long m, int cs, Address a, String shape) {
@@ -555,26 +617,41 @@ final class WSCodePointers {
         }
     }
 
-    /** F2 pairing: offset at M and segment at M+2, both constant, stored in the same chain. */
+    /** F2 pairing: offset at M and segment at M+2, both constant, stored in the same chain.
+     *  Also records RAM word pairs in both (off, seg) and (seg, off) orientations for CT3 table pointers. */
     void pair(long m, Map<Long, Val> chainStores, Address site) {
         for (long lo : new long[] { m, m - 2 }) {
-            Val off = chainStores.get(lo), seg = chainStores.get(lo + 2);
-            if (off == null || seg == null || off.c() == null || seg.c() == null) continue;
-            farPairs.add(new long[] { lo, seg.c(), off.c(),
+            if (lo < 0) continue;
+            Val vLo = chainStores.get(lo), vHi = chainStores.get(lo + 2);
+            if (vLo == null || vHi == null || vLo.c() == null || vHi.c() == null) continue;
+            farPairs.add(new long[] { lo, vHi.c(), vLo.c(),
                 segProven.getOrDefault(lo, false) && segProven.getOrDefault(lo + 2, false) ? 1 : 0 });
-            farPairSite.put(lo << 20 ^ (long) seg.c() << 16 ^ off.c(), off.def() != null ? off.def() : site);
+            Address defSite = vLo.def() != null ? vLo.def() : site;
+            farPairSite.put(lo << 20 ^ (long) vHi.c() << 16 ^ vLo.c(), defSite);
+            if (lo < 0x10000) {
+                addRamPtr(lo + 2, lo, vHi.c(), vLo.c(), defSite);
+                addRamPtr(lo, lo + 2, vLo.c(), vHi.c(), defSite);
+            }
         }
+    }
+
+    void addRamPtr(long mSeg, long mOff, int segVal, int offVal, Address site) {
+        long k = (mSeg << 20) | mOff;
+        List<RamPtr> list = ramPtrs.computeIfAbsent(k, x -> new ArrayList<>());
+        for (RamPtr rp : list) if (rp.seg() == segVal && rp.off() == offVal) return;
+        list.add(new RamPtr(segVal, offVal, site));
     }
 
     /** Linear address of a memory operand with every register part constant (segment: override, SS for BP, else DS). */
     Long ea(Matcher d, Map<String, Val> regs) {
-        String segName = d.group(1) != null ? d.group(1) : d.group(2).contains("BP") ? "SS" : "DS";
+        String expr = d.group(2).replace("+-", "-");
+        String segName = d.group(1) != null ? d.group(1) : expr.contains("BP") ? "SS" : "DS";
         Val seg = regs.get(segName);
         if (seg == null || seg.c() == null) return null;
         lastSegProven = seg.def() != null && seg.c() == 0;   // F2v: set to 0000 by an instruction of this chain
         lastSegName = segName;
         long off = 0;
-        Matcher term = Pattern.compile("([+-]?)(0X[0-9A-F]+|AX|BX|CX|DX|SI|DI|BP)").matcher(d.group(2));
+        Matcher term = Pattern.compile("([+-]?)(0X[0-9A-F]+|AX|BX|CX|DX|SI|DI|BP)").matcher(expr);
         int pos = 0;
         while (term.find()) {
             if (term.start() != pos) return null;
@@ -584,38 +661,432 @@ final class WSCodePointers {
             else { Val r = regs.get(term.group(2)); if (r == null || r.c() == null) return null; v = r.c(); }
             off += term.group(1).equals("-") ? -v : v;
         }
-        if (pos != d.group(2).length()) return null;
+        if (pos != expr.length()) return null;
         return (((long) seg.c() << 4) + (off & 0xFFFF)) & 0xFFFFF;
     }
 
-    /** F3: stores of entry-input registers along the function's entry chain (no joins, no calls). */
-    Map<Long, String> setterStores(Function f) {
+    /** F3/F3s: stores of entry-input registers along the function's entry chain, tracking [BP+d] stack-frame spills
+     *  across capacity/bounds guard branches and recording both constant RAM stores (F3) and F6 indexed RAM array
+     *  word pairs (F3s). */
+    SetterInfo setterStores(Function f) {
         Map<Long, String> out = new HashMap<>();
+        List<SetterFieldPair> outFields = new ArrayList<>();
         Map<String, Val> regs = new HashMap<>();
         for (String r : List.of("AX", "BX", "CX", "DX", "SI", "DI", "BP", "ES")) regs.put(r, Val.in(r));
-        BigInteger ds = rDS == null ? null : ctx.getValue(rDS, f.getEntryPoint(), false);
-        if (ds != null) regs.put("DS", Val.konst(ds.intValue(), null));
+        contextDs(f.getEntryPoint(), regs);
         Instruction ins = listing.getInstructionAt(f.getEntryPoint());
         Deque<Val> stack = new ArrayDeque<>();
         Map<Long, Val> chain = new HashMap<>();
         segProven.clear();
+        Map<Integer, Val> bpLocals = new HashMap<>();
+        Map<Field, String> fieldInputs = new HashMap<>();
         chainFields.clear();
         int before = stores.size();
         int pairsBefore = fieldPairs.size();
-        for (int n = 0; ins != null && n < 48; n++) {
+        int guards = 0;
+        for (int n = 0; ins != null && n < 64; n++) {
             if (n > 0 && joins(ins)) break;
             String mn = ins.getMnemonicString().toUpperCase();
             if (mn.startsWith("CALL") || mn.startsWith("INT") || mn.startsWith("RET") || mn.equals("IRET")) break;
+            String t = norm(ins);
+            // F3s: track [BP+d] local spills and F6 indexed RAM array stores of entry-input registers
+            int close = t.indexOf("],");
+            if (mn.equals("MOV") && close > 0 && t.indexOf('[') < close && !t.startsWith("MOVBYTEPTR")) {
+                String dst = t.substring(3, close + 1), src = t.substring(close + 2);
+                boolean word = dst.startsWith("WORDPTR") || R16.contains(src);
+                Matcher d = MEMOP.matcher(dst);
+                if (word && d.matches()) {
+                    Integer bpOff = bpLocal(d);
+                    if (bpOff != null) {
+                        Val v = R16.contains(src) ? regs.get(src) : null;
+                        if (v != null && v.input() != null) bpLocals.put(bpOff, v);
+                        else bpLocals.remove(bpOff);
+                    } else if (ea(d, regs) == null) {
+                        Field fld = field(d);
+                        if (fld != null) {
+                            Val v = R16.contains(src) ? regs.get(src) : null;
+                            if (v != null && v.input() != null) {
+                                fieldInputs.put(fld, v.input());
+                                for (int dd : new int[] { 2, -2 }) {
+                                    Field other = fld.plus(dd);
+                                    String otherReg = fieldInputs.get(other);
+                                    if (otherReg != null && !otherReg.equals(v.input())) {
+                                        outFields.add(new SetterFieldPair(fld, other, v.input(), otherReg));
+                                        outFields.add(new SetterFieldPair(other, fld, otherReg, v.input()));
+                                    }
+                                }
+                            } else {
+                                fieldInputs.remove(fld);
+                            }
+                        }
+                    }
+                }
+            }
+            // Reload of a spilled [BP+d] local into a 16-bit register
+            String reloadDst = null;
+            Val reloadVal = null;
+            Matcher mv = Pattern.compile("MOV(AX|BX|CX|DX|SI|DI|BP|DS|ES|SS),(.+)").matcher(t);
+            if (mv.matches()) {
+                Matcher sd = MEMOP.matcher(mv.group(2));
+                if (sd.matches()) {
+                    Integer bpOff = bpLocal(sd);
+                    if (bpOff != null) {
+                        reloadDst = mv.group(1);
+                        reloadVal = bpLocals.get(bpOff);
+                    }
+                }
+            }
             try { step(ins, regs, stack, chain); } catch (Exception e) { break; }
+            if (reloadDst != null && reloadVal != null) regs.put(reloadDst, reloadVal);
+            // Drop any fieldInputs whose base/index register was modified by this instruction
+            if (!fieldInputs.isEmpty() || !bpLocals.isEmpty()) {
+                for (Object o : ins.getResultObjects()) {
+                    if (!(o instanceof Register r)) continue;
+                    Register base = r.getBaseRegister();
+                    String rn = (base == null ? r.getName() : base.getName()).toUpperCase();
+                    if (rn.length() == 3 && rn.startsWith("E")) rn = rn.substring(1);
+                    String r16 = rn.length() == 2 && (rn.endsWith("L") || rn.endsWith("H")) && "ABCD".indexOf(rn.charAt(0)) >= 0
+                        ? rn.charAt(0) + "X" : rn;
+                    final String kill = r16;
+                    fieldInputs.keySet().removeIf(fld -> fld.uses(kill));
+                    if (kill.equals("BP") && !t.equals("MOVBP,SP")) bpLocals.clear();
+                }
+            }
             Address ft = ins.getFallThrough();
-            if (ft == null || ins.getFlowType().isJump()) break;
+            if (ft == null) break;
+            if (ins.getFlowType().isJump()) {
+                if (!ins.getFlowType().isConditional() || ++guards > 2) break;
+            }
             ins = listing.getInstructionAt(ft);
         }
         for (Store s : stores.subList(before, stores.size())) if (s.v().input() != null) out.put(s.m(), s.v().input());
         stores.subList(before, stores.size()).clear();
         fieldPairs.subList(pairsBefore, fieldPairs.size()).clear();   // setter chains carry inputs, not pointers
         chainFields.clear();
+        return new SetterInfo(out, outFields);
+    }
+
+    // ---- Rule CT3: RAM-pointed non-power-of-2 strided far-pointer record tables ----------------------------
+
+    static final Pattern CT3_OP = Pattern.compile("(?:DWORDPTR)?(?:(ES|DS):)?\\[(DI|SI|BX)(?:\\+0X([0-9A-F]+))?\\]");
+    static final Pattern CT3_MEM_BASE = Pattern.compile("(?:WORDPTR)?(?:(DS|SS|ES):)?\\[(SI|DI|BX)(?:([+-])0X([0-9A-F]+))?\\]");
+
+    /** CT3: detects CALLF/JMPF ES:[DI+field] / DS:[SI+field] strided record table dispatches backed by a
+     *  constant-initialized RAM far pointer and scaled by MUL imm8 / IMUL, and scans the ROM table with proven
+     *  stop rules (no unbounded over-reads). */
+    void detectCt3(List<Target> targets) throws Exception {
+        if (ramPtrs.isEmpty()) return;
+        for (Function f : p.getFunctionManager().getFunctions(true)) {
+            monitor.checkCancelled();
+            List<Ct3Site> sites = findCt3Sites(f);
+            if (sites.isEmpty()) continue;
+            // Group sites by (segReg, idxReg, stride) so all called fields of the same record are validated together
+            Map<String, List<Ct3Site>> groups = new LinkedHashMap<>();
+            for (Ct3Site s : sites)
+                groups.computeIfAbsent(s.segReg() + ":" + s.idxReg() + ":" + s.stride(), k -> new ArrayList<>()).add(s);
+            for (List<Ct3Site> grp : groups.values()) {
+                Ct3Site first = grp.get(0);
+                List<long[]> ramPairsForGroup = resolveCt3RamPairs(f, first);
+                if (ramPairsForGroup.isEmpty()) continue;
+                TreeSet<Integer> fields = new TreeSet<>();
+                Map<Integer, Address> fieldSite = new HashMap<>();
+                for (Ct3Site s : grp) {
+                    fields.add(s.fieldOff());
+                    fieldSite.putIfAbsent(s.fieldOff(), s.site());
+                }
+                for (long[] mp : ramPairsForGroup) {
+                    List<RamPtr> ptrs = ramPtrs.get((mp[0] << 20) | mp[1]);
+                    if (ptrs == null) continue;
+                    for (RamPtr rp : ptrs)
+                        scanCt3Table(rp, first.stride(), fields, fieldSite, mp[0], mp[1], targets);
+                }
+            }
+        }
+    }
+
+    /** Finds all CALLF/JMPF SEG:[IDX+field] sites in function f preceded by ADD IDX, prodReg and MUL imm / IMUL. */
+    List<Ct3Site> findCt3Sites(Function f) {
+        List<Ct3Site> out = new ArrayList<>();
+        InstructionIterator it = listing.getInstructions(f.getBody(), true);
+        while (it.hasNext()) {
+            Instruction ins = it.next();
+            String mn = ins.getMnemonicString().toUpperCase();
+            if (!mn.equals("CALLF") && !mn.equals("JMPF")) continue;
+            String t = norm(ins);
+            String op = t.substring(mn.length()).replace("+-", "-");
+            Matcher m = CT3_OP.matcher(op);
+            if (!m.matches()) continue;
+            String segReg = farSegOverride(ins, m.group(1));
+            if (!segReg.equals("ES") && !segReg.equals("DS")) continue;
+            String idxReg = m.group(2);
+            int fieldOff = m.group(3) == null ? 0 : Integer.parseInt(m.group(3), 16);
+            // Walk backwards in the same basic block for ADD idxReg, prodReg <- MUL <- MOV AL/AX, stride (or IMUL)
+            Address addSite = null;
+            String prodReg = null;
+            boolean sawMul = false;
+            int stride = -1;
+            Instruction cur = ins;
+            for (int k = 0; k < 10; k++) {
+                if (k > 0 && joins(cur)) break;
+                Instruction prev = listing.getInstructionBefore(cur.getAddress());
+                if (prev == null || !cur.getAddress().equals(prev.getFallThrough())) break;
+                String pmn = prev.getMnemonicString().toUpperCase();
+                if (pmn.startsWith("CALL") || pmn.startsWith("INT") || pmn.startsWith("RET") || pmn.equals("IRET")
+                        || (prev.getFlowType().isJump() && !prev.getFlowType().isConditional())) break;
+                String pt = norm(prev);
+                if (prodReg == null) {
+                    Matcher addM = Pattern.compile("ADD" + idxReg + ",(AX|BX|CX|DX|SI|DI)").matcher(pt);
+                    if (addM.matches()) {
+                        prodReg = addM.group(1);
+                        addSite = prev.getAddress();
+                    } else if (writesRegName(prev, idxReg)) {
+                        break;
+                    }
+                } else if (!sawMul) {
+                    Matcher imul3 = Pattern.compile("IMUL" + prodReg + ",[^,]+,0X([0-9A-F]+)").matcher(pt);
+                    if (imul3.matches()) {
+                        stride = Integer.parseInt(imul3.group(1), 16);
+                        break;
+                    }
+                    if ((pmn.equals("MUL") || pmn.equals("IMUL")) && prodReg.equals("AX")) {
+                        sawMul = true;
+                    } else if (writesRegName(prev, prodReg)) {
+                        break;
+                    }
+                } else {
+                    Matcher movK = Pattern.compile("MOV(?:AL|AX),0X([0-9A-F]+)").matcher(pt);
+                    if (movK.matches()) {
+                        stride = Integer.parseInt(movK.group(1), 16);
+                        break;
+                    }
+                    if (writesRegName(prev, "AX")) break;
+                }
+                cur = prev;
+            }
+            if (stride >= 4 && stride <= 256 && fieldOff + 4 <= stride && addSite != null)
+                out.add(new Ct3Site(ins.getAddress(), addSite, segReg, idxReg, fieldOff, stride));
+        }
         return out;
+    }
+
+    /** Resolves where (segReg, idxReg) were loaded from RAM before the CT3 dispatch: either a constant RAM pair
+     *  (mSeg, mOff) directly, or a struct-relative pair [baseReg+dSeg]/[baseReg+dOff] resolved via caller callState. */
+    List<long[]> resolveCt3RamPairs(Function f, Ct3Site site) {
+        List<long[]> out = new ArrayList<>();
+        // Collect candidate load instructions: first from the same basic block before addSite, else function entry prefix
+        List<Instruction> prefix = new ArrayList<>();
+        Instruction ins = listing.getInstructionAt(f.getEntryPoint());
+        for (int n = 0; ins != null && n < 32; n++) {
+            if (n > 0 && joins(ins)) break;
+            if (ins.getAddress().equals(site.addSite())) break;
+            String mn = ins.getMnemonicString().toUpperCase();
+            if (mn.startsWith("CALL") || mn.startsWith("INT") || mn.startsWith("RET") || mn.equals("IRET")
+                    || (ins.getFlowType().isJump() && !ins.getFlowType().isConditional())) break;
+            prefix.add(ins);
+            Address ft = ins.getFallThrough();
+            if (ft == null) break;
+            ins = listing.getInstructionAt(ft);
+        }
+        // Track constants & find MOV segReg, [mem] / MOV idxReg, [mem] / LES|LDS idxReg, [mem]
+        Map<String, Val> regs = new HashMap<>();
+        contextDs(f.getEntryPoint(), regs);
+        String segMem = null, offMem = null;
+        Long constSegM = null, constOffM = null;
+        Set<String> clobbered = new HashSet<>();
+        for (Instruction q : prefix) {
+            String mn = q.getMnemonicString().toUpperCase();
+            String t = norm(q);
+            if ((mn.equals("LES") && site.segReg().equals("ES")) || (mn.equals("LDS") && site.segReg().equals("DS"))) {
+                Matcher lm = Pattern.compile("(?:LES|LDS)" + site.idxReg() + ",(.+)").matcher(t);
+                if (lm.matches()) {
+                    Matcher dm = MEMOP.matcher(lm.group(1));
+                    if (dm.matches()) {
+                        Long m = ea(dm, regs);
+                        if (m != null) { constOffM = m; constSegM = (m + 2) & 0xFFFFF; }
+                        else { offMem = lm.group(1); segMem = "+2:" + lm.group(1); }
+                    }
+                }
+            } else if (mn.equals("MOV")) {
+                Matcher mv = Pattern.compile("MOV(ES|DS|DI|SI|BX),(.+)").matcher(t);
+                if (mv.matches()) {
+                    String dst = mv.group(1), src = mv.group(2);
+                    Matcher dm = MEMOP.matcher(src);
+                    if (dm.matches()) {
+                        Long m = ea(dm, regs);
+                        if (dst.equals(site.segReg())) {
+                            if (m != null) { constSegM = m; segMem = null; } else { segMem = src; constSegM = null; }
+                        } else if (dst.equals(site.idxReg())) {
+                            if (m != null) { constOffM = m; offMem = null; } else { offMem = src; constOffM = null; }
+                        }
+                    } else if (src.startsWith("0X")) {
+                        regs.put(dst, Val.konst(Integer.parseInt(src.substring(2), 16), q.getAddress()));
+                    } else if (R16.contains(src) && regs.containsKey(src)) {
+                        regs.put(dst, regs.get(src));
+                    }
+                }
+            }
+            for (Object o : q.getResultObjects()) {
+                if (!(o instanceof Register r)) continue;
+                Register base = r.getBaseRegister();
+                String rn = (base == null ? r.getName() : base.getName()).toUpperCase();
+                if (rn.length() == 3 && rn.startsWith("E")) rn = rn.substring(1);
+                if (!rn.equals(site.segReg()) && !rn.equals(site.idxReg())) clobbered.add(rn);
+            }
+        }
+        if (constSegM != null && constOffM != null && constSegM < 0x10000 && constOffM < 0x10000) {
+            out.add(new long[] { constSegM, constOffM });
+            return out;
+        }
+        if (segMem == null || offMem == null) return out;
+        // Struct-relative pair: [baseReg + dSeg] / [baseReg + dOff] resolved via callers' callState
+        boolean lesPair = segMem.startsWith("+2:");
+        Matcher mo = CT3_MEM_BASE.matcher(offMem.replace("+-", "-"));
+        Matcher ms = lesPair ? mo : CT3_MEM_BASE.matcher(segMem.replace("+-", "-"));
+        if (!mo.matches() || (!lesPair && !ms.matches())) return out;
+        String baseReg = mo.group(2);
+        if (!lesPair && !baseReg.equals(ms.group(2))) return out;
+        if (clobbered.contains(baseReg)) return out;
+        String offSegName = mo.group(1) != null ? mo.group(1) : "DS";
+        String segSegName = lesPair ? offSegName : (ms.group(1) != null ? ms.group(1) : "DS");
+        int dOff = mo.group(4) == null ? 0 : (mo.group(3).equals("-") ? -Integer.parseInt(mo.group(4), 16) : Integer.parseInt(mo.group(4), 16));
+        int dSeg = lesPair ? (dOff + 2) : (ms.group(4) == null ? 0 : (ms.group(3).equals("-") ? -Integer.parseInt(ms.group(4), 16) : Integer.parseInt(ms.group(4), 16)));
+        Set<Long> seenPairs = new HashSet<>();
+        for (Reference r : p.getReferenceManager().getReferencesTo(f.getEntryPoint())) {
+            if (!r.getReferenceType().isCall()) continue;
+            Map<String, Val> st = callState.get(r.getFromAddress());
+            if (st == null) continue;
+            Val bv = st.get(baseReg);
+            if (bv == null || bv.c() == null) continue;
+            Val svOff = st.getOrDefault(offSegName, regs.get(offSegName));
+            Val svSeg = st.getOrDefault(segSegName, regs.get(segSegName));
+            if (svOff == null || svOff.c() == null || svSeg == null || svSeg.c() == null) continue;
+            long mOff = (((long) svOff.c() << 4) + ((bv.c() + dOff) & 0xFFFF)) & 0xFFFFF;
+            long mSeg = (((long) svSeg.c() << 4) + ((bv.c() + dSeg) & 0xFFFF)) & 0xFFFFF;
+            if (mOff < 0x10000 && mSeg < 0x10000 && seenPairs.add((mSeg << 20) | mOff))
+                out.add(new long[] { mSeg, mOff });
+        }
+        return out;
+    }
+
+    /** Scans one CT3 ROM record table at rp.seg:rp.off with stride and called field offsets, stopping at the first
+     *  proven boundary (code, own target, out-of-ROM, invalid/offcut/data/undecodable far pointer, or cap 64). */
+    void scanCt3Table(RamPtr rp, int stride, TreeSet<Integer> fields, Map<Integer, Address> fieldSite,
+                      long mSeg, long mOff, List<Target> targets) throws Exception {
+        long tblLin = ((long) rp.seg() << 4) + rp.off();
+        if (tblLin < 0x40000 || tblLin >= 0x100000) return;
+        Address tblAddr = space.getAddress(rp.seg(), rp.off());
+        MemoryBlock tblBlock = mem.getBlock(tblAddr);
+        if (tblBlock == null || !tblBlock.isInitialized() || !tblBlock.isExecute() || WonderSwanLoader.isDataOverlay(tblBlock))
+            return;
+        String tblKey = String.format("%04x:%04x", rp.seg(), rp.off());
+        String dedupKey = tblKey + "/" + stride + "/" + fields;
+        if (ct3Done.contains(dedupKey)) return;
+
+        record RecTarget(int seg, int off, Address addr, int fieldOff, int recIdx) { }
+        List<RecTarget> accepted = new ArrayList<>();
+        Set<Address> ownTargets = new HashSet<>();
+        ghidra.app.util.PseudoDisassembler pd = new ghidra.app.util.PseudoDisassembler(p);
+        String stop = "CAP";
+        int records = 0;
+        for (int i = 0; i < 64; i++) {
+            Address recAddr;
+            try { recAddr = tblAddr.add((long) i * stride); } catch (Exception e) { stop = "OUT_OF_ROM"; break; }
+            Address recEnd;
+            try { recEnd = recAddr.add(stride - 1); } catch (Exception e) { stop = "OUT_OF_ROM"; break; }
+            if (!tblBlock.contains(recAddr) || !tblBlock.contains(recEnd)) { stop = "OUT_OF_ROM"; break; }
+            // Stop before reading into existing instructions, function entries, or own collected targets
+            String recStop = null;
+            for (int b = 0; b < stride; b++) {
+                Address ba = recAddr.add(b);
+                if (listing.getInstructionContaining(ba) != null) { recStop = "EXISTING_CODE"; break; }
+                if (p.getFunctionManager().getFunctionAt(ba) != null) { recStop = "FUNCTION_ENTRY"; break; }
+                if (ownTargets.contains(ba)) { recStop = "OWN_TARGET"; break; }
+            }
+            if (recStop != null) { stop = recStop; break; }
+
+            // Validate every called far-pointer field of record i before accepting record i
+            List<RecTarget> recPending = new ArrayList<>();
+            for (int fOff : fields) {
+                int off, seg;
+                try {
+                    off = mem.getShort(recAddr.add(fOff)) & 0xFFFF;
+                    seg = mem.getShort(recAddr.add(fOff + 2)) & 0xFFFF;
+                } catch (Exception e) { recStop = "OUT_OF_ROM"; break; }
+                if (seg == 0 && off == 0) continue;   // null placeholder
+                long rawLin = ((long) seg << 4) + off;
+                if (rawLin < 0x40000 || rawLin >= 0x100000) { recStop = "INVALID_TARGET"; break; }
+                Address ta = space.getAddress(seg, off);
+                MemoryBlock tb = mem.getBlock(ta);
+                if (tb == null || !tb.isInitialized() || !tb.isExecute() || WonderSwanLoader.isDataOverlay(tb) || ta.equals(tb.getEnd())) {
+                    recStop = "OUT_OF_ROM"; break;
+                }
+                if (listing.getInstructionAt(ta) == null) {
+                    if (listing.getInstructionContaining(ta) != null) { recStop = "OFFCUT"; break; }
+                    if (listing.getDefinedDataContaining(ta) != null) { recStop = "DATA"; break; }
+                    try {
+                        byte b0 = mem.getByte(ta), b1 = mem.getByte(ta.next());
+                        if (b0 == (byte) 0xFF && b1 == (byte) 0xFF) { recStop = "UNDECODABLE"; break; }
+                    } catch (Exception e) { recStop = "OUT_OF_ROM"; break; }
+                    try {
+                        ghidra.app.util.PseudoDisassemblerContext pc =
+                            new ghidra.app.util.PseudoDisassemblerContext(p.getProgramContext());
+                        if (csval != null) pc.setFutureRegisterValue(ta,
+                            new ghidra.program.model.lang.RegisterValue(csval, BigInteger.valueOf(seg)));
+                        if (pd.disassemble(ta, pc, false) == null) { recStop = "UNDECODABLE"; break; }
+                    } catch (Exception e) { recStop = "UNDECODABLE"; break; }
+                }
+                recPending.add(new RecTarget(seg, off, ta, fOff, i));
+            }
+            if (recStop != null) { stop = recStop; break; }
+            for (RecTarget rt : recPending) {
+                accepted.add(rt);
+                ownTargets.add(rt.addr());
+            }
+            records++;
+        }
+        ct3Done.add(dedupKey);
+        if (records == 0 || accepted.isEmpty()) return;
+        ct3Tables++;
+        Address firstSite = fieldSite.get(fields.first());
+        emit.accept(String.format("{\"rule\":\"CT3\",\"table\":\"%s\",\"stride\":%d,\"fields\":\"%s\",\"records\":%d,\"targets\":%d,\"stop\":\"%s\",\"site\":\"%s\",\"ram_seg\":\"%05x\",\"ram_off\":\"%05x\"}",
+            tblKey, stride, fields, records, accepted.size(), stop, firstSite, mSeg, mOff));
+        for (RecTarget rt : accepted) {
+            ct3Targets++;
+            Address site = fieldSite.getOrDefault(rt.fieldOff(), firstSite);
+            targets.add(new Target(rt.seg(), rt.off(), site,
+                String.format("CT3 table %s stride %d +%d [%d] (dispatch %s)", tblKey, stride, rt.fieldOff(), rt.recIdx(), site), true));
+        }
+    }
+
+    static String farSegOverride(Instruction ins, String explicitSeg) {
+        if (explicitSeg != null) return explicitSeg;
+        try {
+            byte[] bytes = ins.getBytes();
+            String seg = "DS";
+            for (byte b : bytes) {
+                int u = b & 0xFF;
+                if (u == 0x26) seg = "ES";
+                else if (u == 0x2E) seg = "CS";
+                else if (u == 0x36) seg = "SS";
+                else if (u == 0x3E) seg = "DS";
+                else if (u == 0xF0 || u == 0xF2 || u == 0xF3) continue;
+                else break;
+            }
+            return seg;
+        } catch (Exception e) { return "DS"; }
+    }
+
+    static boolean writesRegName(Instruction ins, String reg16) {
+        for (Object o : ins.getResultObjects()) {
+            if (!(o instanceof Register r)) continue;
+            Register base = r.getBaseRegister();
+            String rn = (base == null ? r.getName() : base.getName()).toUpperCase();
+            if (rn.length() == 3 && rn.startsWith("E")) rn = rn.substring(1);
+            String r16 = rn.length() == 2 && (rn.endsWith("L") || rn.endsWith("H")) && "ABCD".indexOf(rn.charAt(0)) >= 0
+                ? rn.charAt(0) + "X" : rn;
+            if (r16.equals(reg16)) return true;
+        }
+        return false;
     }
 
     // ---- accepting a target --------------------------------------------------------------------------------
@@ -626,6 +1097,11 @@ final class WSCodePointers {
             return v != null && v.intValue() != 0 ? v.intValue() : sa.getSegment();
         }
         return (int) (a.getOffset() >> 4) & 0xF000;
+    }
+
+    static String ruleOf(String via) {
+        int sp = via.indexOf(' ');
+        return sp > 0 ? via.substring(0, sp) : via;
     }
 
     boolean accept(Target t) throws Exception {
@@ -657,7 +1133,7 @@ final class WSCodePointers {
             if (!why.equals("NULL_POINTER")) rejected++;
             rejects.merge(why, 1, Integer::sum);
             emit.accept(String.format("{\"rule\":\"%s\",\"target\":\"%s\",\"from\":\"%s\",\"via\":\"%s\",\"outcome\":\"%s\"}",
-                t.via().substring(0, 2), key, t.from(), t.via(), why));
+                ruleOf(t.via()), key, t.from(), t.via(), why));
             return false;
         }
         String outcome;
@@ -682,7 +1158,7 @@ final class WSCodePointers {
         if (listing.getInstructionAt(a) != null)
             p.getBookmarkManager().setBookmark(a, BookmarkType.ANALYSIS, "WSEvidence", t.via() + " from " + t.from());
         emit.accept(String.format("{\"rule\":\"%s\",\"target\":\"%s\",\"from\":\"%s\",\"via\":\"%s\",\"outcome\":\"%s\"}",
-            t.via().substring(0, 2), key, t.from(), t.via(), outcome));
+            ruleOf(t.via()), key, t.from(), t.via(), outcome));
         return !outcome.equals("EXISTING_CODE") || t.function() && outcome.equals("NEW_FUNCTION");
     }
 }
