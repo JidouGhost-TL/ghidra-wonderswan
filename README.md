@@ -15,6 +15,10 @@ Reference material: [`docs/V30MZ-SPEC-NOTES.md`](docs/V30MZ-SPEC-NOTES.md) (cite
 
 No ROMs are included. Use cartridge dumps you are entitled to use.
 
+## Community & Support
+
+Come discuss the wonders of WonderSwan RE, modding, etc... also the best way to report issues or bugs, or ask for help on your own project: [Join our Discord](https://discord.gg/VswKtaKyhv) (`https://discord.gg/VswKtaKyhv`).
+
 ## Requirements
 
 - Ghidra **12.1.3** (extensions are built against, and only install into, the exact Ghidra version)
