@@ -24,11 +24,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.app.cmd.function.DecompilerSwitchAnalysisCmd;
+import ghidra.app.decompiler.DecompInterface;
+import ghidra.app.decompiler.DecompileOptions;
 import ghidra.app.decompiler.DecompileResults;
+import ghidra.app.decompiler.parallel.DecompileConfigurer;
 import ghidra.app.decompiler.parallel.DecompilerCallback;
 import ghidra.app.decompiler.parallel.ParallelDecompiler;
 import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
-import ghidra.app.plugin.core.analysis.SwitchAnalysisDecompileConfigurer;
 import ghidra.app.services.*;
 import ghidra.app.util.importer.MessageLog;
 import ghidra.framework.options.Options;
@@ -66,6 +68,12 @@ public class WSDecompilerSwitchAnalyzer extends AbstractAnalyzer {
 	public static final String STOCK = "Decompiler Switch Analysis";
 	/** Functions decompiled before their switches are applied; fixed, so every run sees the same program states. */
 	public static final int CHUNK = 32;
+	/** Per-function instruction cap for switch analysis on 16-bit 64 KiB segments; stops runaway unguarded switches
+	 *  from disassembling half a segment and exhausting native decompiler memory. */
+	public static final int MAX_SWITCH_INSTRUCTIONS = 2000;
+	/** Per-switch table entry cap on 16-bit segments; stops unguarded 16-bit index switches from reading up to
+	 *  Ghidra's 1024-entry default across non-table ROM bytes. */
+	public static final int MAX_SWITCH_ENTRIES = 256;
 	private static final String DESCRIPTION =
 		"Creates switch statements for dynamic instructions using Decompiler, in a fixed order (repeatable imports).";
 	private MessageLog log = new MessageLog();
@@ -185,9 +193,23 @@ public class WSDecompilerSwitchAnalyzer extends AbstractAnalyzer {
 			TaskMonitor monitor) throws InterruptedException, Exception {
 
 		// SW1: decompiles only read the program; results are applied afterwards, in entry-point order
+		DecompileConfigurer configurer = new DecompileConfigurer() {
+			@Override
+			public void configure(DecompInterface decompiler) {
+				decompiler.toggleCCode(false);
+				decompiler.toggleJumpLoads(true);
+				decompiler.toggleSyntaxTree(false);
+				decompiler.setSimplificationStyle("decompile");
+				DecompileOptions options = new DecompileOptions();
+				options.setEliminateUnreachable(false);
+				options.grabFromProgram(program);
+				options.setMaxInstructions(MAX_SWITCH_INSTRUCTIONS);
+				options.setMaxJumpTableEntries(MAX_SWITCH_ENTRIES);
+				decompiler.setOptions(options);
+			}
+		};
 		DecompilerCallback<DecompileResults> callback =
-			new DecompilerCallback<DecompileResults>(program,
-				new SwitchAnalysisDecompileConfigurer(program)) {
+			new DecompilerCallback<DecompileResults>(program, configurer) {
 
 				@Override
 				public DecompileResults process(DecompileResults results, TaskMonitor m) {
@@ -289,8 +311,10 @@ public class WSDecompilerSwitchAnalyzer extends AbstractAnalyzer {
 				continue;
 			}
 
-
 			Address address = instruction.getMinAddress();
+			if (WSSwitchOrderAnalyzer.isUnguardedHazard(program, address)) {
+				continue;
+			}
 			locations.add(address);
 			long remaining = (maxAddress.getOffset() - address.getOffset()) + address.getSize();
 			monitor.setProgress(total - remaining);

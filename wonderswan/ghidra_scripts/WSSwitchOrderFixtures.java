@@ -36,6 +36,10 @@ import jidoughost.wonderswan.WonderSwanLoader;
  *             phase-2 J1 (the equality exemption covers only JZ leaving the slice or a compare of another register).
  * cmp_ah_jnz: MOV AL,[BP+4]; CMP AH,0FFh; JNZ out; XOR AH,AH; SHL AX,1; MOV BX,AX; JMP CS:[BX+tbl]: AH is disjoint
  *             from the AL index (high byte cleared by XOR AH,AH), so JNZ does not constrain AL and J1u applies.
+ * xor_reg:    XOR AX,AX; MOV AL,[BP+4]; SHL AX,1; MOV BX,AX; ADD BX,tbl; JMP CS:[BX]: full-register zeroing before
+ *             the low-byte load clears the high byte, so J1u recognises the byte bound and recovers the 7-slot table.
+ * inv_eq_jnz: MOV AL,[BP+4]; CMP AL,0FFh; JNZ next; JMP out; next: XOR AH,AH; ADD AX,AX; MOV BX,tbl; ADD BX,AX;
+ *             MOV AX,CS:[BX]; JMP AX: inverted equality exclusion skips an unconditional JMP, providing no range bound.
  * guarded:    CMP AL,6; JA out before the scaling: stock switch recovery bounds it itself and keeps it (unchanged).
  * guardmask:  CMP AL,6; JA out before SHL and an AND mask: guarded, left to stock recovery (unchanged).
  *
@@ -91,6 +95,12 @@ public class WSSwitchOrderFixtures extends GhidraScript {
             // MOV AL,[BP+4]; CMP AH,0FFh; JNZ 0053h; XOR AH,AH; SHL AX,1; MOV BX,AX; JMP CS:[BX+0060h]; RET
             // (AH is disjoint from AL; XOR AH,AH clears AH before scaling, so JNZ on AH does not guard AL)
             put(rom, 0x40, "8a460480fcff750b32e4d1e08bd82effa76000c3");
+        } else if (variant.equals("xor_reg")) {
+            // NOP; XOR AX,AX; MOV AL,[BP+4]; SHL AX,1; MOV BX,AX; ADD BX,0060h; JMP CS:[BX]
+            put(rom, 0x40, "9031c08a4604d1e08bd881c360002eff27");
+        } else if (variant.equals("inv_eq_jnz")) {
+            // MOV AL,[BP+4]; CMP AL,0FFh; JNZ 004Ah; JMP 0058h; XOR AH,AH; ADD AX,AX; MOV BX,0060h; ADD BX,AX; MOV AX,CS:[BX]; JMP AX; RET
+            put(rom, 0x40, "8a46043cff7503e90e0032e403c0bb600003d82e8b07ffe0c3");
         } else if (variant.equals("eqmask")) {
             // IN AL,0B5h; CMP AL,0FFh; JZ 0055h; MOV BL,AL; MOV BH,0; AND BX,00FEh; ADD BX,0060h; JMP CS:[BX]; RET
             put(rom, 0x40, "e4b53cff740f88c3b70081e3fe0081c360002eff27c3");
@@ -207,8 +217,9 @@ public class WSSwitchOrderFixtures extends GhidraScript {
             try { analyzeAll(p); } finally { p.endTransaction(tx, true); }
             long seconds = (System.nanoTime() - t0) / 1_000_000_000L;
             check(variant, seconds < 120, "analysis finished in " + seconds + " s");
-            Address site = at(p, guardedVariant(variant) ? SITE_GUARDED : variant.equals("masked") || variant.equals("cmp_ah_jnz") ? SITE_MASKED
-                : variant.equals("eqmask") ? 0x52 : SITE_PROVEN);
+            Address site = at(p, guardedVariant(variant) ? SITE_GUARDED
+                : variant.equals("masked") || variant.equals("cmp_ah_jnz") || variant.equals("xor_reg") ? SITE_MASKED
+                : variant.equals("eqmask") ? 0x52 : variant.equals("inv_eq_jnz") ? 0x56 : SITE_PROVEN);
             Instruction ins = p.getListing().getInstructionAt(site);
             check(variant, ins != null && ins.toString().startsWith("JMP"), "dispatch site decoded: " + ins);
             if (ins == null) return;
@@ -247,7 +258,9 @@ public class WSSwitchOrderFixtures extends GhidraScript {
             for (int h : ADJACENT) decoded &= p.getListing().getInstructionAt(at(p, h)) != null;
             check(variant, decoded, "all 7 handlers decoded");
             AddressSet code = new AddressSet(at(p, 0x00), at(p, 0x10));
-            code.add(at(p, 0x40), at(p, guardedVariant(variant) ? 0x57 : variant.equals("eqmask") || variant.equals("cmp_ah_jnz") ? 0x55 : 0x52));
+            code.add(at(p, 0x40), at(p, guardedVariant(variant) ? 0x57
+                : variant.equals("inv_eq_jnz") ? 0x58
+                : variant.equals("eqmask") || variant.equals("cmp_ah_jnz") ? 0x55 : 0x52));
             code.add(at(p, 0x6e), at(p, 0x9e));
             List<Address> stray = new ArrayList<>();
             for (Instruction i : p.getListing().getInstructions(true))
@@ -272,7 +285,7 @@ public class WSSwitchOrderFixtures extends GhidraScript {
     public void run() throws Exception {
         File dir = Files.createTempDirectory("ws-switch-order").toFile();
         String[] args = getScriptArgs();
-        List<String> variants = args.length > 0 ? List.of(args) : List.of("proven", "masked", "eqmask", "eqjnz", "cmp_ah_jnz", "copy", "unprovable", "npe", "conflict",
+        List<String> variants = args.length > 0 ? List.of(args) : List.of("proven", "masked", "eqmask", "eqjnz", "cmp_ah_jnz", "xor_reg", "inv_eq_jnz", "copy", "unprovable", "npe", "conflict",
             "withdraw", "guarded", "guardmask");
         for (String v : variants) {
             try { fixture(dir, v); }

@@ -41,6 +41,13 @@ public class WSSwitchOrderAnalyzer extends AbstractAnalyzer {
     /** The J1u state of a program in this session (null when J1u did not run), for rule J1uw in phase 2. */
     static WSJumpTables beforeSwitch(Program program) { return STATE.get(program); }
 
+    /** True when J1u already identified {@code site} as an unguarded byte-index or masked CS jump table whose
+     *  extent could not be proven or safely applied (Rule C hazard). */
+    static boolean isUnguardedHazard(Program program, ghidra.program.model.address.Address site) {
+        WSJumpTables j = STATE.get(program);
+        return j != null && j.unguardedHazards.contains(site);
+    }
+
     public WSSwitchOrderAnalyzer() {
         super(NAME, "Applies proven CS-relative jump tables with an unguarded byte or masked index (rule J1u) before "
             + "Decompiler Switch Analysis, which would otherwise read every byte-index slot.",

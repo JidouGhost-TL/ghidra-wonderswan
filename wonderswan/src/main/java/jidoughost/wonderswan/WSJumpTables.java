@@ -509,10 +509,44 @@ public final class WSJumpTables {
             }
             if (q != site && q.getFlowType().isConditional() && !equalityExclusion(q, qi + 1 < slice.size() ? slice.get(qi + 1) : null, reg))
                 return false;
+            boolean hasJoin = false;
             for (Reference ref : p.getReferenceManager().getReferencesTo(q.getAddress()))
-                if (ref.getReferenceType().isJump() || ref.getReferenceType().isConditional()) return false;
+                if (ref.getReferenceType().isJump() || ref.getReferenceType().isConditional()) { hasJoin = true; break; }
+            if (hasJoin) {
+                Instruction cmp = invertedEqualityExclusion(q);
+                if (cmp == null) return false;
+                if (qi + 1 == slice.size() && slice.size() < 20)
+                    slice.addAll(predecessors(cmp, 20 - slice.size()));
+            }
         }
         return true;
+    }
+
+    /** Inverted equality exclusion for far/near jump skips: {@code CMP reg,imm; JNZ target; JMP away; target:} where
+     *  {@code target} has no fall-through and its only incoming jump is that {@code JNZ/JNE}. Semantically identical to
+     *  {@code CMP reg,imm; JZ away; target:} — excludes one value and provides no range bound. Returns the {@code CMP}
+     *  instruction so the caller can continue walking backward before it, or null if not this pattern. */
+    private Instruction invertedEqualityExclusion(Instruction target) {
+        if (target.getFallFrom() != null) return null;
+        Instruction br = null;
+        for (Reference ref : p.getReferenceManager().getReferencesTo(target.getAddress())) {
+            if (!ref.getReferenceType().isJump() && !ref.getReferenceType().isConditional()) continue;
+            if (br != null) return null;
+            br = listing.getInstructionAt(ref.getFromAddress());
+            if (br == null) return null;
+        }
+        if (br == null) return null;
+        String m = br.getMnemonicString().toUpperCase();
+        if (!m.equals("JNZ") && !m.equals("JNE")) return null;
+        Address ft = br.getFallThrough();
+        Instruction skip = ft == null ? null : listing.getInstructionAt(ft);
+        if (skip == null || !skip.getMnemonicString().equalsIgnoreCase("JMP") || skip.getFlowType().isConditional())
+            return null;
+        Address cmpAddr = br.getFallFrom();
+        Instruction cmp = cmpAddr == null ? null : listing.getInstructionAt(cmpAddr);
+        if (cmp == null) return null;
+        String ct = cmp.toString().toUpperCase().replace(" ", "");
+        return Pattern.compile("CMP([A-Z]{2}),-?0X[0-9A-F]+").matcher(ct).matches() ? cmp : null;
     }
 
     /** An equality test that bounds no range for switch recovery, so it is no guard: JZ/JE on the flags of
@@ -570,6 +604,7 @@ public final class WSJumpTables {
             String skip = !r.byteBound && r.maskOffsets == null ? null : !unguardedByteIndex(ins, r) ? "GUARDED"
                 : r.targets.isEmpty() ? "NOT_PROVEN" : null;
             if (skip != null || r.targets.isEmpty() || !unguardedByteIndex(ins, r)) {
+                if ("NOT_PROVEN".equals(skip)) unguardedHazards.add(ins.getAddress());
                 if (skip != null)
                     emit.accept(String.format("{\"rule\":\"J1u\",\"site\":\"%s\",\"insn\":\"%s\",\"outcome\":\"LEFT_TO_LATER_PASSES\",\"why\":\"%s\",\"shape\":\"%s\",\"stop\":\"%s\",\"slots\":%d}",
                         ins.getAddress(), ins, skip, r.shape, r.stop, r.slots));
@@ -583,7 +618,11 @@ public final class WSJumpTables {
         for (Map.Entry<Instruction, Rec> e : recs.entrySet()) {
             monitor.checkCancelled();
             try {
-                if (!applySite(e.getKey(), e.getValue(), monitor)) { conflicts.put(e.getKey().getAddress(), e.getValue()); continue; }
+                if (!applySite(e.getKey(), e.getValue(), monitor)) {
+                    conflicts.put(e.getKey().getAddress(), e.getValue());
+                    unguardedHazards.add(e.getKey().getAddress());
+                    continue;
+                }
             }
             catch (ghidra.util.exception.CancelledException c) { throw c; }
             catch (Exception x) {
@@ -607,6 +646,9 @@ public final class WSJumpTables {
     final Set<Address> recoveredSites = new HashSet<>();
     /** J1u: site -> targets it applied before stock switch analysis. */
     final Map<Address, List<Address>> beforeSwitchTargets = new LinkedHashMap<>();
+    /** J1u: unguarded byte-index or masked CS jump tables that J1u could not prove or apply (Rule C hazards);
+     *  switch recovery cannot bound their index without overrunning into non-table bytes. */
+    final Set<Address> unguardedHazards = new HashSet<>();
     int withdrawn;
 
     /**
@@ -1902,12 +1944,14 @@ public final class WSJumpTables {
             if (t.startsWith("ADD" + reg + ",0X")) continue;
             if (t.equals("ADD" + reg + "," + reg)) { shift++; continue; }   // x2 scaling
             if (t.equals("XOR" + hi + "," + hi) || t.equals("MOV" + hi + ",0X0") || t.equals("SUB" + hi + "," + hi)) { hiClear = true; if (loByte) break; continue; }
+            if (loByte && (t.equals("XOR" + reg + "," + reg) || t.equals("SUB" + reg + "," + reg) || t.equals("MOV" + reg + ",0X0"))) { hiClear = true; break; }
             if (t.startsWith("MOV" + lo + ",")) { loByte = true; if (hiClear) break; continue; }
+            if (t.startsWith("SUB" + lo + ",") || t.startsWith("ADD" + lo + ",")) { loByte = true; continue; }
             if (t.equals("CBW") && reg.equals("AX")) { cbw = true; loByte = true; hiClear = true; break; }
             if (t.startsWith("MOVZX" + reg)) { loByte = true; hiClear = true; break; }
             if (writes(t, reg)) { if (r.bound.startsWith("via ")) r.bound = "none"; return; }
         }
-        if (!(hiClear && loByte)) { if (r.bound.startsWith("via ")) r.bound = "none"; return; }
+        if (!hiClear) { if (r.bound.startsWith("via ")) r.bound = "none"; return; }
         int bytes = (cbw ? 128 : 256) << shift;           // CBW: only the 0..127 half lies at or after the base
         r.cap = Math.max(1, bytes / r.stride);
         r.byteBound = true;
