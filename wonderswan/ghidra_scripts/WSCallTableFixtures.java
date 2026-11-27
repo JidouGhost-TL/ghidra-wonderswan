@@ -513,6 +513,97 @@ public class WSCallTableFixtures extends GhidraScript {
         } finally { done(p); }
     }
 
+    /** CT1a-ES/DS: CALLF/JMPF via constant-ROM ES/DS segment, plus negative controls (WRAM / clobbered ES). */
+    void farEsDs(String variant) throws Exception {
+        byte[] m = fill(0x1000), o = fill(0x100);
+        if (variant.equals("es-callf"))
+            // MOV CX,0x4000; MOV ES,CX; MOV AL,[0x10]; CBW; MOV SI,AX; SHL SI,1; SHL SI,1; CALLF ES:[SI+0x100]; RET
+            put(m, 0x40, "b900408ec1a01000988bf0d1e6d1e626ff9c0001c3");      // site at 4000:004f
+        else if (variant.equals("ds-jmpf"))
+            // MOV AX,0x4000; MOV DS,AX; MOV BL,[0x10]; XOR BH,BH; SHL BX,1; SHL BX,1; JMPF DS:[BX+0x100]
+            put(m, 0x40, "b800408ed88a1e100032ffd1e3d1e33effaf0001");        // site at 4000:004f
+        else if (variant.equals("ctrl-wram"))
+            // MOV CX,0x0000; MOV ES,CX; SHL SI,1; SHL SI,1; CALLF ES:[SI+0x100]; RET
+            put(m, 0x40, "b900008ec1d1e6d1e626ff9c0001c3");
+        else
+            // MOV CX,0x4000; MOV ES,CX; MOV ES,BX; SHL SI,1; SHL SI,1; CALLF ES:[SI+0x100]; RET
+            put(m, 0x40, "b900408ec18ec3d1e6d1e626ff9c0001c3");
+        put(m, 0x100, "1000005020000050");                                   // 5000:0010, 5000:0020
+        put(m, 0x108, "c3");                                                 // strong stop (function entry)
+        put(o, 0x10, "b80100cb"); put(o, 0x20, "b80200cb");
+        ProgramDB p = make("ct1a-esds-" + variant, m, o);
+        try {
+            code(p, 0x40, true); code(p, 0x108, true);
+            repair(p, new WSEvidence());
+            Address t0 = at(p, 0x5000, 0x10), t1 = at(p, 0x5000, 0x20);
+            if (variant.startsWith("ctrl-")) {
+                check(!insn(p, t0), "CT1a-ES/DS control (" + variant + "): must not recover table");
+            } else {
+                check(insn(p, t0) && insn(p, t1), "CT1a-ES/DS (" + variant + ") targets decoded");
+                check(ref(p, 0x4f, t0) && ref(p, 0x4f, t1), "CT1a-ES/DS (" + variant + ") computed refs");
+            }
+        } finally { done(p); }
+    }
+
+    /** J1-STACKSAVE: MOV AH,0; PUSH AX; CALL helper; POP AX; JC skip; SHL AX,1; MOV BX,AX; CALL CS:[BX+0x100]. */
+    void stackSave(boolean balanced) throws Exception {
+        byte[] m = fill(0x1000);
+        if (balanced)
+            // MOV AL,[0x10]; MOV AH,0; PUSH AX; CALL 0x0080; POP AX; JC +0x8; SHL AX,1; MOV BX,AX; CALL CS:[BX+0x100]; RET
+            put(m, 0x40, "a01000b40050e83700587208d1e08bd82eff970001c3");    // site at 4000:0050
+        else
+            // Unbalanced: PUSH AX; PUSH BX; CALL 0x0080; POP AX; ...
+            put(m, 0x40, "a01000b4005053e83600587208d1e08bd82eff970001c3");  // site at 4000:0051
+        put(m, 0x80, "f8c3");                                                // CLC; RET
+        put(m, 0x100, "000220024002");                                       // 3 near slots
+        put(m, 0x106, "c3");                                                 // strong stop
+        for (int t : new int[] { 0x200, 0x220, 0x240 }) put(m, t, "b80100c3");
+        ProgramDB p = make(balanced ? "j1-stacksave" : "j1-stacksave-ctrl", m, null);
+        try {
+            code(p, 0x40, true); code(p, 0x80, true); code(p, 0x106, true);
+            List<String> lines = repair(p, new WSEvidence());
+            if (balanced) {
+                for (int t : new int[] { 0x200, 0x220, 0x240 })
+                    check(insn(p, at(p, t)) && ref(p, 0x50, at(p, t)), "J1-STACKSAVE target " + Integer.toHexString(t));
+            } else {
+                boolean claimedStackSave = lines.stream().anyMatch(l -> l.contains("J1-STACKSAVE") || l.contains("byte index"));
+                check(!claimedStackSave, "J1-STACKSAVE control: unbalanced stack must not claim J1-STACKSAVE or byte index");
+            }
+        } finally { done(p); }
+    }
+
+    /** J1-NULLGUARD: MOV AX,CS:[BX+0x100]; OR/TEST/CMP AX,0; JE skip; CALL AX (with 0000 empty slot). */
+    void nullGuard(String variant) throws Exception {
+        byte[] m = fill(0x1000);
+        int siteOff;
+        if (variant.equals("or")) {
+            // MOV BL,[0x10]; XOR BH,BH; SHL BX,1; MOV AX,CS:[BX+0x100]; OR AX,AX; JE +2; CALL AX; RET
+            put(m, 0x40, "8a1e100032ffd1e32e8b8700010bc07402ffd0c3");
+            siteOff = 0x51;
+        } else if (variant.equals("test")) {
+            put(m, 0x40, "8a1e100032ffd1e32e8b87000185c07402ffd0c3");
+            siteOff = 0x51;
+        } else {
+            // Negative control: OR AX,1 modifies AX before CALL AX -> must not recover
+            put(m, 0x40, "8a1e100032ffd1e32e8b87000183c8017402ffd0c3");
+            siteOff = 0x52;
+        }
+        put(m, 0x100, "000200004002");                                       // slot 1 is 0000 (empty)
+        put(m, 0x106, "c3");                                                 // strong stop
+        for (int t : new int[] { 0x200, 0x240 }) put(m, t, "b80100c3");
+        ProgramDB p = make("j1-nullguard-" + variant, m, null);
+        try {
+            code(p, 0x40, true); code(p, 0x106, true);
+            repair(p, new WSEvidence());
+            if (variant.equals("ctrl-or-imm")) {
+                check(!insn(p, at(p, 0x200)), "J1-NULLGUARD control: OR AX,1 must not recover table");
+            } else {
+                for (int t : new int[] { 0x200, 0x240 })
+                    check(insn(p, at(p, t)) && ref(p, siteOff, at(p, t)), "J1-NULLGUARD (" + variant + ") target " + Integer.toHexString(t));
+            }
+        } finally { done(p); }
+    }
+
     @Override public void run() throws Exception {
         String only = getScriptArgs().length > 0 ? getScriptArgs()[0] : "";
         Map<String, ThrowingRunnable> all = new LinkedHashMap<>();
@@ -539,6 +630,15 @@ public class WSCallTableFixtures extends GhidraScript {
         all.put("J1jp-own-call-target-near", () -> ownCallTarget("near"));
         all.put("J1jp-own-call-target-far", () -> ownCallTarget("far"));
         all.put("J1jp-control-data-bytes", () -> ownCallTarget("control"));
+        all.put("CT1a-ES-callf", () -> farEsDs("es-callf"));
+        all.put("CT1a-DS-jmpf", () -> farEsDs("ds-jmpf"));
+        all.put("CT1a-ES-control-wram", () -> farEsDs("ctrl-wram"));
+        all.put("CT1a-ES-control-clobbered", () -> farEsDs("ctrl-clobbered"));
+        all.put("J1-STACKSAVE-balanced", () -> stackSave(true));
+        all.put("J1-STACKSAVE-control-unbalanced", () -> stackSave(false));
+        all.put("J1-NULLGUARD-or", () -> nullGuard("or"));
+        all.put("J1-NULLGUARD-test", () -> nullGuard("test"));
+        all.put("J1-NULLGUARD-control-or-imm", () -> nullGuard("ctrl-or-imm"));
         all.put("F2v-default-ds-not-vector", () -> vectorProof(false));
         all.put("F2v-control-proven-vector", () -> vectorProof(true));
         all.put("F2v-observed-ds-hardware-vector", () -> vectorObservedDs(true));
