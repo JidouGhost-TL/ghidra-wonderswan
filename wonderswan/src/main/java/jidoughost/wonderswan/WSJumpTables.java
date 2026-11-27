@@ -139,9 +139,17 @@ import ghidra.util.task.TaskMonitor;
  *   table is kept only when it ends on a strong stop (the J1b proof); otherwise the 64-slot result stands as before.
  * CT1d (J1o extended to the segment end): a near slot 0xFFFF (last byte of the code segment, where the IP wraps) and a
  *   far slot FFFF:FFFF (past 1 MiB) are skipped like empty slots: no routine entry can live there.
+ * J1-ES/DS: near tables read through ES:[...] or DS:[...] (direct or register-loaded) when ES/DS is proven to hold a
+ *   constant linear ROM segment (or the site's own ROM segment) in the same fall-through chain (MOV r,imm; MOV ES/DS,r,
+ *   MOV r,CS; MOV ES/DS,r, or PUSH CS; POP ES/DS). Linear-alias segments resolve to canonical linear ROM addresses; near
+ *   targets still execute in the site's CS. Commuted J1i (MOV idx,imm; ADD idx,scaled) and register copies (MOV idx,src)
+ *   are followed along the backward slice while preserving all J1/CT1/Rule C guards.
+ * J1j+ (OWN_CALL_TARGET): for an unbounded/weak-stopped near table with >= 2 plausible slots, if trial-decoded control
+ *   flow inside tentative slot k (0 <= k < m) directly CALLs or CALLFs the slot boundary table + stride*m (m >= 2) and
+ *   that boundary decodes cleanly as a code entry, table + stride*m is a proven DIRECT_CALL_ENTRY strong stop.
  */
 public final class WSJumpTables {
-    static final Pattern MEM = Pattern.compile("word ptr CS:\\[(BX|SI|DI|BP)(?: ?([+-]) ?0x([0-9a-f]+))?\\]", Pattern.CASE_INSENSITIVE);
+    static final Pattern MEM = Pattern.compile("word ptr (?:(CS|ES|DS):)?\\[(BX|SI|DI|BP)(?: ?([+-]) ?0x([0-9a-f]+))?\\]", Pattern.CASE_INSENSITIVE);
 
     static final class Rec {
         String shape = "?", idx, scaledBy = null, bound = "none", stop = "BOUND";
@@ -151,9 +159,11 @@ public final class WSJumpTables {
         List<Integer> slotOf = new ArrayList<>(); // slot index of each target
         List<Integer> emptySlots = new ArrayList<>();
         int base, disp, table, cap = 64;
+        int tableSeg = -1;                      // J1-ES/DS: segment holding the table (-1 -> site's CS)
+        String tableSegReg = "CS";              // segment register reading the table (CS/ES/DS)
         int width = 2;                          // CT1a: 4 for far (offset, segment) slots
         int stride = 2;                         // CT1g: bytes between slots (> width for records of several pointers)
-        String ct1;                             // CT1a/b/c/e provenance (null: plain J1)
+        String ct1;                             // CT1a/b/c/e / J1-ES/DS / J1j+ provenance (null: plain J1)
         boolean allowPlaceholders;              // CT1e
         List<Integer> placeholderSlots = new ArrayList<>();
         Set<Address> placeholderTargets = new HashSet<>();
@@ -200,10 +210,10 @@ public final class WSJumpTables {
     record QuarRef(Address to, RefType type) { }
     void apply(TaskMonitor monitor) throws Exception {
         for (int pass = 0; pass < 16; pass++) {
-            int before = done.size() + quarantined.size();
+            int recBefore = recovered, qBefore = quarantined.size();
             applyPass(monitor);
             passes++;
-            if (done.size() + quarantined.size() == before) break;
+            if (recovered == recBefore && quarantined.size() == qBefore) break;
         }
         dropOverlayEndRefs();
     }
@@ -433,7 +443,8 @@ public final class WSJumpTables {
                         continue;
                     }
                     done.add(e.getKey().getAddress());
-                    if (quarantined.remove(e.getKey().getAddress()) != null) reported.remove(e.getKey().getAddress());
+                    reported.remove(e.getKey().getAddress());
+                    quarantined.remove(e.getKey().getAddress());
                 }
             }
             catch (ghidra.util.exception.CancelledException c) { throw c; }
@@ -584,7 +595,8 @@ public final class WSJumpTables {
         List<Instruction> sites = new ArrayList<>();
         for (Instruction ins : listing.getInstructions(set, true)) {
             monitor.checkCancelled();
-            if (ins.toString().contains("CS:[")) csOperands.add(ins.getAddress());
+            String txt = ins.toString();
+            if (txt.contains("CS:[") || txt.contains("ES:[") || txt.contains("DS:[")) csOperands.add(ins.getAddress());
             if (!ins.getFlowType().isJump() || !ins.getFlowType().isComputed()) continue;
             if (!ins.getMnemonicString().equalsIgnoreCase("JMP") || done.contains(ins.getAddress())) continue;
             sites.add(ins);
@@ -762,7 +774,8 @@ public final class WSJumpTables {
             return;
         }
         if (quarantined.containsKey(site)) return;   // still unresolved after quarantine: wait for more code
-        done.add(site);
+        // Do not freeze in `done`: a later pass (e.g. a sibling table creating a FUNCTION_ENTRY at this table's end)
+        // may prove this site on retry; `apply()` exits as soon as a pass recovers/quarantines nothing new.
         if (reported.add(site)) emitUnresolved(ins, r);
     }
 
@@ -939,13 +952,16 @@ public final class WSJumpTables {
             emit.accept(String.format("{\"rule\":\"J1x\",\"site\":\"%s\",\"continuation\":\"%s\",\"outcome\":\"PUSHED_NEAR_CALL\"}", ins.getAddress(), r.returnEnd));
         }
         int dataSlots = 0;
+        int tseg = r.tableSeg >= 0 ? r.tableSeg : cs;
         if (r.maskOffsets == null) {
-            if (r.slots > 0 && WSInlineTables.words(p, seg(cs, r.table), ((r.slots - 1) * r.stride + r.width) / 2, ins.getAddress(), emit)) dataSlots = r.slots;
+            Address tbl = tableAddr(tseg, r.table, cs);
+            if (r.slots > 0 && tbl != null && WSInlineTables.words(p, tbl, ((r.slots - 1) * r.stride + r.width) / 2, ins.getAddress(), emit)) dataSlots = r.slots;
         } else {
             int scanned = 0;
             for (int offset : r.maskOffsets) {
                 if (scanned++ >= r.slots) break;
-                if (WSInlineTables.words(p, seg(cs, (r.table + offset) & 0xffff), r.width / 2, ins.getAddress(), emit)) dataSlots++;
+                Address tbl = tableAddr(tseg, (r.table + offset) & 0xffff, cs);
+                if (tbl != null && WSInlineTables.words(p, tbl, r.width / 2, ins.getAddress(), emit)) dataSlots++;
             }
         }
         if (dataSlots > 0)
@@ -1616,24 +1632,126 @@ public final class WSJumpTables {
         return a instanceof SegmentedAddress sa ? sa.getSegment() : (int) (a.getOffset() >> 4) & 0xF000;
     }
 
+    /** Address of a table slot in {@code tableSeg} at {@code off}: same-CS tables stay in the site's own space
+     *  (preserving bank overlays); cross-segment ES/DS tables must land in initialized executable linear ROM
+     *  (0x40000..0xFFFFF) and are canonicalized to their linear segment so J1f/J1j/J1w match across aliases. */
+    Address tableAddr(int tableSeg, int off, int cs) {
+        if (tableSeg == cs) return seg(cs, off);
+        long lin = ((long) tableSeg << 4) + (off & 0xFFFF);
+        if (lin < 0x40000 || lin > 0xFFFFF) return null;
+        Address a = space.getAddress((int) ((lin >> 4) & 0xF000), (int) (lin & 0xFFFF));
+        MemoryBlock b = mem.getBlock(a);
+        if (b == null || !b.isInitialized() || !b.isExecute() || WonderSwanLoader.isDataOverlay(b)) return null;
+        return a;
+    }
+
+    /** Resolve the segment register of a near table operand (CS, ES, DS, or omitted DS for BX/SI/DI).
+     *  Returns -1 if the segment is not proven to be a constant ROM segment. */
+    int resolveTableSeg(Instruction access, List<Instruction> back, String segPrefix, String reg, int cs) {
+        if ("CS".equalsIgnoreCase(segPrefix)) return cs;
+        String segReg;
+        if (segPrefix == null) {
+            if ("BP".equalsIgnoreCase(reg)) return -1;   // default segment for BP is SS, not DS
+            segReg = "DS";
+        } else {
+            segReg = segPrefix.toUpperCase();
+        }
+        Integer v = constSegAt(access, back, segReg, cs);
+        if (v == null || v < 0x2000) return -1;
+        if (v < 0x4000 && v != cs) return -1;
+        return v;
+    }
+
+    /** Prove that segment register {@code segReg} (ES or DS) holds a constant segment at {@code access} along
+     *  its fall-through predecessor chain {@code back}: MOV r,imm; MOV seg,r | MOV r,CS; MOV seg,r | MOV seg,CS |
+     *  PUSH CS; POP seg, with no flow joins, CALL/INT, or clobbering writes in between. */
+    Integer constSegAt(Instruction access, List<Instruction> back, String segReg, int cs) {
+        ghidra.program.model.lang.Register sr = p.getRegister(segReg);
+        Instruction after = access;
+        for (int qi = 0; qi < back.size(); qi++) {
+            Instruction d = back.get(qi);
+            for (Reference ref : p.getReferenceManager().getReferencesTo(after.getAddress()))
+                if (ref.getReferenceType().isFlow()) return null;
+            String t = d.toString().toUpperCase().replace(" ", "");
+            String mn = d.getMnemonicString().toUpperCase();
+            if (mn.startsWith("CALL") || mn.startsWith("INT")) return null;
+            if (writesReg(d, t, segReg, sr)) {
+                if (t.startsWith("MOV" + segReg + ",")) {
+                    String src = t.substring(t.indexOf(',') + 1);
+                    if (src.equals("CS")) return cs;
+                    if (src.matches("AX|BX|CX|DX|SI|DI|BP")) {
+                        Integer c = constBefore(back, qi, src, new String[1]);
+                        if (c != null) return c;
+                        if (isCsCopyBefore(back, qi, src)) return cs;
+                    }
+                } else if (t.equals("POP" + segReg) && qi + 1 < back.size()) {
+                    boolean joinBetween = false;
+                    for (Reference ref : p.getReferenceManager().getReferencesTo(d.getAddress()))
+                        if (ref.getReferenceType().isFlow()) { joinBetween = true; break; }
+                    if (!joinBetween && back.get(qi + 1).toString().toUpperCase().replace(" ", "").equals("PUSHCS"))
+                        return cs;
+                }
+                return null;
+            }
+            after = d;
+        }
+        return null;
+    }
+
+    /** True when {@code reg}'s last write before {@code back.get(at)} on a join/call-free fall-through chain is MOV reg,CS. */
+    boolean isCsCopyBefore(List<Instruction> back, int at, String reg) {
+        ghidra.program.model.lang.Register r16 = p.getRegister(reg);
+        for (int j = at + 1; j < back.size(); j++) {
+            Instruction d = back.get(j);
+            Instruction after = back.get(j - 1);
+            for (Reference ref : p.getReferenceManager().getReferencesTo(after.getAddress()))
+                if (ref.getReferenceType().isFlow()) return false;
+            String t = d.toString().toUpperCase().replace(" ", "");
+            String mn = d.getMnemonicString().toUpperCase();
+            if (mn.startsWith("CALL") || mn.startsWith("INT")) return false;
+            if (!writesReg(d, t, reg, r16)) continue;
+            return t.equals("MOV" + reg + ",CS");
+        }
+        return false;
+    }
+
     Rec recover(Instruction site) {
         siteSpace = site.getAddress().getAddressSpace();
         Rec r = new Rec();
         r.site = site.getAddress();
         spanHypotheses.remove(r.site);
         int cs = csOf(site.getAddress());
+        r.tableSeg = cs;
         List<Instruction> back = predecessors(site, 16);
         boolean far = site.getMnemonicString().equalsIgnoreCase("CALLF");
         if (far) { r.width = 4; r.stride = 4; }
         Matcher mm = (far ? FARMEM : MEM).matcher(site.toString());
         if (far && !csPrefixed(site)) { r.shape = "FAR_NOT_CS"; return r; }
-        if (mm.find()) { r.shape = far ? "FAR_MEM" : "MEM"; r.idx = mm.group(1).toUpperCase(); r.disp = disp(mm); if (far) r.ct1 = "CT1a"; }
-        else if (TWOREG.matcher(site.toString()).find() && (far || site.toString().contains("CS:["))) {
-            r.shape = far ? "FAR_MEM2" : "MEM2";
-            if (!twoRegister(site, back, r)) return r;
-            if (far) r.ct1 = "CT1a+" + r.ct1;
+        if (far) {
+            if (mm.find()) { r.shape = "FAR_MEM"; r.idx = mm.group(1).toUpperCase(); r.disp = disp(mm); r.ct1 = "CT1a"; }
+            else if (TWOREG.matcher(site.toString()).find()) {
+                r.shape = "FAR_MEM2";
+                if (!twoRegister(site, back, r)) return r;
+                r.ct1 = "CT1a+" + r.ct1;
+            }
+            else { r.shape = "FAR_SHAPE"; return r; }
         }
-        else if (far) { r.shape = "FAR_SHAPE"; return r; }
+        else if (mm.find()) {
+            int tseg = resolveTableSeg(site, back, mm.group(1), mm.group(2), cs);
+            if (tseg < 0) return null;
+            r.shape = "MEM"; r.idx = mm.group(2).toUpperCase(); r.disp = disp(mm, 3);
+            r.tableSeg = tseg; r.tableSegReg = mm.group(1) == null ? "DS" : mm.group(1).toUpperCase();
+            if (!r.tableSegReg.equals("CS")) r.ct1 = "J1-" + r.tableSegReg + " " + String.format("%04x", tseg);
+        }
+        else if (TWOREG.matcher(site.toString()).find()) {
+            Matcher tm = TWOREG.matcher(site.toString());
+            tm.find();
+            int tseg = resolveTableSeg(site, back, tm.group(1), tm.group(2), cs);
+            if (tseg < 0) return null;
+            r.shape = "MEM2"; r.tableSeg = tseg; r.tableSegReg = tm.group(1) == null ? "DS" : tm.group(1).toUpperCase();
+            if (!twoRegister(site, back, r)) return r;
+            if (!r.tableSegReg.equals("CS")) r.ct1 = "J1-" + r.tableSegReg + " " + String.format("%04x", tseg) + "+" + r.ct1;
+        }
         else {
             if (site.getNumOperands() != 1 || site.getRegister(0) == null) return null;
             String reg = site.getRegister(0).getName().toUpperCase();
@@ -1646,19 +1764,32 @@ public final class WSJumpTables {
             if (load == null) { r.shape = "REG_NOLOAD"; return r; }
             Matcher lm = MEM.matcher(load.toString());
             List<Instruction> loadBack = predecessors(load, 16);
-            if (lm.find()) { r.shape = "REG"; r.idx = lm.group(1).toUpperCase(); r.disp = disp(lm); }
-            else if (load.toString().contains("CS:[") && TWOREG.matcher(load.toString()).find()) {
-                r.shape = "REG2";
+            if (lm.find()) {
+                int tseg = resolveTableSeg(load, loadBack, lm.group(1), lm.group(2), cs);
+                if (tseg < 0) { r.shape = "REG_NOT_CS_TABLE"; return r; }
+                r.shape = "REG"; r.idx = lm.group(2).toUpperCase(); r.disp = disp(lm, 3);
+                r.tableSeg = tseg; r.tableSegReg = lm.group(1) == null ? "DS" : lm.group(1).toUpperCase();
+                if (!r.tableSegReg.equals("CS")) r.ct1 = "J1-" + r.tableSegReg + " " + String.format("%04x", tseg);
+            }
+            else if (TWOREG.matcher(load.toString()).find()) {
+                Matcher tm = TWOREG.matcher(load.toString());
+                tm.find();
+                int tseg = resolveTableSeg(load, loadBack, tm.group(1), tm.group(2), cs);
+                if (tseg < 0) { r.shape = "REG_NOT_CS_TABLE"; return r; }
+                r.shape = "REG2"; r.tableSeg = tseg; r.tableSegReg = tm.group(1) == null ? "DS" : tm.group(1).toUpperCase();
                 if (!twoRegister(load, loadBack, r)) return r;
+                if (!r.tableSegReg.equals("CS")) r.ct1 = "J1-" + r.tableSegReg + " " + String.format("%04x", tseg) + "+" + r.ct1;
             }
             else { r.shape = "REG_NOT_CS_TABLE"; return r; }
             back = loadBack;
         }
+        String curIdx = r.idx;
+        int idxStart = 0;
         for (int qi = 0; qi < back.size(); qi++) {
             Instruction q = back.get(qi);
             String t = q.toString().toUpperCase().replace(" ", "");
             Matcher am = ADDREG.matcher(t);
-            if (am.matches() && am.group(1).equals(r.idx) && !am.group(2).equals(r.idx)) {
+            if (am.matches() && am.group(1).equals(curIdx) && !am.group(2).equals(curIdx)) {
                 // J1i: the added register may hold the table base rather than the index
                 String[] why = new String[1];
                 Integer c = constBefore(back, qi, am.group(2), why);
@@ -1667,50 +1798,71 @@ public final class WSJumpTables {
                     r.baseVia = "J1i " + why[0] + " + " + q;
                     continue;
                 }
+                // Commuted J1i: curIdx holds the constant base (MOV curIdx, imm; ADD curIdx, scaled_reg)
+                String[] why2 = new String[1];
+                Integer c2 = constBefore(back, qi, curIdx, why2);
+                if (c2 != null) {
+                    r.base += c2; r.baseFound = true; r.baseAdds.add(q.getAddress());
+                    r.baseVia = "J1i-commuted " + why2[0] + " + " + q;
+                    curIdx = am.group(2);
+                    r.scaledBy = curIdx;
+                    idxStart = qi + 1;
+                    break;
+                }
                 if (r.j1iMiss == null) r.j1iMiss = am.group(2) + "_" + why[0];
             }
-            if (t.startsWith("MOV" + r.idx + ",0X") && r.baseFound && r.idx.equals(r.scaledBy)) {
+            if (t.startsWith("MOV" + curIdx + ",0X") && r.baseFound && curIdx.equals(r.scaledBy)) {
                 // J1i: idx was operated on (scaled/masked/cleared) before the base was added, so this constant is
                 // the index's start value, not part of the table address
                 r.baseVia += "; index start " + q;
                 break;
             }
-            if (t.startsWith("MOV" + r.idx + ",0X")) { r.base += hex(t); r.baseFound = true; break; }
-            if (t.startsWith("LEA" + r.idx + ",[0X")) { r.base += Integer.parseInt(t.substring(t.indexOf("0X") + 2, t.indexOf(']')), 16); r.baseFound = true; break; }
-            if (t.startsWith("ADD" + r.idx + ",0X")) { r.base += hex(t); r.baseFound = true; continue; }
-            if (t.startsWith("ADD" + r.idx + ",") && r.scaledBy == null) { r.scaledBy = t.substring(t.indexOf(',') + 1); continue; }
-            if (t.startsWith("SHL" + r.idx) || t.startsWith("SHR" + r.idx) || t.startsWith("ROL" + r.idx) || t.startsWith("ROR" + r.idx)
-                    || t.startsWith("AND" + r.idx) || t.startsWith("XOR" + r.idx.charAt(0) + "L")) {
-                if (r.scaledBy == null) r.scaledBy = r.idx;
+            if (t.startsWith("MOV" + curIdx + ",0X")) { r.base += hex(t); r.baseFound = true; break; }
+            if (t.startsWith("LEA" + curIdx + ",[0X")) { r.base += Integer.parseInt(t.substring(t.indexOf("0X") + 2, t.indexOf(']')), 16); r.baseFound = true; break; }
+            if (t.startsWith("ADD" + curIdx + ",0X")) { r.base += hex(t); r.baseFound = true; continue; }
+            Matcher copy = Pattern.compile("MOV" + curIdx + ",(AX|BX|CX|DX|SI|DI|BP)").matcher(t);
+            if (copy.matches() && !copy.group(1).equals(curIdx)) {
+                curIdx = copy.group(1);
+                r.scaledBy = curIdx;
+                idxStart = qi + 1;
                 continue;
             }
-            if (writes(t, r.idx)) break;
+            if (t.startsWith("ADD" + curIdx + ",") && r.scaledBy == null) { r.scaledBy = t.substring(t.indexOf(',') + 1); continue; }
+            if (t.startsWith("SHL" + curIdx) || t.startsWith("SHR" + curIdx) || t.startsWith("ROL" + curIdx) || t.startsWith("ROR" + curIdx)
+                    || t.startsWith("AND" + curIdx) || t.startsWith("XOR" + curIdx.charAt(0) + "L")) {
+                if (r.scaledBy == null) r.scaledBy = curIdx;
+                continue;
+            }
+            if (writes(t, curIdx)) break;
         }
-        String ix = r.scaledBy == null ? r.idx : r.scaledBy;
-        if (!r.baseAdds.isEmpty()) back = withoutBaseAdds(back, r);
-        r.maskOffsets = maskValues(back, ix, r);
+        String ix = r.scaledBy == null ? curIdx : r.scaledBy;
+        List<Instruction> idxBack = idxStart > 0 ? back.subList(idxStart, back.size()) : back;
+        if (!r.baseAdds.isEmpty()) idxBack = withoutBaseAdds(idxBack, r);
+        r.maskOffsets = maskValues(idxBack, ix, r);
         if (r.width == 4) {
             // CT1g: the index scale is the record stride; a scale above the slot width means records of several
             // far pointers, of which this site reads one field (its offset is already in the base)
-            int sh = scaleShift(back, ix);
+            int sh = scaleShift(idxBack, ix);
             if (sh <= 8 && (1 << sh) > r.width) {
                 r.stride = 1 << sh;
                 r.ct1 = (r.ct1 == null ? "" : r.ct1 + "+") + "CT1g stride " + r.stride;
             }
         }
         r.table = (r.base + r.disp) & 0xFFFF;
-        tableStart = seg(cs, r.table);
+        tableStart = tableAddr(r.tableSeg, r.table, cs);
         r.tableAddress = tableStart;
-        r.returnEnd = pushedContinuation(site, cs);
         // J1a: the table address needs a constant (base immediate or displacement); a bare [BX] whose BX
         // comes from elsewhere is an unknown table, not one at CS:0000.
         if (!r.baseFound && r.disp == 0) { r.shape += "/NO_BASE" + (r.j1iMiss == null ? "" : "/J1i_" + r.j1iMiss); return r; }
+        if (tableStart == null) { r.shape += "/OUT_OF_ROM_TABLE"; return r; }
+        r.returnEnd = pushedContinuation(site, cs);
         if (r.maskOffsets != null) {
             // A mask bounds the index (upper bound); it does not prove every value occurs: stop rules apply
             // entry by entry in ascending offset order (e.g. mask 0x1e allows 16 entries where the table has 9).
             r.stop = "MASK_BOUND";
             for (int v : r.maskOffsets) {
-                Address ea = seg(cs, (r.table + v) & 0xFFFF);
+                Address ea = tableAddr(r.tableSeg, (r.table + v) & 0xFFFF, cs);
+                if (ea == null) { r.stop = "OUT_OF_ROM"; break; }
                 String why = scanSlot(cs, ea, r);
                 if (why == null) continue;
                 r.stop = why;
@@ -1718,12 +1870,12 @@ public final class WSJumpTables {
             }
             return r;
         }
-        for (Instruction q : back) {
+        for (Instruction q : idxBack) {
             String t = q.toString().toUpperCase().replace(" ", "");
             String r8 = ix.length() == 2 ? ix.charAt(0) + "L" : ix;
             if (t.startsWith("CMP" + ix + ",0X") || t.startsWith("CMP" + r8 + ",0X")) { r.cap = Math.min(256, hex(t) + 1); r.bound = q.toString(); break; }
         }
-        if (r.bound.equals("none")) byteBound(back, ix, r);
+        if (r.bound.equals("none")) byteBound(idxBack, ix, r);
         boolean bounded = !r.bound.equals("none");
         r.allowPlaceholders = true;
         scanTable(cs, r);
@@ -1731,12 +1883,13 @@ public final class WSJumpTables {
             // CT1f: all 64 slots of an unbounded index were plausible; scan on (up to 256) and keep the longer table
             // only if it then ends on a strong stop, as J1b requires; otherwise the 64-slot result stands (weak)
             resetScan(r); r.cap = 256; scanTable(cs, r);
+            if (!STRONG.contains(r.stop) && r.width == 2 && r.slots >= 2) ownCallTargetStop(cs, r);
             if (STRONG.contains(r.stop)) r.ct1 = (r.ct1 == null ? "" : r.ct1 + "+") + "CT1f extended scan ended by " + r.stop + " at slot " + r.slots;
             else { resetScan(r); r.cap = 64; scanTable(cs, r); }
         }
         if (!r.placeholderTargets.isEmpty()) {
             // CT1e: placeholders are valid only when the table ends exactly at their (common) target
-            Address end = r.stop.equals("OWN_TARGET") ? seg(cs, (r.table + r.stride * r.slots) & 0xFFFF) : null;
+            Address end = r.stop.equals("OWN_TARGET") ? tableAddr(r.tableSeg, (r.table + r.stride * r.slots) & 0xFFFF, cs) : null;
             boolean ok = end != null;
             for (Address t : r.placeholderTargets) if (!t.equals(end)) ok = false;
             if (ok) {
@@ -1749,8 +1902,12 @@ public final class WSJumpTables {
                 scanTable(cs, r);
             }
         }
-        boolean strong = r.stop.equals("EXECUTED_CODE") || r.stop.equals("TABLE_BOUNDARY") || r.stop.equals("FUNCTION_ENTRY") || r.stop.equals("DIRECT_CALL_ENTRY")
-            || r.stop.equals("TABLE_BASE") || r.stop.equals("OWN_TARGET") || r.stop.equals("PUSH_RETURN_ENTRY");
+        // J1j+ (OWN_CALL_TARGET): cycle-breaker for weak-stopped near tables where a tentative slot 0..m-1 directly
+        // calls a valid code entry at slot boundary table + stride*m (m >= 2).
+        if (!STRONG.contains(r.stop) && r.width == 2 && r.slots >= 2) {
+            ownCallTargetStop(cs, r);
+        }
+        boolean strong = STRONG.contains(r.stop);
         // J1b: without an index bound only a strong end (next slot executed / next recovered table) proves
         // the extent; running into data or the cap does not (observed targets stay via rule E3).
         if (!bounded && !strong) {
@@ -1793,9 +1950,13 @@ public final class WSJumpTables {
         List<Address[]> rest = new ArrayList<>();
         List<Integer> keepSlots = new ArrayList<>();
         int cs = csOf(r.site);
+        int tseg = r.tableSeg >= 0 ? r.tableSeg : cs;
         for (int k = 0; k < r.targets.size(); k++) {
             if (r.slotOf.get(k) <= span) { keep.add(r.targets.get(k)); keepSlots.add(r.slotOf.get(k)); }
-            else rest.add(new Address[] { seg(cs, (r.table + r.stride * r.slotOf.get(k)) & 0xFFFF), r.targets.get(k) });
+            else {
+                Address slotAddr = tableAddr(tseg, (r.table + r.stride * r.slotOf.get(k)) & 0xFFFF, cs);
+                if (slotAddr != null) rest.add(new Address[] { slotAddr, r.targets.get(k) });
+            }
         }
         int lim = span + 1;
         r.ct1 = (r.ct1 == null ? "" : r.ct1 + "+") + "CT1c span " + lim + " of " + r.slots + " scanned slots ("
@@ -1819,13 +1980,134 @@ public final class WSJumpTables {
 
     /** The ascending slot scan of a recovered site (stops on the first stop reason). */
     void scanTable(int cs, Rec r) {
+        int tseg = r.tableSeg >= 0 ? r.tableSeg : cs;
         for (int i = 0; i < r.cap; i++) {
             Address ea;
-            try { ea = seg(cs, (r.table + r.stride * i) & 0xFFFF); } catch (Exception e) { r.stop = "OUT_OF_ROM"; break; }
+            try { ea = tableAddr(tseg, (r.table + r.stride * i) & 0xFFFF, cs); } catch (Exception e) { r.stop = "OUT_OF_ROM"; break; }
+            if (ea == null) { r.stop = "OUT_OF_ROM"; break; }
             String why = scanSlot(cs, ea, r);
             if (why == null) continue;
             r.stop = why;
             break;
+        }
+    }
+
+    /**
+     * J1j+ (OWN_CALL_TARGET): cycle-breaker for weak-stopped near tables. If valid trial-decoded control flow inside
+     * a tentative slot k (0 <= k < m) directly CALLs or CALLFs the slot boundary table + stride*m (2 <= m <= r.slots),
+     * and that boundary decodes cleanly as a valid code entry (not offcut, not defined data), treat table + stride*m
+     * as a proven DIRECT_CALL_ENTRY strong stop and trim the table to m slots.
+     */
+    void ownCallTargetStop(int cs, Rec r) {
+        if (tableStart == null || r.slots < 2) return;
+        int tseg = r.tableSeg >= 0 ? r.tableSeg : cs;
+        ghidra.app.util.PseudoDisassembler pd = new ghidra.app.util.PseudoDisassembler(p);
+        ghidra.program.model.lang.Register csval = p.getProgramContext().getRegister("csval");
+        Map<Long, Integer> candStops = new HashMap<>();
+        for (int m = 2; m <= r.slots; m++) {
+            Address ea = tableAddr(tseg, (r.table + r.stride * m) & 0xFFFF, cs);
+            if (ea == null || !validEntryCandidate(ea, cs, pd, csval)) continue;
+            candStops.putIfAbsent(ea.getOffset(), m);
+        }
+        if (candStops.isEmpty()) return;
+        long tableLo = tableStart.getOffset();
+        long tableHi = tableLo + (long) r.stride * r.slots;
+        int bestM = Integer.MAX_VALUE, bestCallerSlot = -1;
+        Address bestCallSite = null, bestStopAddr = null;
+        for (int idx = 0; idx < r.targets.size(); idx++) {
+            int k = r.slotOf.get(idx);
+            if (k >= bestM) break;
+            Address entry = r.targets.get(idx);
+            ArrayDeque<Address> q = new ArrayDeque<>();
+            Set<Long> visited = new HashSet<>();
+            q.add(entry);
+            int budget = 128;
+            while (!q.isEmpty() && budget-- > 0) {
+                Address a = q.removeFirst();
+                if (!visited.add(a.getOffset())) continue;
+                long off = a.getOffset();
+                if (off >= tableLo && off < tableHi) continue;
+                Instruction ins = listing.getInstructionAt(a);
+                if (ins == null) {
+                    if (listing.getInstructionContaining(a) != null || listing.getDefinedDataContaining(a) != null) continue;
+                    ins = trialDisassemble(pd, csval, a, cs);
+                }
+                if (ins == null) continue;
+                if (ins.getFlowType().isCall() && !ins.getFlowType().isComputed()) {
+                    boolean isFar = ins.getMnemonicString().equalsIgnoreCase("CALLF");
+                    for (Address ft : ins.getFlows()) {
+                        if (isFar && siteSpace != null && siteSpace.isOverlaySpace()) continue;
+                        Integer m = candStops.get(ft.getOffset());
+                        if (m != null && m > k && m < bestM) {
+                            bestM = m;
+                            bestCallerSlot = k;
+                            bestCallSite = a;
+                            bestStopAddr = tableAddr(tseg, (r.table + r.stride * m) & 0xFFFF, cs);
+                        }
+                    }
+                }
+                if (!ins.getFlowType().isTerminal()) {
+                    Address next = ins.getFallThrough();
+                    if (next != null && !visited.contains(next.getOffset())) q.add(next);
+                }
+                if (ins.getFlowType().isJump() && !ins.getFlowType().isComputed()
+                        && !ins.getMnemonicString().equalsIgnoreCase("JMPF")) {
+                    for (Address jt : ins.getFlows()) {
+                        if (jt.getAddressSpace().equals(entry.getAddressSpace())
+                                && !visited.contains(jt.getOffset())) q.add(jt);
+                    }
+                }
+            }
+        }
+        if (bestM > r.slots) return;
+        List<Address> keep = new ArrayList<>();
+        List<Integer> keepSlots = new ArrayList<>();
+        for (int idx = 0; idx < r.slotOf.size(); idx++) {
+            if (r.slotOf.get(idx) < bestM) {
+                keep.add(r.targets.get(idx));
+                keepSlots.add(r.slotOf.get(idx));
+            }
+        }
+        final int lim = bestM;
+        r.slots = lim;
+        r.targets = keep;
+        r.slotOf = keepSlots;
+        r.emptySlots.removeIf(s -> s >= lim);
+        r.empty = r.emptySlots.size();
+        r.stop = "DIRECT_CALL_ENTRY";
+        r.ct1 = (r.ct1 == null ? "" : r.ct1 + "+") + "J1j+ OWN_CALL_TARGET slot " + bestCallerSlot + " (" + bestCallSite + ") -> " + bestStopAddr;
+        emit.accept(String.format("{\"rule\":\"J1j+\",\"site\":\"%s\",\"caller_slot\":%d,\"call_site\":\"%s\",\"stop_at\":\"%s\",\"slots\":%d,\"outcome\":\"OWN_CALL_TARGET\"}",
+            r.site, bestCallerSlot, bestCallSite, bestStopAddr, bestM));
+    }
+
+    /** True when {@code a} is a plausible, cleanly decodable code entry (not offcut, not defined data, and its
+     *  leading fall-through instructions decode without hitting invalid bytes). */
+    boolean validEntryCandidate(Address a, int cs, ghidra.app.util.PseudoDisassembler pd, ghidra.program.model.lang.Register csval) {
+        MemoryBlock b = mem.getBlock(a);
+        if (b == null || !b.isInitialized() || !b.isExecute() || WonderSwanLoader.isDataOverlay(b)) return false;
+        Instruction existing = listing.getInstructionContaining(a);
+        if (existing != null && !existing.getAddress().equals(a)) return false;
+        if (listing.getDefinedDataContaining(a) != null) return false;
+        Address cur = a;
+        for (int step = 0; step < 3; step++) {
+            Instruction ins = listing.getInstructionAt(cur);
+            if (ins == null) ins = trialDisassemble(pd, csval, cur, cs);
+            if (ins == null) return false;
+            if (ins.getFlowType().isTerminal() || ins.getFlowType().isJump() || ins.getFlowType().isCall()) return true;
+            cur = ins.getFallThrough();
+            if (cur == null) return true;
+        }
+        return true;
+    }
+
+    Instruction trialDisassemble(ghidra.app.util.PseudoDisassembler pd, ghidra.program.model.lang.Register csval, Address a, int cs) {
+        try {
+            ghidra.app.util.PseudoDisassemblerContext pc = new ghidra.app.util.PseudoDisassemblerContext(p.getProgramContext());
+            if (csval != null)
+                pc.setFutureRegisterValue(a, new ghidra.program.model.lang.RegisterValue(csval, java.math.BigInteger.valueOf(cs)));
+            return pd.disassemble(a, pc, false);
+        } catch (Exception e) {
+            return null;
         }
     }
 
@@ -1945,11 +2227,11 @@ public final class WSJumpTables {
             if (t.equals("ADD" + reg + "," + reg)) { shift++; continue; }   // x2 scaling
             if (t.equals("XOR" + hi + "," + hi) || t.equals("MOV" + hi + ",0X0") || t.equals("SUB" + hi + "," + hi)) { hiClear = true; if (loByte) break; continue; }
             if (loByte && (t.equals("XOR" + reg + "," + reg) || t.equals("SUB" + reg + "," + reg) || t.equals("MOV" + reg + ",0X0"))) { hiClear = true; break; }
-            if (t.startsWith("MOV" + lo + ",")) { loByte = true; if (hiClear) break; continue; }
+            if (t.startsWith("MOV" + lo + ",") || t.startsWith("IN" + lo + ",") || t.startsWith("LODSB") && reg.equals("AX")) { loByte = true; if (hiClear) break; continue; }
             if (t.startsWith("SUB" + lo + ",") || t.startsWith("ADD" + lo + ",")) { loByte = true; continue; }
             if (t.equals("CBW") && reg.equals("AX")) { cbw = true; loByte = true; hiClear = true; break; }
             if (t.startsWith("MOVZX" + reg)) { loByte = true; hiClear = true; break; }
-            if (writes(t, reg)) { if (r.bound.startsWith("via ")) r.bound = "none"; return; }
+            if (writes(t, reg)) { if (hiClear) break; if (r.bound.startsWith("via ")) r.bound = "none"; return; }
         }
         if (!hiClear) { if (r.bound.startsWith("via ")) r.bound = "none"; return; }
         int bytes = (cbw ? 128 : 256) << shift;           // CBW: only the 0..127 half lies at or after the base
@@ -2039,7 +2321,7 @@ public final class WSJumpTables {
      *  direct-mode table). */
     final Set<Address> tableBases = new HashSet<>();
     Address tableStart;
-    static final Pattern CSMEM = Pattern.compile("CS:\\[(?:(BX|SI|DI|BP)(?: ?([+-]) ?0x([0-9a-f]+))?|0x([0-9a-f]+))\\]", Pattern.CASE_INSENSITIVE);
+    static final Pattern CSMEM = Pattern.compile("(CS|ES|DS):\\[(?:(BX|SI|DI|BP)(?: ?([+-]) ?0x([0-9a-f]+))?|0x([0-9a-f]+))\\]", Pattern.CASE_INSENSITIVE);
 
     void collectTableBases(TaskMonitor monitor) throws Exception {
         AddressSpace caller = siteSpace;
@@ -2054,36 +2336,50 @@ public final class WSJumpTables {
         }
     }
 
-    /** J1f for one instruction: adds its constant CS-relative table base, if it has one; true when the
-     *  instruction has a CS-relative memory operand at all. */
+    /** J1f for one instruction: adds its constant CS/ES/DS-relative table base, if it has one; true when the
+     *  instruction has a CS/ES/DS-relative memory operand at all. */
     boolean addTableBase(Instruction ins) {
         String txt = ins.toString();
-        if (!txt.contains("CS:[")) return false;
+        if (!txt.contains("CS:[") && !txt.contains("ES:[") && !txt.contains("DS:[")) return false;
         Matcher m = CSMEM.matcher(txt);
         if (!m.find()) return false;
         siteSpace = ins.getAddress().getAddressSpace();
         int cs = csOf(ins.getAddress());
-        if (m.group(4) != null) { tableBases.add(seg(cs, Integer.parseInt(m.group(4), 16))); return true; }
-        String reg = m.group(1).toUpperCase();
-        int disp = m.group(3) == null ? 0 : Integer.parseInt(m.group(3), 16) * (m.group(2).equals("-") ? -1 : 1), base = 0;
-        boolean found = false;
+        String segPrefix = m.group(1).toUpperCase();
         List<Instruction> back = predecessors(ins, 16);
+        int tseg = segPrefix.equals("CS") ? cs : resolveTableSeg(ins, back, segPrefix, m.group(2), cs);
+        if (tseg < 0) return true;
+        if (m.group(5) != null) {
+            Address tb = tableAddr(tseg, Integer.parseInt(m.group(5), 16), cs);
+            if (tb != null) tableBases.add(tb);
+            return true;
+        }
+        String reg = m.group(2).toUpperCase();
+        int disp = m.group(4) == null ? 0 : Integer.parseInt(m.group(4), 16) * (m.group(3).equals("-") ? -1 : 1), base = 0;
+        boolean found = false;
         for (int qi = 0; qi < back.size(); qi++) {
             Instruction q = back.get(qi);
             String t = q.toString().toUpperCase().replace(" ", "");
             Matcher am = ADDREG.matcher(t);
             if (am.matches() && am.group(1).equals(reg) && !am.group(2).equals(reg)) {
                 Integer c = constBefore(back, qi, am.group(2), new String[1]);   // J1i register base
-                if (c != null) { base += c; found = true; }
+                if (c != null) { base += c; found = true; continue; }
+                Integer c2 = constBefore(back, qi, reg, new String[1]);          // commuted J1i
+                if (c2 != null) { base += c2; found = true; break; }
                 continue;
             }
             if (t.startsWith("MOV" + reg + ",0X")) { base += hex(t); found = true; break; }
             if (t.startsWith("LEA" + reg + ",[0X")) { base += Integer.parseInt(t.substring(t.indexOf("0X") + 2, t.indexOf(']')), 16); found = true; break; }
-            if (t.startsWith("ADD" + reg + ",0X")) { base += hex(t); continue; }
+            if (t.startsWith("ADD" + reg + ",0X")) { base += hex(t); found = true; continue; }
+            Matcher copy = Pattern.compile("MOV" + reg + ",(AX|BX|CX|DX|SI|DI|BP)").matcher(t);
+            if (copy.matches() && !copy.group(1).equals(reg)) { reg = copy.group(1); continue; }
             if (t.matches("ADD" + reg + ",(AX|BX|CX|DX|SI|DI|BP)")) continue;   // index added to the base register
             if (writes(t, reg)) break;
         }
-        if (found || disp != 0) tableBases.add(seg(cs, (base + disp) & 0xFFFF));
+        if (found || disp != 0) {
+            Address tb = tableAddr(tseg, (base + disp) & 0xFFFF, cs);
+            if (tb != null) tableBases.add(tb);
+        }
         return true;
     }
 
@@ -2091,7 +2387,7 @@ public final class WSJumpTables {
      *  from the bytes ({@link #csPrefixed}). */
     static final Pattern FARMEM = Pattern.compile("^CALLF \\[(BX|SI|DI|BP)(?: ?([+-]) ?0x([0-9a-f]+))?\\]$", Pattern.CASE_INSENSITIVE);
     /** CT1b: base + index register operand, optional displacement. */
-    static final Pattern TWOREG = Pattern.compile("\\[(BX|BP) \\+ (SI|DI)(?: ?([+-]) ?0x([0-9a-f]+))?\\]", Pattern.CASE_INSENSITIVE);
+    static final Pattern TWOREG = Pattern.compile("(?:(CS|ES|DS):)?\\[(BX|BP) \\+ (SI|DI)(?: ?([+-]) ?0x([0-9a-f]+))?\\]", Pattern.CASE_INSENSITIVE);
 
     /** The last segment-override prefix of the instruction is CS (0x2E). */
     static boolean csPrefixed(Instruction i) {
@@ -2113,8 +2409,8 @@ public final class WSJumpTables {
     boolean twoRegister(Instruction access, List<Instruction> back, Rec r) {
         Matcher m = TWOREG.matcher(access.toString());
         if (!m.find()) { r.shape += "/CT1b_SHAPE"; return false; }
-        String a = m.group(1).toUpperCase(), b = m.group(2).toUpperCase();
-        int d = m.group(4) == null ? 0 : Integer.parseInt(m.group(4), 16) * (m.group(3).equals("-") ? -1 : 1);
+        String a = m.group(2).toUpperCase(), b = m.group(3).toUpperCase();
+        int d = m.group(5) == null ? 0 : Integer.parseInt(m.group(5), 16) * (m.group(4).equals("-") ? -1 : 1);
         String[] wa = new String[1], wb = new String[1];
         Integer ca = constAt(access, back, a, wa), cb = constAt(access, back, b, wb);
         if (ca != null && cb != null) { r.shape += "/CT1b_BOTH_CONSTANT"; return false; }
@@ -2271,7 +2567,11 @@ public final class WSJumpTables {
         return false;
     }
 
-    static int disp(Matcher m) { return m.group(3) == null ? 0 : Integer.parseInt(m.group(3), 16) * (m.group(2).equals("-") ? -1 : 1); }
+    static int disp(Matcher m) { return disp(m, 2); }
+
+    static int disp(Matcher m, int signGroup) {
+        return m.group(signGroup + 1) == null ? 0 : Integer.parseInt(m.group(signGroup + 1), 16) * (m.group(signGroup).equals("-") ? -1 : 1);
+    }
 
     static int hex(String t) { return Integer.parseInt(t.substring(t.indexOf("0X") + 2).replaceAll("[^0-9A-F].*$", ""), 16); }
 

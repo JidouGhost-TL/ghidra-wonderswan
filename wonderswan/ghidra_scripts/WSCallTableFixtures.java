@@ -417,6 +417,102 @@ public class WSCallTableFixtures extends GhidraScript {
         } finally { done(p); }
     }
 
+    /** J1-ES/DS + commuted J1i: MOV DI,0x100; ADD DI,AX; PUSH AX; MOV AX,0x4000; MOV ES,AX; POP AX; CALL ES:[DI]. */
+    void esDirectCommuted() throws Exception {
+        byte[] m = fill(0x1000);
+        put(m, 0x40, "acb400d1e0bf000103f850b800408ec05826ff15c3");   // CALL word ptr ES:[DI] at 4000:0051
+        put(m, 0x100, "060100022002");                                  // 3 slots ending at OWN_TARGET 0x106
+        for (int t : new int[] { 0x106, 0x200, 0x220 }) put(m, t, "b80100c3");
+        ProgramDB p = make("j1-es-commuted", m, null);
+        try {
+            code(p, 0x40, true);
+            repair(p, new WSEvidence());
+            for (int t : new int[] { 0x106, 0x200, 0x220 })
+                check(insn(p, at(p, t)) && ref(p, 0x51, at(p, t)), "J1-ES commuted target " + Integer.toHexString(t));
+            check(p.getListing().getInstructionContaining(at(p, 0x100)) == null, "J1-ES table bytes not code");
+        } finally { done(p); }
+    }
+
+    /** J1-ES/DS linear-alias segment: ES=0x4100 reads table at 4100:0100 == 4000:1100; near targets stay in CS=4000. */
+    void esLinearAlias() throws Exception {
+        byte[] m = fill(0x2000);
+        put(m, 0x40, "a01000b400d1e00500018bf8b800418ec0268b05ffd0c3"); // CALL AX at 4000:0054
+        put(m, 0x1100, "000220024002");                                 // 4100:0100 == 4000:1100
+        put(m, 0x1106, "c3");                                           // function entry right after table
+        for (int t : new int[] { 0x200, 0x220, 0x240 }) put(m, t, "b80100c3");
+        ProgramDB p = make("j1-es-alias", m, null);
+        try {
+            code(p, 0x40, true); code(p, 0x1106, true);
+            repair(p, new WSEvidence());
+            for (int t : new int[] { 0x200, 0x220, 0x240 })
+                check(insn(p, at(p, t)) && ref(p, 0x54, at(p, t)), "J1-ES linear-alias target in CS " + Integer.toHexString(t));
+        } finally { done(p); }
+    }
+
+    /** J1-ES/DS with DS=const_rom_seg: MOV AX,0x4000; MOV DS,AX; CALL word ptr DS:[BX+0x100]. */
+    void dsConstRom() throws Exception {
+        byte[] m = fill(0x1000);
+        put(m, 0x40, "8b1e1000d1e3b800408ed83eff970001c3");            // CALL word ptr DS:[BX+0x100] at 4000:004b
+        put(m, 0x100, "060100022002");
+        for (int t : new int[] { 0x106, 0x200, 0x220 }) put(m, t, "b80100c3");
+        ProgramDB p = make("j1-ds-const", m, null);
+        try {
+            code(p, 0x40, true);
+            repair(p, new WSEvidence());
+            for (int t : new int[] { 0x106, 0x200, 0x220 })
+                check(insn(p, at(p, t)) && ref(p, 0x4b, at(p, t)), "J1-DS const-ROM target " + Integer.toHexString(t));
+        } finally { done(p); }
+    }
+
+    /** J1-ES/DS negative controls: WRAM segment (0x0000), clobbered ES, or non-constant ES -> not recovered. */
+    void esControl(String variant) throws Exception {
+        byte[] m = fill(0x1000);
+        if (variant.equals("wram"))
+            put(m, 0x40, "acb400d1e0bf000103f8b800008ec026ff15c3");     // ES = 0x0000 (WRAM)
+        else if (variant.equals("clobbered"))
+            put(m, 0x40, "acb400d1e0bf000103f8b800408ec08ec326ff15c3"); // ES = 0x4000 then MOV ES,BX
+        else
+            put(m, 0x40, "acb400d1e0bf000103f88ec326ff15c3");           // MOV ES,BX (non-constant)
+        put(m, 0x100, "060100022002");
+        for (int t : new int[] { 0x106, 0x200, 0x220 }) put(m, t, "b80100c3");
+        ProgramDB p = make("j1-es-ctrl-" + variant, m, null);
+        try {
+            code(p, 0x40, true);
+            repair(p, new WSEvidence());
+            check(!insn(p, at(p, 0x200)), "J1-ES control (" + variant + "): must not recover table");
+        } finally { done(p); }
+    }
+
+    /** J1j+ OWN_CALL_TARGET cycle-breaker: unbounded CS: table followed by helper at 0x106 called from slot 2
+     *  (near CALL or CALLF). Control puts unreachable CALLF bytes after RET in slot 2 and must stay unresolved. */
+    void ownCallTarget(String variant) throws Exception {
+        byte[] m = fill(0x1000);
+        put(m, 0x40, "add1e08bf82eff950001c3");                         // CALL word ptr CS:[DI+0x100] at 4000:0045
+        put(m, 0x100, "000220024002");                                  // 3 slots
+        put(m, 0x106, "558becc3");                                      // helper function right after table (not pre-decoded)
+        put(m, 0x200, "b80100c3");
+        put(m, 0x220, "b80200c3");
+        if (variant.equals("near"))
+            put(m, 0x240, "e8c3fec3");                                  // CALL 0x0106; RET
+        else if (variant.equals("far"))
+            put(m, 0x240, "9a06010040c3");                              // CALLF 4000:0106; RET
+        else
+            put(m, 0x240, "b80300c39a06010040");                        // MOV AX,3; RET; <unreachable data bytes 9a 06 01 00 40>
+        ProgramDB p = make("j1jp-" + variant, m, null);
+        try {
+            code(p, 0x40, true);
+            repair(p, new WSEvidence());
+            if (variant.equals("control")) {
+                check(!insn(p, at(p, 0x200)), "J1j+ control: unreachable data bytes must not trigger OWN_CALL_TARGET");
+            } else {
+                for (int t : new int[] { 0x200, 0x220, 0x240 })
+                    check(insn(p, at(p, t)) && ref(p, 0x45, at(p, t)), "J1j+ (" + variant + ") slot target " + Integer.toHexString(t));
+                check(insn(p, at(p, 0x106)), "J1j+ (" + variant + ") helper at table end decoded via slot call");
+                check(!ref(p, 0x45, at(p, 0x8b55)), "J1j+ (" + variant + ") did not scan past table end");
+            }
+        } finally { done(p); }
+    }
+
     @Override public void run() throws Exception {
         String only = getScriptArgs().length > 0 ? getScriptArgs()[0] : "";
         Map<String, ThrowingRunnable> all = new LinkedHashMap<>();
@@ -434,6 +530,15 @@ public class WSCallTableFixtures extends GhidraScript {
         all.put("CT1f-long-table", () -> longTable(true));
         all.put("CT1f-control-no-strong-end", () -> longTable(false));
         all.put("CT1g-record-stride", this::recordStride);
+        all.put("J1-ES-direct-commuted", this::esDirectCommuted);
+        all.put("J1-ES-linear-alias", this::esLinearAlias);
+        all.put("J1-DS-const-rom", this::dsConstRom);
+        all.put("J1-ES-control-wram", () -> esControl("wram"));
+        all.put("J1-ES-control-clobbered", () -> esControl("clobbered"));
+        all.put("J1-ES-control-nonconst", () -> esControl("nonconst"));
+        all.put("J1jp-own-call-target-near", () -> ownCallTarget("near"));
+        all.put("J1jp-own-call-target-far", () -> ownCallTarget("far"));
+        all.put("J1jp-control-data-bytes", () -> ownCallTarget("control"));
         all.put("F2v-default-ds-not-vector", () -> vectorProof(false));
         all.put("F2v-control-proven-vector", () -> vectorProof(true));
         all.put("F2v-observed-ds-hardware-vector", () -> vectorObservedDs(true));
