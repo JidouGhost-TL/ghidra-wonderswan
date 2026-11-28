@@ -29,7 +29,7 @@ Come discuss the wonders of WonderSwan RE, modding, etc... also the best way to 
 Check both `v30mz` and `wonderswan` ZIPs against the release's `SHA256SUMS`. In Ghidra 12.1.3,
 open **File → Install Extensions**, add V30MZ first and WonderSwan second, enable both and
 restart. [Extension v0.1.0 downloads](https://github.com/JidouGhost-TL/ghidra-wonderswan/releases/tag/v0.1.0)
-· [Installation guide](https://github.com/JidouGhost-TL/ghidra-wonderswan/wiki/Installation)
+· [Installation guide](https://jidoughost-tl.github.io/wonderswan-wiki/guides/installation)
 
 ## Build from source
 
@@ -101,7 +101,7 @@ distributed, so they are not part of this repository.
   tests (80186 quirks, prefixes, interrupt timing) pass on `WSMachine`.
 - **Emulator:** short, scripted comparisons with Mesen 2 measure overlap in executed addresses over
   1500 frames. The overlap varies by cartridge; it does not establish identical code paths or
-  full-game compatibility. See the wiki's [method and results](https://github.com/JidouGhost-TL/ghidra-wonderswan/wiki/Emulation).
+  full-game compatibility. See the wiki's [method and results](https://jidoughost-tl.github.io/wonderswan-wiki/guides/emulator).
 - **Saves:** cartridge and internal EEPROM (full serial protocol) and SRAM are emulated; the ws-test-suite EEPROM
   test ROMs (internal, 1 Kbit, 16 Kbit) pass. Save images load and save as files (see `wonderswan/README.md`).
 
